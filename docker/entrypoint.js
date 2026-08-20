@@ -165,7 +165,10 @@ function providerSettingsYaml(provider) {
     'agent-default-model:',
     `  provider: ${provider.name}`,
     `  model: ${yq(model)}`,
-    '  reasoningEffort: max',
+    // No reasoningEffort: custom OpenAI-compatible models usually do not
+    // declare reasoning capability, and a configured effort then fails every
+    // call with UNSUPPORTED_REASONING_EFFORT. Omit it so the provider default
+    // applies; users who need a thinking level can add it in settings later.
     '',
     'llm-pi-ai:',
     '  providers:',
