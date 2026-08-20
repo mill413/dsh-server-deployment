@@ -1,0 +1,15 @@
+# This file is linked from the repository root as `.dockerignore` (the build
+# toolchain only honors `.dockerignore` at the build-context root, which is the
+# repo root). Edit it here; keep the root symlink in place.
+**/node_modules
+**/.pnpm-store
+**/.turbo
+**/coverage
+**/playwright-report
+**/test-results
+**/.local-run
+**/*.log
+**/*.tar.gz
+**/*.tar.gz.tmp
+# runtime data bind mount (docker/data) - never part of the image
+docker/data

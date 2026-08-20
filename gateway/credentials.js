@@ -18,18 +18,23 @@ function hasApiKey(usersDir, user) {
   } catch (e) { return false; }
 }
 
-function setApiKey(usersDir, user, key) {
+// Write (or replace) one credential entry in a user's .credentials.yaml.
+// `ref` is the credential-ref name (e.g. 'DEEPSEEK_API_KEY' or a custom
+// provider's '<NAME>_API_KEY'). Root callers write the file then chown to the
+// user; the per-user DSH instance also writes it via the loopback
+// credentials.set RPC.
+function setCredential(usersDir, user, ref, key) {
   const file = credentialsPath(usersDir, user);
   const dir = path.dirname(file);
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
   let lines = [];
   try { lines = fs.readFileSync(file, 'utf8').split(/\r?\n/); } catch (e) {}
   const esc = String(key).replace(/\\/g, '\\\\').replace(/"/g, '\\"');
-  const newLine = 'DEEPSEEK_API_KEY: "' + esc + '"';
+  const newLine = ref + ': "' + esc + '"';
   let replaced = false;
   const out = [];
   for (const line of lines) {
-    if (/^\s*DEEPSEEK_API_KEY\s*:/.test(line)) { out.push(newLine); replaced = true; }
+    if (new RegExp('^\\s*' + ref.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\s*:').test(line)) { out.push(newLine); replaced = true; }
     else out.push(line);
   }
   if (!replaced) {
@@ -40,4 +45,8 @@ function setApiKey(usersDir, user, key) {
   try { fs.chmodSync(file, 0o600); fs.chmodSync(dir, 0o700); } catch (e) {}
 }
 
-module.exports = { credentialsPath, hasApiKey, setApiKey };
+function setApiKey(usersDir, user, key) {
+  setCredential(usersDir, user, 'DEEPSEEK_API_KEY', key);
+}
+
+module.exports = { credentialsPath, hasApiKey, setApiKey, setCredential };

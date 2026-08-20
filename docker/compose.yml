@@ -1,0 +1,66 @@
+# Pin the compose project name: it is derived from the compose file's
+# directory, and the file now lives in docker/ - without this the project
+# would be named "docker" and the named volumes below would be recreated.
+name: dsh-server-deployment
+
+services:
+  dsh-multitenant:
+    image: dsh-server-deployment:local
+    build:
+      # Context is the repo root: the Dockerfile copies the whole deployment
+      # repo into the image. Run everything from the repo root with
+      # `docker compose -f docker/compose.yml ...`.
+      context: ..
+      dockerfile: docker/Dockerfile
+      no_cache: true
+      pull: true
+    cap_add:
+      - NET_ADMIN
+    environment:
+      COOKIE_SECURE: "0"
+      DSH_SKIP_KEY_SETUP: "1"
+      # Admin account (management only, no DSH instance). Created/updated at
+      # boot from this env var (scrypt-hashed into users.json). Unset it and
+      # remove users.json's admin record to disable. Login as admin lands on
+      # /__gw/admin (online users panel).
+      DSH_ADMIN_PASSWORD: "${DSH_ADMIN_PASSWORD:-admin-test-password}"
+      # External machine-to-machine API token (Bearer). When set, enables:
+      #   POST /api/register                 {"username","password"}   -> create user
+      #   POST /api/users/<name>/provider    {"provider":{"name","baseURL","model"},"apiKey"} -> register the user's custom provider + key
+      # Unset to disable the API entirely.
+      DSH_REGISTER_API_KEY: "${DSH_REGISTER_API_KEY:-register-test-token}"
+      # Single data volume: user homes live under /var/lib/dsh/users and the
+      # gateway/supervisor state (users.json, secret, identities) under
+      # /var/lib/dsh/gateway - one volume = one backup/cleanup unit.
+      DSH_USERS_DIR: /var/lib/dsh/users
+      DSH_GATEWAY_STATE_DIR: /var/lib/dsh/gateway
+      # DSH_TENANTS_JSON is a BOOTSTRAP SEED only: these users are created (or
+      # updated) when the container starts. To add / remove / change users at
+      # runtime without editing this file or recreating the container, use the
+      # in-image CLI (persists in the dsh-data volume):
+      #
+      #   docker compose -f docker/compose.yml exec dsh-multitenant dsh-users add <user> [password]
+      #   docker compose -f docker/compose.yml exec dsh-multitenant dsh-users list
+      #   docker compose -f docker/compose.yml exec dsh-multitenant dsh-users passwd <user> [password]
+      #   docker compose -f docker/compose.yml exec dsh-multitenant dsh-users del <user> [--yes]
+      #   docker compose -f docker/compose.yml exec dsh-multitenant dsh-users set-key <user> [key]
+      #
+      # Removing a user from DSH_TENANTS_JSON does NOT delete a runtime user;
+      # use `dsh-users del` for that.
+      DSH_TENANTS_JSON: >-
+        [{"name":"alice","password":"alice-test-password"},{"name":"bob","password":"bob-test-password"}]
+    ports:
+      # Bind all host interfaces so the gateway is reachable from the LAN
+      # (http://<host-ip>:20810). The gateway injects a crypto.randomUUID
+      # fallback into DSH pages, so the web client works on plain-HTTP LAN
+      # origins too (browsers hide randomUUID outside secure contexts).
+      # Passwords/sessions still travel in clear text - use TLS or a VPN for
+      # anything untrusted.
+      - "${DSH_GATEWAY_HOST_PORT:-20810}:3100"
+    volumes:
+      # Everything under one host directory (bind mount): user data + gateway
+      # state. Path is relative to this compose file -> docker/data/ on the
+      # host, mounted at /var/lib/dsh in the container. Files are directly
+      # visible/backup-able on the host.
+      - ./data:/var/lib/dsh
+    restart: unless-stopped

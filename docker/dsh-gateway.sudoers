@@ -1,0 +1,2 @@
+Defaults:dsh-gateway !requiretty
+dsh-gateway ALL=(root) NOPASSWD: /usr/local/libexec/dsh/dsh-file-put, /usr/local/libexec/dsh/dsh-file-stat, /usr/local/libexec/dsh/dsh-file-read, /usr/local/libexec/dsh/dsh-file-list, /usr/local/libexec/dsh/dsh-register, /usr/local/libexec/dsh/dsh-provider

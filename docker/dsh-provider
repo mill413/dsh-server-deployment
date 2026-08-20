@@ -1,0 +1,54 @@
+#!/usr/bin/env node
+'use strict';
+// Root helper: configure (register or replace) a custom provider for an
+// EXISTING user (Docker deployment).
+//
+// Usage: dsh-provider <username> <control-socket> '<provider-json>'
+//
+// Runs as root via sudo from the gateway (pinned in the dsh-gateway sudoers
+// allowlist). It forwards {cmd:'set-provider'} to the entrypoint supervisor,
+// which writes the user's settings.yaml (llm-pi-ai provider profile +
+// agent-default-model) and restarts their instance so the config goes live.
+// The API key itself is written afterwards by the gateway through the loopback
+// credentials RPC (no extra privilege needed).
+//
+// The socket path is passed explicitly as the second argument because sudo
+// strips custom environment variables (env_reset).
+
+const fs = require('fs');
+const net = require('net');
+const path = require('path');
+
+const STATE_DIR = process.env.DSH_GATEWAY_STATE_DIR || '/var/lib/dsh-gateway';
+const SOCKET = process.argv[3] || process.env.DSH_CONTROL_SOCKET || path.join(STATE_DIR, 'control.sock');
+
+function fail(msg, code) {
+  process.stderr.write(msg + '\n');
+  process.exit(code);
+}
+
+const name = process.argv[2];
+if (!name || !/^[A-Za-z0-9_-]{1,64}$/.test(name)) fail('invalid username', 2);
+let provider;
+try {
+  provider = JSON.parse(process.argv[4] || '');
+} catch (e) {
+  fail('invalid provider json', 2);
+}
+if (!provider || typeof provider !== 'object' || Array.isArray(provider)) fail('provider is required', 2);
+
+const payload = JSON.stringify({ cmd: 'set-provider', name: name, provider: provider }) + '\n';
+const sock = net.connect(SOCKET);
+let buf = '';
+const timer = setTimeout(() => { sock.destroy(); fail('control socket timeout', 1); }, 90000);
+sock.setEncoding('utf8');
+sock.on('connect', () => sock.write(payload));
+sock.on('data', (c) => { buf += c; });
+sock.on('end', () => {
+  clearTimeout(timer);
+  let reply;
+  try { reply = JSON.parse(buf); } catch (e) { fail('invalid supervisor reply', 1); }
+  process.stdout.write(JSON.stringify(reply) + '\n');
+  process.exit(reply && reply.ok === true ? 0 : 1);
+});
+sock.on('error', (e) => { clearTimeout(timer); fail('cannot reach supervisor: ' + e.message, 1); });

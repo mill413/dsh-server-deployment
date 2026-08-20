@@ -1,0 +1,66 @@
+#!/usr/bin/env node
+'use strict';
+// Root helper for self-service registration (Docker deployment).
+//
+// Usage: dsh-register <username> [control-socket] [provider-json]
+//                    (password on stdin)
+//
+// Runs as root via sudo from the gateway (pinned in the dsh-gateway sudoers
+// allowlist). Like the dsh-file-* helpers, it only forwards a validated
+// request: it connects to the entrypoint supervisor's control socket and asks
+// it to provision the user (OS account, port, instance, firewall, users.json,
+// optional custom-provider config). The supervisor performs all real
+// validation and provisioning, so this helper never needs to know the password
+// beyond forwarding it once.
+//
+// The socket path is passed explicitly as the second argument because sudo
+// strips custom environment variables (env_reset); the gateway computes it
+// from its own USERS_FILE and hands it over as argv. The optional third
+// argument is a JSON provider spec ({name,baseURL,model}) for the registration
+// API; the browser form omits it.
+
+const fs = require('fs');
+const net = require('net');
+const path = require('path');
+
+const STATE_DIR = process.env.DSH_GATEWAY_STATE_DIR || '/var/lib/dsh-gateway';
+const SOCKET = process.argv[3] || process.env.DSH_CONTROL_SOCKET || path.join(STATE_DIR, 'control.sock');
+
+function fail(msg, code) {
+  process.stderr.write(msg + '\n');
+  process.exit(code);
+}
+
+const name = process.argv[2];
+if (!name || !/^[A-Za-z0-9_-]{1,64}$/.test(name)) fail('invalid username', 2);
+let password = '';
+try {
+  password = fs.readFileSync(0, 'utf8').replace(/\r?\n$/, '');
+} catch (e) {
+  fail('cannot read password', 2);
+}
+if (password.length < 8) fail('password must contain at least 8 characters', 2);
+
+const payload = { cmd: 'add', name: name, password: password };
+const providerRaw = process.argv[4];
+if (providerRaw) {
+  try {
+    payload.provider = JSON.parse(providerRaw);
+  } catch (e) {
+    fail('invalid provider json', 2);
+  }
+}
+const sock = net.connect(SOCKET);
+let buf = '';
+const timer = setTimeout(() => { sock.destroy(); fail('control socket timeout', 1); }, 10000);
+sock.setEncoding('utf8');
+sock.on('connect', () => sock.write(JSON.stringify(payload) + '\n'));
+sock.on('data', (c) => { buf += c; });
+sock.on('end', () => {
+  clearTimeout(timer);
+  let reply;
+  try { reply = JSON.parse(buf); } catch (e) { fail('invalid supervisor reply', 1); }
+  process.stdout.write(JSON.stringify(reply) + '\n');
+  process.exit(reply && reply.ok === true ? 0 : 1);
+});
+sock.on('error', (e) => { clearTimeout(timer); fail('cannot reach supervisor: ' + e.message, 1); });

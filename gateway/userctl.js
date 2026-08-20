@@ -11,7 +11,6 @@ const USERS_FILE = process.env.DSH_USERS_FILE || path.join(BASE_DIR, 'gateway', 
 const SETTINGS_SRC = process.env.DSH_SETTINGS_SRC || path.join(BASE_DIR, 'settings.yaml');
 const NODE_BIN = process.env.DSH_NODE_BIN || path.join(BASE_DIR, 'runtime', 'bin', 'node');
 const DSH_BIN = process.env.DSH_DSH_BIN || path.join(BASE_DIR, 'app', 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js');
-const TRUSTED_HOST = process.env.DSH_TRUSTED_HOST || '127.0.0.1:1145';
 const BASE_URL = process.env.DEEPSEEK_BASE_URL || 'https://api.deepseek.com';
 const MIN_PORT = 3101;
 
@@ -143,7 +142,7 @@ function unitFor(name, port) {
     'Environment=HOME=' + home,
     'Environment=PATH=' + path.join(BASE_DIR, 'runtime', 'bin') + ':/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',
     'Environment=DEEPSEEK_BASE_URL=' + BASE_URL,
-    'ExecStart=' + NODE_BIN + ' ' + DSH_BIN + ' --profile web --host 127.0.0.1 --port ' + port + ' --trusted-host ' + TRUSTED_HOST,
+    'ExecStart=' + NODE_BIN + ' ' + DSH_BIN + ' --profile web --host 127.0.0.1 --port ' + port,
     'Restart=on-failure',
     'RestartSec=5',
     // Basic fairness limits: one tenant\'s runaway agent (fork bombs, memory

@@ -24,6 +24,57 @@ const WINDOW_MS = parseInt(process.env.WINDOW_MS || '900000', 10);
 const LOCK_MS = parseInt(process.env.LOCK_MS || '900000', 10);
 const COOKIE_NAME = 'dsh_session';
 const CSRF_COOKIE = 'dsh_csrf';
+
+// ---------- admin / online-users tracking ----------
+// Sessions are stateless HMAC cookies, so "logged in" is approximated by the
+// last authenticated request: users with an entry here have a valid session
+// and were seen recently. `online` = active within ACTIVE_WINDOW_MS; entries
+// are retained while their session could still be valid (SESSION_TTL).
+const ACTIVE_WINDOW_MS = 15 * 60 * 1000;
+const ACTIVE_RETAIN_MS = (SESSION_TTL || 43200) * 1000;
+const activeUsers = new Map(); // username -> { at, ip }
+function markActive(user, req) {
+  const now = Date.now();
+  if (activeUsers.size > 5000) {
+    for (const [k, v] of activeUsers) if (now - v.at > ACTIVE_RETAIN_MS) activeUsers.delete(k);
+  }
+  activeUsers.set(user, { at: now, ip: clientIp(req) });
+}
+
+// ---------- self-service registration (Docker deployment) ----------
+// The gateway cannot provision users itself (OS account / port / instance /
+// firewall need root); it forwards the request through a fixed-path sudo
+// helper (dsh-register) to the entrypoint supervisor's control socket. The
+// feature is enabled automatically when the helper is installed (Docker
+// image) and can be forced off/on with DSH_ENABLE_REGISTER=0/1.
+const REGISTER_HELPER = process.env.DSH_REGISTER_HELPER || '/usr/local/libexec/dsh/dsh-register';
+const REGISTER_ENABLED = process.env.DSH_ENABLE_REGISTER
+  ? process.env.DSH_ENABLE_REGISTER === '1'
+  : fs.existsSync(REGISTER_HELPER);
+const MAX_REGISTER_ATTEMPTS = parseInt(process.env.MAX_REGISTER_ATTEMPTS || '10', 10);
+const registerFails = new Map();
+
+// ---------- external registration / provider API ----------
+// Machine-to-machine endpoints, enabled only when DSH_REGISTER_API_KEY is set.
+//   POST /api/register                {username,password}  -> create the user
+//   POST /api/users/<name>/provider   {provider:{name,baseURL,model},apiKey}
+//                                     -> register/replace the user's custom
+//                                        provider and write its API key
+// All calls require: Authorization: Bearer <DSH_REGISTER_API_KEY>.
+const REGISTER_API_TOKEN = process.env.DSH_REGISTER_API_KEY || '';
+const REGISTER_API_ENABLED = REGISTER_API_TOKEN.length > 0;
+const PROVIDER_HELPER = process.env.DSH_PROVIDER_HELPER || '/usr/local/libexec/dsh/dsh-provider';
+function apiAuthorized(req) {
+  if (!REGISTER_API_ENABLED) return false;
+  const h = req.headers['authorization'] || '';
+  const m = /^Bearer\s+(.+)$/i.exec(h);
+  return !!(m && m[1] && timingSafeStr(m[1], REGISTER_API_TOKEN));
+}
+function readJsonBody(req, limit) {
+  return readBody(req, limit).then((body) => {
+    try { return JSON.parse(body); } catch (e) { throw new Error('invalid JSON body'); }
+  });
+}
 const UPLOAD_HELPER = process.env.UPLOAD_HELPER || '/opt/deepseek-harness/bin/dsh-file-put';
 const FILE_STAT_HELPER = process.env.FILE_STAT_HELPER || '/opt/deepseek-harness/bin/dsh-file-stat';
 const FILE_READ_HELPER = process.env.FILE_READ_HELPER || '/opt/deepseek-harness/bin/dsh-file-read';
@@ -125,10 +176,10 @@ function setUserKeyFlag(user, val) {
 // Ask the user's own DSH instance to persist the key. The instance's credentials
 // store is 0600 and owned by that user's OS account, so the gateway must not
 // write it directly; this loopback RPC is the only write path.
-function rpcCredentialsSet(port, key) {
+function rpcCredentialSet(port, ref, value) {
   return new Promise((resolve) => {
     const rpcId = 'gw-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 10);
-    const body = JSON.stringify({ type: 'client-request', rpcId: rpcId, method: 'credentials.set', payload: { ref: 'DEEPSEEK_API_KEY', value: key } });
+    const body = JSON.stringify({ type: 'client-request', rpcId: rpcId, method: 'credentials.set', payload: { ref: ref, value: value } });
     const req = http.request({
       host: '127.0.0.1', port: port, method: 'POST', path: '/api/credentials.set',
       headers: { 'content-type': 'application/json', 'host': '127.0.0.1:' + port, 'content-length': Buffer.byteLength(body) },
@@ -140,7 +191,9 @@ function rpcCredentialsSet(port, key) {
           const j = JSON.parse(data);
           if (j && j.result && j.result.ok) resolve({ ok: true });
           else resolve({ ok: false, detail: (j && j.result && j.result.error && j.result.error.message) || '后端返回错误' });
-        } catch (e) { resolve({ ok: false, detail: '后端响应解析失败' }); }
+        } catch (e) {
+          resolve({ ok: false, detail: '后端响应解析失败: ' + String(data || '(空响应)').slice(0, 120) });
+        }
       });
     });
     req.on('error', (e) => resolve({ ok: false, detail: '后端服务不可用: ' + e.message }));
@@ -148,6 +201,23 @@ function rpcCredentialsSet(port, key) {
     req.write(body);
     req.end();
   });
+}
+
+// Retry a loopback RPC with backoff: right after the supervisor restarts the
+// user's instance the HTTP port answers before every plugin route is ready, so
+// the first attempt can fail spuriously. Returns { ok, detail }.
+async function rpcCredentialSetRetry(port, ref, value, attempts = 3, delayMs = 2500) {
+  let last = { ok: false, detail: '未尝试' };
+  for (let i = 0; i < attempts; i++) {
+    last = await rpcCredentialSet(port, ref, value);
+    if (last.ok) return last;
+    if (i < attempts - 1) await new Promise((r) => setTimeout(r, delayMs));
+  }
+  return last;
+}
+
+function rpcCredentialsSet(port, key) {
+  return rpcCredentialSet(port, 'DEEPSEEK_API_KEY', key);
 }
 
 // ---------- rate limiting ----------
@@ -400,8 +470,11 @@ function impeccableShell(title, bodyHtml) {
   ].join('');
 }
 
-function loginPage(csrf, error) {
+function loginPage(csrf, error, ok) {
   const errDiv = error ? '<div class="msg err" id="msg"></div>' : '<div class="msg" id="msg"></div>';
+  const regLink = REGISTER_ENABLED
+    ? '<div class="rule"></div><div class="hint">没有账号？<a href="/register" style="color:var(--gold);text-decoration:none">注册新账号</a></div>'
+    : '';
   const body = [
     '<div class="card"><div class="brand"><div class="logo">D</div><div><h1>DeepSeek Harness</h1><div class="sub">登录控制台</div></div></div>',
     '<p class="lead">请输入你的账号与密码以继续。账号由服务器管理员创建。</p>',
@@ -413,14 +486,98 @@ function loginPage(csrf, error) {
     '</form>', errDiv,
     '<div class="rule"></div>',
     '<div class="hint">忘记密码？请联系服务器管理员重置。</div>',
+    regLink,
     '</div>',
     '<script>',
     'var m=document.getElementById("msg");',
     error ? 'm.className="msg err";m.textContent=' + JSON.stringify(error) + ';' : '',
+    ok ? 'm.className="msg ok";m.textContent=' + JSON.stringify(ok) + ';' : '',
     'document.getElementById("f").addEventListener("submit",function(){var b=document.getElementById("btn");if(b){b.disabled=true;b.textContent="登录中…";}});',
     '</scr' + 'ipt>',
   ].join('');
   return impeccableShell('登录', body);
+}
+
+function registerPage(csrf, error) {
+  const errDiv = error ? '<div class="msg err" id="msg"></div>' : '<div class="msg" id="msg"></div>';
+  const body = [
+    '<div class="card"><div class="brand"><div class="logo">D</div><div><h1>DeepSeek Harness</h1><div class="sub">注册新账号</div></div></div>',
+    '<p class="lead">创建你的账号以使用 DeepSeek Harness。注册后即可登录并配置 API Key。</p>',
+    '<form id="f" method="post" action="/register" autocomplete="on">',
+    '<input type="hidden" name="csrf" value="' + csrf + '">',
+    '<label for="u">用户名</label><input id="u" name="username" type="text" autocomplete="username" required autofocus>',
+    '<label for="p">密码</label><input id="p" name="password" type="password" autocomplete="new-password" required>',
+    '<label for="c">确认密码</label><input id="c" name="confirm" type="password" autocomplete="new-password" required>',
+    '<button type="submit" id="btn">注册</button>',
+    '</form>', errDiv,
+    '<div class="rule"></div>',
+    '<div class="hint">已有账号？<a href="/login" style="color:var(--gold);text-decoration:none">返回登录</a> · 密码至少 8 位。</div>',
+    '</div>',
+    '<script>',
+    'var m=document.getElementById("msg");',
+    error ? 'm.className="msg err";m.textContent=' + JSON.stringify(error) + ';' : '',
+    'document.getElementById("f").addEventListener("submit",function(){var b=document.getElementById("btn");if(b){b.disabled=true;b.textContent="注册中…";}});',
+    '</scr' + 'ipt>',
+  ].join('');
+  return impeccableShell('注册', body);
+}
+
+// Admin panel data: every user with online status. "online" means a valid
+// session was seen within ACTIVE_WINDOW_MS (sessions are stateless cookies, so
+// this is last-activity, not a live presence).
+function adminUsersPayload() {
+  const db = loadUsers();
+  const now = Date.now();
+  const users = Object.keys(db.users || {}).sort().map((name) => {
+    const u = db.users[name];
+    const act = activeUsers.get(name);
+    return {
+      name: name,
+      admin: u.admin === true,
+      online: !!act && (now - act.at <= ACTIVE_WINDOW_MS),
+      lastActiveAt: act ? act.at : null,
+      ip: act ? act.ip : null,
+      keyConfigured: !!u.keyConfigured,
+      created: u.created || null,
+    };
+  });
+  return { ok: true, now: now, onlineCount: users.filter((x) => x.online).length, users: users };
+}
+
+function adminPage(csrf) {
+  const body = [
+    '<div class="card" style="max-width:880px"><div class="brand"><div class="logo">A</div><div><h1>管理控制台</h1><div class="sub">DeepSeek Harness · 在线用户</div></div></div>',
+    '<p class="lead" id="stat">加载中…</p>',
+    '<table id="tbl"><thead><tr><th>用户</th><th>状态</th><th>IP</th><th>最近活跃</th><th>API Key</th><th>创建时间</th></tr></thead><tbody></tbody></table>',
+    '<div class="rule"></div>',
+    '<form method="post" action="/logout" style="display:inline"><input type="hidden" name="csrf" value="' + csrf + '"><button type="submit" class="ghost">退出登录</button></form>',
+    '<button type="button" class="ghost" id="refresh" style="margin-left:10px">刷新</button>',
+    '</div>',
+    '<script>',
+    'function esc(s){return String(s==null?"":s).replace(/[&<>"]/g,function(c){return{"&":"&amp;","<":"&lt;",">":"&gt;",\'"\':"&quot;"}[c];});}',
+    'function fmt(ts){if(!ts)return "-";try{return new Date(ts).toLocaleString();}catch(e){return "-";}}',
+    'function load(){fetch("/__gw/admin/users",{credentials:"same-origin"}).then(function(r){return r.json();}).then(function(j){',
+    'if(!j.ok){document.getElementById("stat").textContent="加载失败";return;}',
+    'document.getElementById("stat").textContent="在线用户："+j.onlineCount+" · 用户总数："+j.users.length;',
+    'var tb=document.querySelector("#tbl tbody");tb.innerHTML="";',
+    'j.users.forEach(function(u){var tr=document.createElement("tr");',
+    'var st=u.online?"<span class=on>● 在线</span>":(u.lastActiveAt?"<span class=off>○ 离线</span>":"<span class=off>○ 从未活跃</span>");',
+    'tr.innerHTML="<td>"+esc(u.name)+(u.admin?" <span class=adm>管理员</span>":"")+"</td>"+"<td>"+st+"</td>"+"<td>"+esc(u.ip)+"</td>"+"<td>"+fmt(u.lastActiveAt)+"</td>"+"<td>"+(u.keyConfigured?"已配置":"—")+"</td>"+"<td>"+fmt(u.created)+"</td>";',
+    'tb.appendChild(tr);});}).catch(function(){document.getElementById("stat").textContent="加载失败";});}',
+    'document.getElementById("refresh").addEventListener("click",load);',
+    'load();setInterval(load,10000);',
+    '</scr' + 'ipt>',
+    '<style>',
+    'table{width:100%;border-collapse:collapse;font-size:13px}',
+    'th,td{text-align:left;padding:10px;border-bottom:1px solid var(--hairline);color:var(--ink)}',
+    'th{color:var(--muted);font-weight:600;letter-spacing:.3px;font-size:12px}',
+    '.on{color:var(--ok)}.off{color:var(--faint)}',
+    '.adm{color:var(--gold);font-size:11px;border:1px solid var(--hairline);padding:1px 6px;border-radius:6px;margin-left:6px}',
+    '.ghost{background:transparent;border:1px solid var(--hairline);border-radius:9px;color:var(--gold);padding:9px 18px;font-size:13px;font-weight:600;cursor:pointer;width:auto;margin-top:0}',
+    '.ghost:hover{background:rgba(226,185,97,.08)}',
+    '</style>',
+  ].join('');
+  return impeccableShell('管理控制台', body);
 }
 
 function setupPage(csrf, error, warning) {
@@ -465,7 +622,7 @@ function runHelper(args, opts) {
     const o = Object.assign({ timeoutMs: 15000, maxStdout: 8 * 1024 * 1024 }, opts || {});
     let child;
     try {
-      child = spawn('sudo', ['-n'].concat(args), { stdio: ['ignore', 'pipe', 'pipe'] });
+      child = spawn('sudo', ['-n'].concat(args), { stdio: o.input !== undefined ? ['pipe', 'pipe', 'pipe'] : ['ignore', 'pipe', 'pipe'] });
     } catch (e) { return resolve({ code: null, stdout: '', stderr: String(e && e.message || e) }); }
     let out = [];
     let outLen = 0;
@@ -485,6 +642,10 @@ function runHelper(args, opts) {
     child.stderr.on('data', (c) => { err += c.toString('utf8'); });
     child.on('error', () => finish(null));
     child.on('close', (code) => finish(code));
+    if (o.input !== undefined) {
+      child.stdin.on('error', () => {});
+      child.stdin.end(o.input);
+    }
   });
 }
 
@@ -530,6 +691,17 @@ function userHome(user) {
 // The capsule hides while the SPA shows any dialog (settings panel, modals)
 // so the floating button never covers app chrome. No backdrop blur or
 // gradient chrome; focus rings, ESC/backdrop close, reduced-motion respected.
+
+// crypto.randomUUID shim injected into every proxied HTML page, BEFORE the
+// SPA bundle: browsers only expose Crypto.randomUUID() in secure contexts
+// (HTTPS or localhost), so plain-HTTP LAN access (http://192.168.x.x) leaves
+// it undefined and the DSH web client throws "crypto.randomUUID is not a
+// function" when creating messages / the events.mux RPC downlink. This
+// runtime fallback (getRandomValues-based UUID v4) restores it for insecure
+// origins. It is response injection, not a DSH source patch - consistent with
+// the gateway's existing SPA-injection model.
+const UUID_SHIM = '<script>(function(){if(!window.crypto||typeof window.crypto.randomUUID==="function")return;function u(){var b=window.crypto.getRandomValues(new Uint8Array(16));b[6]=(b[6]&15)|64;b[8]=(b[8]&63)|128;var h="";for(var i=0;i<16;i++){if(i===4||i===6||i===8||i===10)h+="-";h+=(b[i]<16?"0":"")+b[i].toString(16);}return h;}try{Object.defineProperty(window.crypto,"randomUUID",{value:u,configurable:true,writable:true});}catch(e){window.crypto.randomUUID=u;}})();</script>';
+
 const FILES_LINK_HTML = [
   '<style>',
   '#dshgw-fab-stack{position:fixed;right:20px;bottom:20px;z-index:2147483000;display:flex;flex-direction:column;gap:10px;align-items:flex-end;touch-action:none;user-select:none}',
@@ -794,6 +966,16 @@ function proxyRequest(req, res, port, user) {
         } catch (e) {}
       } else {
         let html = body.toString('utf8');
+        // UUID shim must run before the SPA bundle: inject right after the
+        // opening <head> tag (the DSH client scripts are deferred modules),
+        // falling back to the very top of the document when there is no head.
+        const headAt = html.toLowerCase().indexOf('<head');
+        if (headAt >= 0) {
+          const headEnd = html.indexOf('>', headAt);
+          html = html.slice(0, headEnd + 1) + UUID_SHIM + html.slice(headEnd + 1);
+        } else {
+          html = UUID_SHIM + html;
+        }
         const at = html.toLowerCase().lastIndexOf('</body>');
         html = at >= 0 ? html.slice(0, at) + FILES_LINK_HTML + html.slice(at) : html + FILES_LINK_HTML;
         body = Buffer.from(html, 'utf8');
@@ -873,6 +1055,7 @@ const server = http.createServer(async (req, res) => {
   const q = req.url.indexOf('?');
   const pathname = q < 0 ? req.url : req.url.slice(0, q);
   const session = getSession(req);
+  if (session) markActive(session.u, req);
 
   if (req.method === 'GET' && STATIC_ASSETS[pathname]) {
     const asset = STATIC_ASSETS[pathname];
@@ -890,14 +1073,36 @@ const server = http.createServer(async (req, res) => {
     return json(res, 200, { ok: true, user: session.u, keyConfigured: hasKey(session.u) });
   }
 
+  // ---------- admin panel (admin account only) ----------
+  if (pathname === '/__gw/admin' || pathname === '/__gw/admin/users') {
+    const au = session && getUser(session.u);
+    if (!session || !au || au.admin !== true) {
+      if (req.method === 'GET') return redirect(res, '/login');
+      return json(res, 403, { ok: false, error: '需要管理员权限' });
+    }
+    if (pathname === '/__gw/admin/users') return json(res, 200, adminUsersPayload());
+    const csrf = crypto.randomBytes(16).toString('hex');
+    res.setHeader('Set-Cookie', cookieHeader(CSRF_COOKIE, csrf, { maxAge: 600, path: '/', sameSite: 'Lax' }));
+    secHeaders(res);
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+    return res.end(adminPage(csrf));
+  }
+
   if (pathname === '/login') {
     if (req.method === 'GET') {
-      if (session) return redirect(res, hasKey(session.u) ? '/' : '/setup');
+      if (session) {
+        const su = getUser(session.u);
+        return redirect(res, (su && su.admin) ? '/__gw/admin' : (hasKey(session.u) ? '/' : '/setup'));
+      }
+      const query = q < 0 ? '' : req.url.slice(q + 1);
+      const okMsg = /(^|&)ok=1(&|$)/.test(query)
+        ? '注册成功！你的实例正在启动，几秒后即可登录。'
+        : null;
       const csrf = crypto.randomBytes(16).toString('hex');
       res.setHeader('Set-Cookie', cookieHeader(CSRF_COOKIE, csrf, { maxAge: 600, path: '/', sameSite: 'Lax' }));
       secHeaders(res);
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
-      return res.end(loginPage(csrf, null));
+      return res.end(loginPage(csrf, null, okMsg));
     }
     if (req.method === 'POST') {
       let body;
@@ -943,9 +1148,156 @@ const server = http.createServer(async (req, res) => {
       recordSuccess(req, username);
       setSession(res, username);
       logLine(req, 302, 'login ' + username);
+      if (u.admin) return redirect(res, '/__gw/admin');
       return redirect(res, hasKey(username) ? '/' : '/setup');
     }
     return json(res, 405, { ok: false, error: '方法不允许' });
+  }
+
+  if (pathname === '/register') {
+    if (!REGISTER_ENABLED) return redirect(res, '/login');
+    if (session) return redirect(res, hasKey(session.u) ? '/' : '/setup');
+    if (req.method === 'GET') {
+      const csrf = crypto.randomBytes(16).toString('hex');
+      res.setHeader('Set-Cookie', cookieHeader(CSRF_COOKIE, csrf, { maxAge: 600, path: '/', sameSite: 'Lax' }));
+      secHeaders(res);
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+      return res.end(registerPage(csrf, null));
+    }
+    if (req.method === 'POST') {
+      let body;
+      try { body = await readBody(req, 10000); } catch (e) { return json(res, 413, { ok: false, error: '请求过大' }); }
+      const form = parseForm(body);
+      const cookies = parseCookies(req);
+      const renderErr = (msg, code) => {
+        const csrf2 = crypto.randomBytes(16).toString('hex');
+        res.setHeader('Set-Cookie', cookieHeader(CSRF_COOKIE, csrf2, { maxAge: 600, path: '/', sameSite: 'Lax' }));
+        secHeaders(res);
+        res.writeHead(code || 200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+        return res.end(registerPage(csrf2, msg));
+      };
+      if (!form.csrf || !cookies[CSRF_COOKIE] || !timingSafeStr(form.csrf, cookies[CSRF_COOKIE])) {
+        logLine(req, 403, 'csrf-register');
+        return renderErr('CSRF 校验失败，请刷新页面重试', 403);
+      }
+      const ip = clientIp(req);
+      const locked = lockedUntil(registerFails, ip);
+      if (locked) {
+        res.setHeader('Retry-After', String(Math.ceil((locked - Date.now()) / 1000)));
+        logLine(req, 429, 'register-locked ' + ip);
+        return renderErr('注册尝试过多，请稍后再试', 429);
+      }
+      const username = (form.username || '').trim();
+      const password = form.password || '';
+      const confirm = form.confirm || '';
+      if (!/^[A-Za-z0-9_-]{1,64}$/.test(username)) return renderErr('用户名仅限字母、数字、下划线、连字符');
+      if (password.length < 8) return renderErr('密码至少 8 位');
+      if (password !== confirm) return renderErr('两次输入的密码不一致');
+      // Pass the control socket path explicitly: the helper runs under sudo,
+      // which strips custom env vars (env_reset), so it cannot rely on
+      // DSH_GATEWAY_STATE_DIR. The socket lives next to users.json.
+      const regSocket = path.join(path.dirname(USERS_FILE), 'control.sock');
+      const r = await runHelper([REGISTER_HELPER, username, regSocket], { input: password, timeoutMs: 20000, maxStdout: 64 * 1024 });
+      let reply = null;
+      try { reply = JSON.parse(r.stdout); } catch (e) {}
+      if (r.code !== 0 || !reply || reply.ok !== true) {
+        registerFailure(registerFails, ip, MAX_REGISTER_ATTEMPTS);
+        const detail = (reply && reply.error) || String(r.stderr || '').trim() || '注册失败，请稍后重试';
+        logLine(req, 200, 'register-fail ' + username + ' ' + detail.slice(0, 160));
+        return renderErr(detail);
+      }
+      // The supervisor has persisted the user; drop the gateway's users cache
+      // so the immediate redirect and any follow-up login see it right away.
+      usersCacheAt = 0;
+      registerFails.delete(ip);
+      logLine(req, 302, 'register ' + username + ' port=' + (reply.result && reply.result.port));
+      return redirect(res, '/login?ok=1');
+    }
+    return json(res, 405, { ok: false, error: '方法不允许' });
+  }
+
+  // ---------- external registration API (Bearer token) ----------
+  // Creates the user only; custom providers are registered afterwards via
+  // POST /api/users/<username>/provider (with the API key).
+  if (pathname === '/api/register' && req.method === 'POST') {
+    if (!apiAuthorized(req)) return json(res, 401, { ok: false, error: 'unauthorized' });
+    let body;
+    try { body = await readJsonBody(req, 10000); } catch (e) { return json(res, 400, { ok: false, error: 'invalid JSON body' }); }
+    if (body.provider !== undefined && body.provider !== null) {
+      return json(res, 400, { ok: false, error: 'provider is not accepted here; use POST /api/users/<username>/provider' });
+    }
+    const username = String(body.username || '').trim();
+    const password = String(body.password || '');
+    if (!/^[A-Za-z0-9_-]{1,64}$/.test(username)) return json(res, 400, { ok: false, error: 'invalid username' });
+    if (password.length < 8) return json(res, 400, { ok: false, error: 'password must be at least 8 characters' });
+    const regSocket = path.join(path.dirname(USERS_FILE), 'control.sock');
+    const r = await runHelper([REGISTER_HELPER, username, regSocket], { input: password, timeoutMs: 20000, maxStdout: 64 * 1024 });
+    let reply = null;
+    try { reply = JSON.parse(r.stdout); } catch (e) {}
+    if (r.code !== 0 || !reply || reply.ok !== true) {
+      const detail = (reply && reply.error) || String(r.stderr || '').trim() || 'registration failed';
+      logLine(req, 200, 'api-register-fail ' + username + ' ' + detail.slice(0, 160));
+      return json(res, 409, { ok: false, error: detail });
+    }
+    usersCacheAt = 0;
+    logLine(req, 200, 'api-register ' + username + ' port=' + (reply.result && reply.result.port));
+    return json(res, 200, { ok: true, user: username, port: reply.result.port });
+  }
+
+  // ---------- model registration API: POST /api/users/<name>/provider ----------
+  // Registers (or replaces) the user's custom provider AND writes its API key.
+  // The supervisor writes the provider config and restarts the instance; the
+  // key is written by the user's own instance via the loopback credentials RPC.
+  const apiProviderMatch = /^\/api\/users\/([A-Za-z0-9_-]{1,64})\/provider$/.exec(pathname);
+  if (apiProviderMatch && req.method === 'POST') {
+    if (!apiAuthorized(req)) return json(res, 401, { ok: false, error: 'unauthorized' });
+    const name = apiProviderMatch[1];
+    let body;
+    try { body = await readJsonBody(req, 10000); } catch (e) { return json(res, 400, { ok: false, error: 'invalid JSON body' }); }
+    const p = body.provider;
+    if (!p || typeof p !== 'object' || Array.isArray(p)) return json(res, 400, { ok: false, error: 'provider is required' });
+    const pname = String(p.name || '').trim();
+    const baseURL = String(p.baseURL || '').trim();
+    const model = String(p.model || '').trim();
+    if (!/^[A-Za-z0-9_-]{1,64}$/.test(pname)) return json(res, 400, { ok: false, error: 'invalid provider name (letters, digits, underscore, hyphen)' });
+    if (!/^https?:\/\/[^\s]+$/.test(baseURL)) return json(res, 400, { ok: false, error: 'invalid provider baseURL (must be an http(s) URL)' });
+    if (!model || model.length > 128) return json(res, 400, { ok: false, error: 'invalid provider model' });
+    const papi = (p.api === undefined || p.api === null || p.api === '') ? 'openai-completions' : String(p.api);
+    if (!['openai-completions', 'openai-responses', 'anthropic-messages'].includes(papi)) {
+      return json(res, 400, { ok: false, error: 'invalid provider api (openai-completions | openai-responses | anthropic-messages)' });
+    }
+    const key = String(body.apiKey !== undefined ? body.apiKey : body.key || '').trim();
+    if (!key) return json(res, 400, { ok: false, error: 'apiKey is required' });
+    const u = getUser(name);
+    if (!u || !u.port) return json(res, 404, { ok: false, error: 'user not found' });
+    if (u.admin === true) return json(res, 400, { ok: false, error: 'admin has no instance' });
+    const regSocket = path.join(path.dirname(USERS_FILE), 'control.sock');
+    const r = await runHelper([PROVIDER_HELPER, name, regSocket, JSON.stringify({ name: pname, baseURL, model, api: papi })], { timeoutMs: 90000, maxStdout: 64 * 1024 });
+    let reply = null;
+    try { reply = JSON.parse(r.stdout); } catch (e) {}
+    if (r.code !== 0 || !reply || reply.ok !== true) {
+      const detail = (reply && reply.error) || String(r.stderr || '').trim() || 'provider registration failed';
+      logLine(req, 200, 'api-provider-fail ' + name + ' ' + detail.slice(0, 160));
+      return json(res, 409, { ok: false, error: detail });
+    }
+    const ref = reply.result.provider.apiKeyEnv;
+    const saved = await rpcCredentialSetRetry(u.port, ref, key);
+    if (!saved.ok) {
+      // The provider config IS live in the user's settings - only the key
+      // write failed. Say so explicitly so the caller can retry the key (or
+      // fix the instance) instead of thinking registration failed.
+      logLine(req, 502, 'api-provider key-fail ' + name + ' ' + String(saved.detail).slice(0, 160));
+      return json(res, 502, {
+        ok: false,
+        error: 'provider configured but API key write failed: ' + saved.detail,
+        provider: reply.result.provider,
+        keyWrite: { ok: false, detail: saved.detail },
+      });
+    }
+    setUserKeyFlag(name, true);
+    usersCacheAt = 0;
+    logLine(req, 200, 'api-provider ' + name + ' ref=' + ref);
+    return json(res, 200, { ok: true, user: name, provider: reply.result.provider, ref: ref });
   }
 
   if (pathname === '/logout') {
@@ -1357,6 +1709,11 @@ const server = http.createServer(async (req, res) => {
     return json(res, 403, { ok: false, error: '请先配置 API Key', redirect: '/setup' });
   }
   const u = getUser(session.u);
+  if (u && u.admin) {
+    // Admin has no DSH instance; send every page request to the panel.
+    if (req.method === 'GET' && !pathname.startsWith('/api/')) return redirect(res, '/__gw/admin');
+    return json(res, 403, { ok: false, error: '管理员账号不提供实例访问' });
+  }
   if (!u || !u.port) {
     clearSession(res);
     return json(res, 401, { ok: false, error: '账号不可用' });

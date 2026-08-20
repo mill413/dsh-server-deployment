@@ -11,6 +11,12 @@ state-cwd.json
 # local dev/testing tree
 .local-run/
 
+# docker image export artifact
+dsh-server-deployment-local.tar.gz
+
+# docker runtime data (bind mount ./data)
+docker/data/
+
 # ops/deploy records - server-private, never commit
 docs/dsh-*-deployment.md
 docs/dsh-portal-handover.md

@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# Container-side user management: forwards commands to the entrypoint
+# supervisor over its control socket. Use from the host as:
+#
+#   docker compose -f docker/compose.yml exec dsh-multitenant dsh-users add <user> [password]
+#   docker compose -f docker/compose.yml exec dsh-multitenant dsh-users del <user> [--yes]
+#   docker compose -f docker/compose.yml exec dsh-multitenant dsh-users list
+#
+# (The host-mode tool is bin/dsh-users.sh, which manages systemd units.)
+set -euo pipefail
+# The image installs a copy under /usr/local/libexec/dsh; the source checkout
+# lives at /opt/dsh-server-deployment. Prefer the checkout so userctl.js is
+# always found, then fall back to relative resolution for plain git checkouts.
+if [ -d /opt/dsh-server-deployment ]; then
+  exec node /opt/dsh-server-deployment/docker/userctl.js "$@"
+fi
+base="$(cd "$(dirname "$0")/.." && pwd)"
+exec node "$base/docker/userctl.js" "$@"

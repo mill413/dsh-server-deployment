@@ -62,6 +62,13 @@ hook_output() {
 
 apply_rules() {
   local specs=("$@") spec user port
+  # Validate the complete desired state before touching the active chain. A
+  # malformed entry must not flush the rules that currently isolate tenants.
+  for spec in "${specs[@]}"; do
+    user="${spec%%:*}"
+    port="${spec##*:}"
+    valid_spec "$spec" "$user" "$port" || exit 2
+  done
   ipt -N "$CHAIN" 2>/dev/null || true
   ipt -F "$CHAIN"
   for spec in "${specs[@]}"; do
@@ -72,11 +79,6 @@ apply_rules() {
     # here because replies come from sport; the REJECT rules below are the
     # only destination-scoped denials)
     ipt -A "$CHAIN" -o lo -p tcp -m owner --uid-owner "$user" --dport "$port" -m comment --comment "$comment" -j ACCEPT
-  done
-  for spec in "${specs[@]}"; do
-    user="${spec%%:*}"
-    port="${spec##*:}"
-    valid_spec "$spec" "$user" "$port" || exit 2
   done
   for spec in "${specs[@]}"; do
     user="${spec%%:*}"
