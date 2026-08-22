@@ -29,6 +29,11 @@ services:
       #   POST /api/users/<name>/provider    {"provider":{"name","baseURL","model"},"apiKey"} -> register the user's custom provider + key
       # Unset to disable the API entirely.
       DSH_REGISTER_API_KEY: "${DSH_REGISTER_API_KEY:-register-test-token}"
+      # Trusted-backend automatic login (LOCAL TEST ONLY). The backend swaps
+      # this long-lived Bearer token for a short-lived, one-time browser URL.
+      # Production must inject a strong value from a secret store instead.
+      DSH_LOGIN_API_KEY: "${DSH_LOGIN_API_KEY:-login-test-token}"
+      LOGIN_TICKET_TTL: "${LOGIN_TICKET_TTL:-60}"
       # Single data volume: user homes live under /var/lib/dsh/users and the
       # gateway/supervisor state (users.json, secret, identities) under
       # /var/lib/dsh/gateway - one volume = one backup/cleanup unit.

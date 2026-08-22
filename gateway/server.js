@@ -63,17 +63,55 @@ const registerFails = new Map();
 // All calls require: Authorization: Bearer <DSH_REGISTER_API_KEY>.
 const REGISTER_API_TOKEN = process.env.DSH_REGISTER_API_KEY || '';
 const REGISTER_API_ENABLED = REGISTER_API_TOKEN.length > 0;
+// External SSO bridge. A trusted backend authenticates with this dedicated
+// key, asks for a short-lived one-time ticket, then redirects the browser to
+// the returned same-origin URL. Never put this long-lived key in browser code.
+const LOGIN_API_TOKEN = process.env.DSH_LOGIN_API_KEY || '';
+const LOGIN_API_ENABLED = LOGIN_API_TOKEN.length > 0;
+const LOGIN_TICKET_TTL = Math.min(300, Math.max(10, parseInt(process.env.LOGIN_TICKET_TTL || '60', 10) || 60));
+const LOGIN_TICKET_MAX = 10000;
+const loginTickets = new Map(); // sha256(ticket) -> { user, returnTo, expiresAt }
 const PROVIDER_HELPER = process.env.DSH_PROVIDER_HELPER || '/usr/local/libexec/dsh/dsh-provider';
-function apiAuthorized(req) {
-  if (!REGISTER_API_ENABLED) return false;
+function bearerAuthorized(req, token) {
+  if (!token) return false;
   const h = req.headers['authorization'] || '';
   const m = /^Bearer\s+(.+)$/i.exec(h);
-  return !!(m && m[1] && timingSafeStr(m[1], REGISTER_API_TOKEN));
+  return !!(m && m[1] && timingSafeStr(m[1], token));
+}
+function apiAuthorized(req) {
+  return REGISTER_API_ENABLED && bearerAuthorized(req, REGISTER_API_TOKEN);
+}
+function loginApiAuthorized(req) {
+  return LOGIN_API_ENABLED && bearerAuthorized(req, LOGIN_API_TOKEN);
 }
 function readJsonBody(req, limit) {
   return readBody(req, limit).then((body) => {
     try { return JSON.parse(body); } catch (e) { throw new Error('invalid JSON body'); }
   });
+}
+
+// Ask an OpenAI-compatible provider for its model list (GET <baseURL>/models
+// with the API key). Used by the model registration API so callers do not have
+// to know the models ahead of time. Returns up to 100 model ids.
+async function fetchProviderModels(baseURL, apiKey) {
+  const url = String(baseURL).replace(/\/+$/, '') + '/models';
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 15000);
+  try {
+    const res = await fetch(url, {
+      method: 'GET',
+      headers: { 'Authorization': 'Bearer ' + apiKey, 'Accept': 'application/json' },
+      signal: controller.signal,
+    });
+    if (!res.ok) throw new Error('HTTP ' + res.status + (res.statusText ? ' ' + res.statusText : ''));
+    const j = await res.json();
+    if (!j || !Array.isArray(j.data)) throw new Error('provider response has no data array');
+    const ids = j.data.map((m) => (m && typeof m.id === 'string') ? m.id.trim() : '').filter(Boolean);
+    if (ids.length === 0) throw new Error('provider returned no models');
+    return ids.slice(0, 100);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 const UPLOAD_HELPER = process.env.UPLOAD_HELPER || '/opt/deepseek-harness/bin/dsh-file-put';
 const FILE_STAT_HELPER = process.env.FILE_STAT_HELPER || '/opt/deepseek-harness/bin/dsh-file-stat';
@@ -329,6 +367,54 @@ function setSession(res, user) {
 }
 function clearSession(res) {
   res.setHeader('Set-Cookie', cookieHeader(COOKIE_NAME, '', { maxAge: 0, path: '/' }));
+}
+
+function ticketKey(ticket) {
+  return crypto.createHash('sha256').update(ticket).digest('base64url');
+}
+function cleanLoginTickets(now) {
+  for (const [key, value] of loginTickets) {
+    if (!value || value.expiresAt <= now) loginTickets.delete(key);
+  }
+}
+function issueLoginTicket(user, returnTo) {
+  const now = Date.now();
+  cleanLoginTickets(now);
+  if (loginTickets.size >= LOGIN_TICKET_MAX) return null;
+  const ticket = crypto.randomBytes(32).toString('base64url');
+  loginTickets.set(ticketKey(ticket), {
+    user: user,
+    returnTo: returnTo,
+    expiresAt: now + LOGIN_TICKET_TTL * 1000,
+  });
+  return ticket;
+}
+function consumeLoginTicket(ticket) {
+  if (!ticket || typeof ticket !== 'string' || ticket.length > 256) return null;
+  const key = ticketKey(ticket);
+  const value = loginTickets.get(key);
+  // Delete before checking/using it, so concurrent requests cannot replay it.
+  loginTickets.delete(key);
+  if (!value || value.expiresAt <= Date.now()) return null;
+  return value;
+}
+function safeReturnTo(value) {
+  if (value === undefined || value === null || value === '') return '/';
+  if (typeof value !== 'string' || value.length > 2048) return null;
+  try {
+    const base = new URL('http://dsh.invalid/');
+    const parsed = new URL(value, base);
+    if (parsed.origin !== base.origin || value[0] !== '/' || value.startsWith('//')) return null;
+    return parsed.pathname + parsed.search + parsed.hash;
+  } catch (e) {
+    return null;
+  }
+}
+function loginDestination(user, requested) {
+  const record = getUser(user);
+  if (record && record.admin === true) return '/__gw/admin';
+  if (!hasKey(user)) return '/setup';
+  return requested || '/';
 }
 
 // ---------- security headers (gateway-origin pages) ----------
@@ -1041,7 +1127,9 @@ function proxyUpgrade(req, socket, head, port) {
 
 // ---------- request logging ----------
 function logLine(req, status, extra) {
-  console.log(new Date().toISOString() + ' ' + clientIp(req) + ' ' + req.method + ' ' + req.url + ' ' + status + (extra ? ' ' + extra : ''));
+  // Login tickets are bearer credentials. Redact them even from local logs.
+  const safeUrl = String(req.url || '').replace(/([?&]ticket=)[^&#]*/gi, '$1[redacted]');
+  console.log(new Date().toISOString() + ' ' + clientIp(req) + ' ' + req.method + ' ' + safeUrl + ' ' + status + (extra ? ' ' + extra : ''));
 }
 
 // ---------- server ----------
@@ -1216,6 +1304,46 @@ const server = http.createServer(async (req, res) => {
     return json(res, 405, { ok: false, error: '方法不允许' });
   }
 
+  // ---------- external browser login (trusted backend -> one-time ticket) ----------
+  // 1. Trusted backend POSTs here with Authorization: Bearer DSH_LOGIN_API_KEY.
+  // 2. It redirects the user's browser to the returned loginUrl.
+  // 3. The browser consumes the one-time ticket, receives a session cookie,
+  //    and is redirected to a validated same-origin path.
+  if (pathname === '/api/login-ticket' && req.method === 'POST') {
+    if (!loginApiAuthorized(req)) return json(res, 401, { ok: false, error: 'unauthorized' });
+    let body;
+    try { body = await readJsonBody(req, 10000); } catch (e) { return json(res, 400, { ok: false, error: 'invalid JSON body' }); }
+    const username = String(body.username || '').trim();
+    if (!/^[A-Za-z0-9_-]{1,64}$/.test(username)) return json(res, 400, { ok: false, error: 'invalid username' });
+    if (!getUser(username)) return json(res, 404, { ok: false, error: 'user not found' });
+    const returnTo = safeReturnTo(body.returnTo);
+    if (returnTo === null) return json(res, 400, { ok: false, error: 'returnTo must be a same-origin absolute path' });
+    const ticket = issueLoginTicket(username, returnTo);
+    if (!ticket) return json(res, 503, { ok: false, error: 'too many outstanding login tickets' });
+    res.setHeader('Cache-Control', 'no-store');
+    logLine(req, 200, 'login-ticket ' + username);
+    return json(res, 200, {
+      ok: true,
+      loginUrl: '/auth/external?ticket=' + encodeURIComponent(ticket),
+      expiresIn: LOGIN_TICKET_TTL,
+    });
+  }
+
+  if (pathname === '/auth/external' && req.method === 'GET') {
+    let ticket = '';
+    try { ticket = new URL(req.url, 'http://gw').searchParams.get('ticket') || ''; } catch (e) {}
+    const login = consumeLoginTicket(ticket);
+    if (!login || !getUser(login.user)) {
+      logLine(req, 302, 'external-login invalid');
+      return redirect(res, '/login');
+    }
+    setSession(res, login.user);
+    res.setHeader('Referrer-Policy', 'no-referrer');
+    const destination = loginDestination(login.user, login.returnTo);
+    logLine(req, 302, 'external-login ' + login.user);
+    return redirect(res, destination);
+  }
+
   // ---------- external registration API (Bearer token) ----------
   // Creates the user only; custom providers are registered afterwards via
   // POST /api/users/<username>/provider (with the API key).
@@ -1258,21 +1386,41 @@ const server = http.createServer(async (req, res) => {
     if (!p || typeof p !== 'object' || Array.isArray(p)) return json(res, 400, { ok: false, error: 'provider is required' });
     const pname = String(p.name || '').trim();
     const baseURL = String(p.baseURL || '').trim();
-    const model = String(p.model || '').trim();
     if (!/^[A-Za-z0-9_-]{1,64}$/.test(pname)) return json(res, 400, { ok: false, error: 'invalid provider name (letters, digits, underscore, hyphen)' });
     if (!/^https?:\/\/[^\s]+$/.test(baseURL)) return json(res, 400, { ok: false, error: 'invalid provider baseURL (must be an http(s) URL)' });
-    if (!model || model.length > 128) return json(res, 400, { ok: false, error: 'invalid provider model' });
     const papi = (p.api === undefined || p.api === null || p.api === '') ? 'openai-completions' : String(p.api);
     if (!['openai-completions', 'openai-responses', 'anthropic-messages'].includes(papi)) {
       return json(res, 400, { ok: false, error: 'invalid provider api (openai-completions | openai-responses | anthropic-messages)' });
     }
     const key = String(body.apiKey !== undefined ? body.apiKey : body.key || '').trim();
     if (!key) return json(res, 400, { ok: false, error: 'apiKey is required' });
+    // Models: an explicit `model` (or `models` array) is used as-is; otherwise
+    // the gateway asks the provider for its model list (GET <baseURL>/models
+    // with the API key) so the caller does not have to know them.
+    let models = null;
+    if (Array.isArray(p.models) && p.models.length > 0) {
+      models = p.models.map((m) => String(m).trim()).filter((m) => m && m.length <= 128);
+      if (models.length === 0) return json(res, 400, { ok: false, error: 'invalid provider models' });
+    } else if (p.model !== undefined && p.model !== null && String(p.model).trim() !== '') {
+      const m = String(p.model).trim();
+      if (!m || m.length > 128) return json(res, 400, { ok: false, error: 'invalid provider model' });
+      models = [m];
+    } else {
+      try {
+        models = await fetchProviderModels(baseURL, key);
+      } catch (e) {
+        logLine(req, 502, 'api-provider fetch-models-fail ' + name + ' ' + String(e && e.message || e).slice(0, 160));
+        return json(res, 502, {
+          ok: false,
+          error: 'failed to fetch models from provider: ' + (e && e.message || e) + '; pass provider.model to set it explicitly',
+        });
+      }
+    }
     const u = getUser(name);
     if (!u || !u.port) return json(res, 404, { ok: false, error: 'user not found' });
     if (u.admin === true) return json(res, 400, { ok: false, error: 'admin has no instance' });
     const regSocket = path.join(path.dirname(USERS_FILE), 'control.sock');
-    const r = await runHelper([PROVIDER_HELPER, name, regSocket, JSON.stringify({ name: pname, baseURL, model, api: papi })], { timeoutMs: 90000, maxStdout: 64 * 1024 });
+    const r = await runHelper([PROVIDER_HELPER, name, regSocket, JSON.stringify({ name: pname, baseURL, api: papi, models })], { timeoutMs: 90000, maxStdout: 64 * 1024 });
     let reply = null;
     try { reply = JSON.parse(r.stdout); } catch (e) {}
     if (r.code !== 0 || !reply || reply.ok !== true) {
@@ -1296,8 +1444,8 @@ const server = http.createServer(async (req, res) => {
     }
     setUserKeyFlag(name, true);
     usersCacheAt = 0;
-    logLine(req, 200, 'api-provider ' + name + ' ref=' + ref);
-    return json(res, 200, { ok: true, user: name, provider: reply.result.provider, ref: ref });
+    logLine(req, 200, 'api-provider ' + name + ' ref=' + ref + ' models=' + models.length);
+    return json(res, 200, { ok: true, user: name, provider: reply.result.provider, ref: ref, models: models });
   }
 
   if (pathname === '/logout') {

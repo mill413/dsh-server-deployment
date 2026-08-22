@@ -29,6 +29,9 @@ const SECRET_FILE = process.env.SECRET_FILE || path.join(STATE_DIR, 'secret');
 const CWD_STATE_FILE = process.env.CWD_STATE_FILE || path.join(STATE_DIR, 'state-cwd.json');
 const CONTROL_SOCKET = process.env.DSH_CONTROL_SOCKET || path.join(STATE_DIR, 'control.sock');
 const DSH_BIN = process.env.DSH_DSH_BIN || path.join(APP_DIR, 'apps/cli/lib/bin.js');
+const BETTER_SIDEBAR_PACKAGE = 'dsh-better-sidebar';
+const BETTER_SIDEBAR_DIR = '/opt/dsh-public/profiles/web/node_modules/dsh-better-sidebar';
+const BETTER_SIDEBAR_SPEC = `link:${BETTER_SIDEBAR_DIR}`;
 const NODE_BIN = process.execPath;
 const GATEWAY_PORT = numberEnv('DSH_GATEWAY_PORT', 3100);
 const TENANT_PORT_BASE = numberEnv('DSH_TENANT_PORT_BASE', 3101);
@@ -116,6 +119,80 @@ function searchPatchContent() {
   ].join('\n');
 }
 
+// The image installs better-sidebar once through DSH's native plugin manager.
+// Each tenant then registers a DSH-managed link dependency to that immutable
+// root-owned package, retaining an independent profile without duplicating the
+// plugin dependency tree.
+function ensureBetterSidebarProfile(home, osUser) {
+  const sharedManifest = path.join(BETTER_SIDEBAR_DIR, 'package.json');
+  if (!fs.existsSync(sharedManifest)) {
+    throw new Error(`shared better-sidebar package is missing: ${sharedManifest}`);
+  }
+
+  const profileDir = path.join(home, 'profiles', 'web');
+  const profileManifest = path.join(profileDir, 'package.json');
+  const profileWorkspace = path.join(profileDir, 'pnpm-workspace.yaml');
+  fs.mkdirSync(profileDir, { recursive: true, mode: 0o700 });
+
+  let manifest = null;
+  if (fs.existsSync(profileManifest)) {
+    try {
+      manifest = JSON.parse(fs.readFileSync(profileManifest, 'utf8'));
+    } catch (error) {
+      throw new Error(`cannot read web profile manifest ${profileManifest}: ${error.message}`);
+    }
+    if (!manifest || typeof manifest !== 'object' || Array.isArray(manifest)) {
+      throw new Error(`web profile manifest must contain a JSON object: ${profileManifest}`);
+    }
+  }
+
+  const dependency = manifest && manifest.dependencies && manifest.dependencies[BETTER_SIDEBAR_PACKAGE];
+  const bundles = manifest && manifest.dsh && manifest.dsh.profile && manifest.dsh.profile.bundles;
+  const installedDir = path.join(profileDir, 'node_modules', BETTER_SIDEBAR_PACKAGE);
+  let resolvesToSharedPackage = false;
+  try { resolvesToSharedPackage = fs.realpathSync(installedDir) === BETTER_SIDEBAR_DIR; } catch {}
+  if (dependency === BETTER_SIDEBAR_SPEC && Array.isArray(bundles)
+      && bundles.includes(BETTER_SIDEBAR_PACKAGE) && resolvesToSharedPackage) return;
+
+  if (!fs.existsSync(profileWorkspace)) {
+    writeAtomic(profileWorkspace, [
+      'packages:',
+      '  - .',
+      '',
+      'nodeLinker: hoisted',
+      'autoInstallPeers: false',
+      '',
+    ].join('\n'), 0o644);
+  }
+
+  execFileSync('chown', ['-hR', `${osUser}:${osUser}`, home]);
+  const pluginCommand = (action, spec) => execFileSync('runuser', ['-u', osUser, '--', 'env',
+    `DSH_HOME=${home}`,
+    `HOME=${home}`,
+    'SHELL=/bin/bash',
+    `PATH=${process.env.PATH || '/usr/local/bin:/usr/bin:/bin'}`,
+    'NPM_CONFIG_UPDATE_NOTIFIER=false',
+    NODE_BIN, DSH_BIN, 'plugin', '--profile', 'web', action, spec,
+  ], { stdio: 'inherit' });
+
+  // Remove local installs and links from older deployment revisions through
+  // DSH before registering the image-owned shared package.
+  if (dependency) pluginCommand('remove', BETTER_SIDEBAR_PACKAGE);
+  pluginCommand('add', BETTER_SIDEBAR_SPEC);
+
+  // Remove the sibling fallback link created by the first shared-package
+  // revision; the current link is owned by pnpm inside web/node_modules.
+  const legacyLink = path.join(home, 'profiles', 'node_modules', BETTER_SIDEBAR_PACKAGE);
+  try {
+    const stat = fs.lstatSync(legacyLink);
+    if (stat.isSymbolicLink() && fs.readlinkSync(legacyLink).startsWith('/opt/dsh-plugins/')) {
+      fs.unlinkSync(legacyLink);
+    }
+  } catch (error) {
+    if (error.code !== 'ENOENT') throw error;
+  }
+}
+
 // ---------- custom provider provisioning (llm-pi-ai) ----------
 
 function providerApiKeyEnv(name) {
@@ -125,22 +202,31 @@ function providerApiKeyEnv(name) {
 // Validate an optional custom-provider spec from the registration API.
 // Returns null when absent; throws on malformed values. The API key itself is
 // NOT set here - the external caller writes it later via the key endpoint.
-// `api` must be one of the pi-ai protocols (an invalid protocol makes the
-// whole llm-pi-ai settings section fail validation and the route stays
-// dormant); 'openai-completions' is the OpenAI-compatible default.
+// `models` is an array of model ids (a single `model` string is also accepted
+// for convenience). `api` must be one of the pi-ai protocols (an invalid
+// protocol makes the whole llm-pi-ai settings section fail validation and the
+// route stays dormant); 'openai-completions' is the OpenAI-compatible default.
 const SUPPORTED_PROVIDER_APIS = ['openai-completions', 'openai-responses', 'anthropic-messages'];
 function validateProvider(provider) {
   if (provider === undefined || provider === null) return null;
   if (typeof provider !== 'object' || Array.isArray(provider)) throw new Error('provider must be an object');
-  const { name, baseURL, model } = provider;
+  const { name, baseURL } = provider;
   if (typeof name !== 'string' || !/^[A-Za-z0-9_-]{1,64}$/.test(name)) {
     throw new Error('provider name must be letters, digits, underscore or hyphen');
   }
   if (typeof baseURL !== 'string' || !/^https?:\/\/[^\s]+$/.test(baseURL)) {
     throw new Error('provider baseURL must be an http(s) URL');
   }
-  if (typeof model !== 'string' || model.length === 0 || model.length > 128) {
-    throw new Error('provider model is required');
+  let models;
+  if (Array.isArray(provider.models) && provider.models.length > 0) {
+    models = provider.models.map((m) => (typeof m === 'string' ? m.trim() : '')).filter((m) => m && m.length <= 128);
+    if (models.length === 0) throw new Error('provider models must be non-empty strings');
+  } else if (typeof provider.model === 'string' && provider.model.trim() !== '') {
+    const m = provider.model.trim();
+    if (m.length > 128) throw new Error('provider model is too long');
+    models = [m];
+  } else {
+    throw new Error('provider model(s) are required');
   }
   const api = provider.api === undefined || provider.api === null || provider.api === ''
     ? 'openai-completions'
@@ -148,7 +234,7 @@ function validateProvider(provider) {
   if (!SUPPORTED_PROVIDER_APIS.includes(api)) {
     throw new Error(`provider api must be one of: ${SUPPORTED_PROVIDER_APIS.join(', ')}`);
   }
-  return { name, baseURL, model, api };
+  return { name, baseURL, model: models[0], models, api };
 }
 
 // yq-safe YAML scalar quoting (double-quoted; JSON.stringify output is valid
@@ -160,11 +246,10 @@ function yq(v) { return JSON.stringify(String(v)); }
 // agent-default-model points at it so the web client uses it by default.
 function providerSettingsYaml(provider) {
   const ref = providerApiKeyEnv(provider.name);
-  const model = provider.model;
-  return [
+  const lines = [
     'agent-default-model:',
     `  provider: ${provider.name}`,
-    `  model: ${yq(model)}`,
+    `  model: ${yq(provider.models[0])}`,
     // No reasoningEffort: custom OpenAI-compatible models usually do not
     // declare reasoning capability, and a configured effort then fails every
     // call with UNSUPPORTED_REASONING_EFFORT. Omit it so the provider default
@@ -178,12 +263,17 @@ function providerSettingsYaml(provider) {
     `      api: ${provider.api}`,
     `      baseURL: ${yq(provider.baseURL)}`,
     '      models:',
-    `        - id: ${yq(model)}`,
-    `          name: ${yq(model)}`,
-    '          contextWindow: 32768',
-    '          maxTokens: 8192',
-    '',
-  ].join('\n');
+  ];
+  for (const m of provider.models) {
+    lines.push(
+      `        - id: ${yq(m)}`,
+      `          name: ${yq(m)}`,
+      '          contextWindow: 32768',
+      '          maxTokens: 8192',
+    );
+  }
+  lines.push('');
+  return lines.join('\n');
 }
 
 function provisionTenant(tenant, port, uid, existing) {
@@ -195,6 +285,7 @@ function provisionTenant(tenant, port, uid, existing) {
   if (!fs.existsSync(searchPatch)) {
     fs.writeFileSync(searchPatch, searchPatchContent(), { mode: 0o644 });
   }
+  ensureBetterSidebarProfile(home, osUser);
   if (tenant.provider) {
     // Custom provider: default the web client to it and skip the /setup gate
     // (the API key is written afterwards by the external key endpoint).
@@ -204,7 +295,7 @@ function provisionTenant(tenant, port, uid, existing) {
     const escaped = tenant.apiKey.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
     fs.writeFileSync(path.join(home, '.credentials.yaml'), `DEEPSEEK_API_KEY: "${escaped}"\n`, { mode: 0o600 });
   }
-  execFileSync('chown', ['-R', `${osUser}:${osUser}`, home]);
+  execFileSync('chown', ['-hR', `${osUser}:${osUser}`, home]);
   fs.chmodSync(home, 0o700);
   const passwordUnchanged = existing && existing.pwd && verifyPassword(tenant.password, existing.pwd);
   const record = {
@@ -221,6 +312,7 @@ function provisionTenant(tenant, port, uid, existing) {
       name: tenant.provider.name,
       baseURL: tenant.provider.baseURL,
       model: tenant.provider.model,
+      models: tenant.provider.models,
       api: tenant.provider.api,
       apiKeyEnv: providerApiKeyEnv(tenant.provider.name),
     };
@@ -239,7 +331,8 @@ function ensurePreservedRecord(name, record, uid) {
   if (!fs.existsSync(searchPatch)) {
     fs.writeFileSync(searchPatch, searchPatchContent(), { mode: 0o644 });
   }
-  execFileSync('chown', ['-R', `${osUser}:${osUser}`, record.home]);
+  ensureBetterSidebarProfile(record.home, osUser);
+  execFileSync('chown', ['-hR', `${osUser}:${osUser}`, record.home]);
   fs.chmodSync(record.home, 0o700);
   return { ...record, osUser, home: record.home, port: record.port };
 }
@@ -366,6 +459,7 @@ function tenantArgs(record) {
   const env = [
     `DSH_HOME=${record.home}`,
     `HOME=${record.home}`,
+    'SHELL=/bin/bash',
     `PATH=${process.env.PATH || '/usr/local/bin:/usr/bin:/bin'}`,
     `DEEPSEEK_BASE_URL=${process.env.DEEPSEEK_BASE_URL || 'https://api.deepseek.com'}`,
   ];
@@ -553,7 +647,7 @@ function controlSetKey(payload) {
   if (!record) throw new Error(`user not found: ${name}`);
   if (typeof key !== 'string' || key.length === 0) throw new Error('API key required');
   setApiKey(USERS_DIR, name, key);
-  try { execFileSync('chown', ['-R', `${record.osUser}:${record.osUser}`, record.home]); } catch (e) {}
+  try { execFileSync('chown', ['-hR', `${record.osUser}:${record.osUser}`, record.home]); } catch (e) {}
   record.keyConfigured = true;
   saveUsersDb(state.db);
   return { ok: true, result: { name } };
@@ -584,6 +678,7 @@ async function controlSetProvider(payload) {
     name: provider.name,
     baseURL: provider.baseURL,
     model: provider.model,
+    models: provider.models,
     api: provider.api,
     apiKeyEnv: providerApiKeyEnv(provider.name),
   };

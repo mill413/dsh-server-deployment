@@ -26,6 +26,7 @@ process.env.USERS_FILE = USERS_FILE;
 process.env.SECRET_FILE = path.join(TMP, 'secret');
 process.env.USERS_DIR = USERS_DIR;
 process.env.COOKIE_SECURE = '0';
+process.env.DSH_LOGIN_API_KEY = 'login-test-token';
 process.env.DEEPSEEK_BASE_URL = 'http://127.0.0.1:3999';
 
 const upstream = http.createServer((req, res) => {
@@ -89,6 +90,41 @@ function check(name, cond) {
 
   r = await req('GET', '/__gw/health');
   check('health 200', r.status === 200 && r.body.indexOf('"ok":true') >= 0);
+
+  r = await req('POST', '/api/login-ticket', {
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ username: 'tester' }),
+  });
+  check('login ticket requires bearer token', r.status === 401);
+
+  const loginApiHeaders = { Authorization: 'Bearer login-test-token', 'Content-Type': 'application/json' };
+  r = await req('POST', '/api/login-ticket', {
+    headers: loginApiHeaders,
+    body: JSON.stringify({ username: 'tester', returnTo: 'https://evil.example/' }),
+  });
+  check('login ticket rejects external returnTo', r.status === 400);
+
+  r = await req('POST', '/api/login-ticket', {
+    headers: loginApiHeaders,
+    body: JSON.stringify({ username: 'tester', returnTo: '/some/path?from=sso' }),
+  });
+  const issued = JSON.parse(r.body);
+  check('login ticket issued', r.status === 200 && issued.ok === true && /^\/auth\/external\?ticket=/.test(issued.loginUrl) && issued.expiresIn === 60);
+  r = await req('GET', issued.loginUrl);
+  check('login ticket sets session and redirects', r.status === 302 && r.headers.location === '/some/path?from=sso' && !!cookies(r.headers['set-cookie'])['dsh_session']);
+  const externalSess = cookies(r.headers['set-cookie'])['dsh_session'];
+  r = await req('GET', issued.loginUrl);
+  check('login ticket cannot be replayed', r.status === 302 && r.headers.location === '/login');
+  r = await req('GET', '/some/path', { headers: { Cookie: 'dsh_session=' + externalSess } });
+  check('external login session works', r.status === 200 && r.body.indexOf('UPSTREAM-OK /some/path') >= 0);
+
+  r = await req('POST', '/api/login-ticket', {
+    headers: loginApiHeaders,
+    body: JSON.stringify({ username: 'nokey', returnTo: '/some/path' }),
+  });
+  const noKeyIssued = JSON.parse(r.body);
+  r = await req('GET', noKeyIssued.loginUrl);
+  check('external login without key redirects to setup', r.status === 302 && r.headers.location === '/setup');
 
   r = await req('GET', '/login');
   check('login page brand', r.status === 200 && r.body.indexOf('DeepSeek Harness') >= 0);

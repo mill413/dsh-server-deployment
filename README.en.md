@@ -64,7 +64,7 @@ nginx/                  # TLS reverse-proxy example config (placeholder domain)
 
 ## Docker test on a trusted network
 
-During the build, the Docker test image shallow-clones the latest `master` branch directly from the official `https://github.com/deepseek-ai/deepseek-harness.git`; it does not read a sibling local Harness checkout. The runtime image keeps the complete Harness source and build output under `/opt/deepseek-harness`, plus this complete deployment repository under `/opt/dsh-server-deployment`. The gateway and tenant instances share one container network namespace, while every instance still runs under its own `dsh-<name>` OS account with a separate `DSH_HOME`. The entrypoint applies the loopback firewall before starting any tenant and terminates the container if isolation cannot be installed. It needs only the `NET_ADMIN` capability, not `--privileged` or systemd inside the container.
+During the build, the Docker test image shallow-clones the latest `master` branch directly from the official `https://github.com/deepseek-ai/deepseek-harness.git`; it does not read a sibling local Harness checkout. The build runs `dsh plugin --profile web add dsh-better-sidebar` once in a public profile and stores the complete dependency tree as root-owned read-only files under `/opt/dsh-public`. Through DSH's native plugin manager, the entrypoint registers a `link:` dependency to that package in every tenant's independent `web` profile; persisted and runtime-created users are both covered without copying the dependency tree. The runtime image includes pnpm and the build tools needed for other native plugins, and keeps the complete Harness source and build output under `/opt/deepseek-harness`, plus this complete deployment repository under `/opt/dsh-server-deployment`. The gateway and tenant instances share one container network namespace, while every instance still runs under its own `dsh-<name>` OS account with a separate `DSH_HOME`. The entrypoint applies the loopback firewall before starting any tenant and terminates the container if isolation cannot be installed. It needs only the `NET_ADMIN` capability, not `--privileged` or systemd inside the container.
 
 All Docker files live in `docker/`. The commands below run from the **repository root** (compose is passed with `-f`; the build context is the repository root, so the Dockerfile path is `docker/Dockerfile`):
 
@@ -121,6 +121,27 @@ The login page has a "注册新账号" (register) link so users can create their
 - **Password change**: edit `DSH_ADMIN_PASSWORD` and restart the container (sessions are invalidated). Do not use `dsh-users passwd admin` — the env var overwrites it on the next boot.
 - To disable, unset `DSH_ADMIN_PASSWORD` and remove the admin record from `users.json`.
 
+### External automatic login (one-time ticket)
+
+After setting a dedicated `DSH_LOGIN_API_KEY`, a trusted external **backend service** can obtain a one-time login URL for an existing user. The long-lived key must only exist server-side; never place it in browser JavaScript, a URL, or frontend configuration. The local test Compose defaults to `login-test-token` and allows an environment override of the same name; never use that default in production.
+
+First, the external backend issues a ticket (`returnTo` is optional and only same-origin paths beginning with `/` are accepted):
+
+```bash
+curl -X POST https://dsh.example.com/api/login-ticket \
+  -H "Authorization: Bearer <DSH_LOGIN_API_KEY>" \
+  -H "Content-Type: application/json" \
+  -d '{"username":"alice","returnTo":"/"}'
+# → 200 {"ok":true,"loginUrl":"/auth/external?ticket=...","expiresIn":60}
+```
+
+The external backend then redirects the user's browser to `https://dsh.example.com` plus the returned `loginUrl`. DSH consumes the ticket, sets the `dsh_session` cookie, and redirects to `returnTo`; a normal user without a configured key goes to `/setup` first, while an admin goes to the admin console.
+
+- Tickets expire after 60 seconds by default, are single-use, and disappear on process restart. Set `LOGIN_TICKET_TTL` to 10–300 seconds if needed.
+- The endpoint is disabled when `DSH_LOGIN_API_KEY` is unset. Unknown users return 404; a missing or invalid Bearer token returns 401.
+- Tickets live in gateway process memory, so the current deployment must use a single gateway replica; issuing and consuming a ticket must reach the same process.
+- `DSH_LOGIN_API_KEY` grants the ability to log in as any existing user. Keep it separate from `DSH_REGISTER_API_KEY` and inject it from a secret store such as a Kubernetes Secret.
+
 ### External registration API & model registration (machine-to-machine)
 
 Setting `DSH_REGISTER_API_KEY` (compose env var, default `register-test-token`) enables two Bearer-token endpoints; leaving it unset disables them entirely.
@@ -149,8 +170,9 @@ curl -X POST http://<host>:20810/api/users/alice2/provider \
 # → 200 {"ok":true,"user":"alice2","provider":{"name":"my-gateway","baseURL":"...","model":"gpt-4o-mini","apiKeyEnv":"MY_GATEWAY_API_KEY"},"ref":"MY_GATEWAY_API_KEY"}
 ```
 
-- **Strict validation**: `provider` is required (name limited to letters/digits/underscore/hyphen, baseURL must be an http(s) URL, model required); `provider.api` is optional — `openai-completions` (default) / `openai-responses` / `anthropic-messages` — an invalid value makes the whole settings section rejected and the model unusable; `apiKey` is required; the user must exist and not be the admin.
-- Effect: writes the user's `settings.yaml` (an `llm-pi-ai.providers.<name>` OpenAI-compatible profile plus `agent-default-model` pointing at it) and **restarts that user's instance so the config goes live**; the key is written by the user's own instance via the loopback RPC into their private `.credentials.yaml` (0600, owner-only) — the same write path as `/setup`.
+- **Strict validation**: `provider` is required (name limited to letters/digits/underscore/hyphen, baseURL must be an http(s) URL); `provider.api` is optional — `openai-completions` (default) / `openai-responses` / `anthropic-messages` — an invalid value makes the whole settings section rejected and the model unusable; `apiKey` is required; the user must exist and not be the admin.
+- **Automatic model discovery**: when `provider.model` (or a `models` array) is omitted, the gateway calls `GET <baseURL>/models` with the API key and writes the fetched model list (capped at 100) into the user's config; a fetch failure returns 502 with a hint to pass `provider.model` explicitly. Passing `model`/`models` skips the fetch. The response's `models` array is the effective model list.
+- Effect: writes the user's `settings.yaml` (an `llm-pi-ai.providers.<name>` OpenAI-compatible profile plus `agent-default-model` pointing at the first model) and **restarts that user's instance so the config goes live**; the key is written by the user's own instance via the loopback RPC into their private `.credentials.yaml` (0600, owner-only) — the same write path as `/setup`.
 - Re-calling the endpoint **replaces** the provider config and key (change baseURL/model/key anytime). The returned `ref` is the provider's credential name (`<NAME>_API_KEY`).
 - Once configured, the user skips `/setup` and the provider is the default on login.
 
@@ -201,6 +223,7 @@ The second command must fail to connect. The image health check covers the gatew
 | `USERS_FILE`, `SECRET_FILE`, `USERS_DIR` | gateway | `/opt/deepseek-harness/...` |
 | `UPLOAD_HELPER`, `FILE_STAT_HELPER`, `FILE_READ_HELPER`, `FILE_LIST_HELPER` | absolute paths of helpers called by the gateway | `/opt/deepseek-harness/bin/dsh-file-*` (**if you customize the prefix you MUST update sudoers and these four variables in sync**) |
 | `HOST`, `PORT`, `SESSION_TTL`, `COOKIE_SECURE`, `DEEPSEEK_BASE_URL`, `UPLOAD_MAX_MB`, `MAX_IP_ATTEMPTS`, `MAX_USER_ATTEMPTS`, `WINDOW_MS`, `LOCK_MS` | gateway | see `gateway/server.js` |
+| `DSH_LOGIN_API_KEY`, `LOGIN_TICKET_TTL` | gateway external login | disabled by default; tickets default to 60s |
 
 `bin/dsh-users.sh` and `bin/dsh-file-list` locate themselves relative to their own path: any checkout directory works as-is (`dsh-users.sh` auto-re-privileges to root on first call; node resolves relative to the script location, falling back to `PATH`). When using a custom installation prefix, generate the systemd units with the `sed` command above; the gateway systemd unit also supports `EnvironmentFile=-/etc/default/dsh-gateway` for injecting the environment variables above in one place.
 

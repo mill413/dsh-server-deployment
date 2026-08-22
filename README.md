@@ -64,7 +64,7 @@ nginx/                  # TLS 反向代理示例配置（已占位化域名）
 
 ## Docker 可信网络测试
 
-Docker 测试镜像会在构建阶段从官方 `https://github.com/deepseek-ai/deepseek-harness.git` 的 `master` 分支浅克隆最新代码并完成构建，不读取本机同级 harness 仓库。运行镜像完整保留 `/opt/deepseek-harness` 源码与构建产物，以及 `/opt/dsh-server-deployment` 下的本部署仓库。网关与多个租户实例位于同一容器网络命名空间，但每个实例仍以独立的 `dsh-<name>` OS 账号和独立 `DSH_HOME` 运行。入口进程在启动租户前应用回环防火墙；隔离规则失败会直接终止容器。容器只需要 `NET_ADMIN` capability，不需要 `--privileged` 或容器内 systemd。
+Docker 测试镜像会在构建阶段从官方 `https://github.com/deepseek-ai/deepseek-harness.git` 的 `master` 分支浅克隆最新代码并完成构建，不读取本机同级 harness 仓库。构建阶段会在公共 profile 中实际执行一次 `dsh plugin --profile web add dsh-better-sidebar`；完整插件依赖树以 root 只读形式保存在 `/opt/dsh-public`。入口进程通过 DSH 原生插件管理器，在每个租户的独立 `web` profile 中登记指向该公共包的 `link:` 依赖；已有持久化用户和运行时新增用户都会覆盖，且不会复制插件依赖树。运行镜像包含 pnpm 以及安装其他原生插件所需的构建工具，并完整保留 `/opt/deepseek-harness` 源码与构建产物，以及 `/opt/dsh-server-deployment` 下的本部署仓库。网关与多个租户实例位于同一容器网络命名空间，但每个实例仍以独立的 `dsh-<name>` OS 账号和独立 `DSH_HOME` 运行。入口进程在启动租户前应用回环防火墙；隔离规则失败会直接终止容器。容器只需要 `NET_ADMIN` capability，不需要 `--privileged` 或容器内 systemd。
 
 所有 docker 文件都在 `docker/` 目录下，以下命令均从**仓库根目录**执行（compose 文件用 `-f` 指定；构建上下文是仓库根目录，因此 Dockerfile 用 `docker/Dockerfile` 相对路径）：
 
@@ -121,6 +121,27 @@ docker compose -f docker/compose.yml exec dsh-multitenant dsh-users del carol   
 - **改密**：改 `DSH_ADMIN_PASSWORD` 环境变量后重启容器（会话自动失效）；不要用 `dsh-users passwd admin`（下次启动会被环境变量覆盖）。
 - 去掉 `DSH_ADMIN_PASSWORD` 并删除 `users.json` 里的 admin 记录即可关闭。
 
+### 外部自动登录（一次性票据）
+
+配置独立的 `DSH_LOGIN_API_KEY` 后，可信的外部**后端服务**可以为已有用户换取一次性登录地址。长期密钥只允许出现在服务端，严禁放入浏览器 JavaScript、URL 或前端配置。本地测试 Compose 默认使用 `login-test-token`，可通过同名宿主机环境变量覆盖；生产环境不可使用此默认值。
+
+第一步，外部后端换票（`returnTo` 可选，且只接受本站 `/` 开头的相对路径）：
+
+```bash
+curl -X POST https://dsh.example.com/api/login-ticket \
+  -H "Authorization: Bearer <DSH_LOGIN_API_KEY>" \
+  -H "Content-Type: application/json" \
+  -d '{"username":"alice","returnTo":"/"}'
+# → 200 {"ok":true,"loginUrl":"/auth/external?ticket=...","expiresIn":60}
+```
+
+第二步，外部后端把用户浏览器 `302` 到 `https://dsh.example.com` 加返回的 `loginUrl`。DSH 消费票据、写入 `dsh_session` Cookie，再跳转到 `returnTo`；未配置 Key 的普通用户会优先进入 `/setup`，admin 会进入管理台。
+
+- 票据默认 60 秒有效、仅可使用一次、进程重启即失效；`LOGIN_TICKET_TTL` 可设为 10–300 秒。
+- 接口未配置 `DSH_LOGIN_API_KEY` 时保持关闭；未知用户返回 404，错误/缺失的 Bearer Token 返回 401。
+- 票据保存在网关进程内存中，因此当前部署必须保持单副本网关；换票与浏览器消费票据需要命中同一进程。
+- `DSH_LOGIN_API_KEY` 拥有“以任意已有用户登录”的高权限，必须与 `DSH_REGISTER_API_KEY` 分开并通过 Kubernetes Secret 等机密存储注入。
+
 ### 外部注册 API 与模型注册接口（机器对机器）
 
 配置 `DSH_REGISTER_API_KEY`（compose 环境变量，默认 `register-test-token`）后启用两个 Bearer Token 接口；不配置则完全关闭。
@@ -149,8 +170,9 @@ curl -X POST http://<主机>:20810/api/users/alice2/provider \
 # → 200 {"ok":true,"user":"alice2","provider":{"name":"my-gateway","baseURL":"...","model":"gpt-4o-mini","apiKeyEnv":"MY_GATEWAY_API_KEY"},"ref":"MY_GATEWAY_API_KEY"}
 ```
 
-- **严格校验**：`provider` 必填（name 限字母/数字/下划线/连字符、baseURL 必须是 http(s) URL、model 必填）；`provider.api` 可选，取值 `openai-completions`（默认）/ `openai-responses` / `anthropic-messages`，必须合法否则整个设置段会被拒绝、模型不可用；`apiKey` 必填；用户必须存在且非 admin。
-- 效果：写入用户 `settings.yaml`（`llm-pi-ai.providers.<name>` OpenAI 兼容适配器 + `agent-default-model` 指向它）并**重启该用户实例使配置生效**；key 经回环 RPC 由用户自己的实例写入私有 `.credentials.yaml`（0600，属主仅本人），与 `/setup` 同一写路径。
+- **严格校验**：`provider` 必填（name 限字母/数字/下划线/连字符、baseURL 必须是 http(s) URL）；`provider.api` 可选，取值 `openai-completions`（默认）/ `openai-responses` / `anthropic-messages`，必须合法否则整个设置段会被拒绝、模型不可用；`apiKey` 必填；用户必须存在且非 admin。
+- **模型自动获取**：不传 `provider.model`（或 `models` 数组）时，网关用 `apiKey` 调 `GET <baseURL>/models` 自动拉取模型列表（上限 100 个）全部写入配置；拉取失败返回 502 并提示可显式传 `model` 兜底。显式传 `model`/`models` 则跳过拉取。响应里的 `models` 即生效的模型列表。
+- 效果：写入用户 `settings.yaml`（`llm-pi-ai.providers.<name>` OpenAI 兼容适配器 + `agent-default-model` 指向第一个模型）并**重启该用户实例使配置生效**；key 经回环 RPC 由用户自己的实例写入私有 `.credentials.yaml`（0600，属主仅本人），与 `/setup` 同一写路径。
 - 重复调用 = **覆盖更新**（换 baseURL/模型/Key 都行）；返回的 `ref` 是该提供商的凭证名（`<NAME>_API_KEY`）。
 - 配置完成后用户跳过 `/setup`，登录即默认使用该提供商。
 
@@ -201,6 +223,7 @@ docker compose -f docker/compose.yml exec dsh-multitenant runuser -u dsh-alice -
 | `USERS_FILE`、`SECRET_FILE`、`USERS_DIR` | 网关 | `/opt/deepseek-harness/...` |
 | `UPLOAD_HELPER`、`FILE_STAT_HELPER`、`FILE_READ_HELPER`、`FILE_LIST_HELPER` | 网关调用助手的绝对路径 | `/opt/deepseek-harness/bin/dsh-file-*`（**自定义前缀时必须同步改 sudoers 与这四个变量**） |
 | `HOST`、`PORT`、`SESSION_TTL`、`COOKIE_SECURE`、`DEEPSEEK_BASE_URL`、`UPLOAD_MAX_MB`、`MAX_IP_ATTEMPTS`、`MAX_USER_ATTEMPTS`、`WINDOW_MS`、`LOCK_MS` | 网关 | 见 `gateway/server.js` |
+| `DSH_LOGIN_API_KEY`、`LOGIN_TICKET_TTL` | 网关外部自动登录 | 默认关闭；票据默认 60 秒 |
 
 `bin/dsh-users.sh` 与 `bin/dsh-file-list` 已按自身位置自定位：任意目录检出即可直接运行（`dsh-users.sh` 首次调用自动重提权为 root；node 解析相对脚本位置，缺失时回退 `PATH`）。自定义安装前缀时 systemd 单元用上面的 `sed` 命令生成；网关 systemd 单元还支持 `EnvironmentFile=-/etc/default/dsh-gateway`，可在该文件里统一注入上述环境变量。
 
