@@ -16,7 +16,7 @@
 - **用户隔离**：每个用户一个独立 DSH 实例（独立端口），以独立系统账号 `dsh-<name>` 运行，`DSH_HOME` 指向其 0700 私有目录；`userctl.js` 一条命令完成建号 / 改密 / 删号 / 预置 Key。
 - **每用户独立 API Key**：登录后无 Key 自动引导 `/setup` 填写，经回环 RPC 写入该用户私有的 `.credentials.yaml`（0600，属主仅本人）。
 - **回环特权接口修复**：网关向后端呈现 `Host: 127.0.0.1:<port>` 并剥离浏览器信任标记，DSH 钉在回环的 settings / credentials / agentPreset 等特权接口在公网访问下同样可用。
-- **交付文件抽屉（文件管理）**：主界面右下角**一颗**可拖动胶囊「🗂 文件管理」（2026-08 起由「交付文件」+「上传文件」双胶囊合并而来），白色抽屉内嵌文件浏览器——目录浏览、下载（attachment + 中文文件名）、多文件上传（100MB 上限）；自动定位到当前对话所在工作目录（嗅探会话 RPC 追踪 cwd，持久化恢复）。胶囊在 SPA 弹窗（设置面板/模态）打开时自动隐藏，避免遮挡。
+- **交付文件抽屉（文件管理）**：入口位于左侧栏底部、“退出登录”和“设置”上方，复用设置行样式；侧栏展开时显示图标与“文件管理”，收起时只显示同尺寸图标。点击后打开白色文件抽屉——目录浏览、下载（attachment + 中文文件名）、多文件上传（100MB 上限）；自动定位到当前对话所在工作目录（嗅探会话 RPC 追踪 cwd，持久化恢复）。
 - **安全边界**：所有用户文件访问经 sudoers 固定路径的助手脚本——root 仅校验参数并降权，文件操作以 `dsh-<name>` 用户自身身份执行（修复 issue #1 的 TOCTOU 竞态）；网关进程对用户目录零权限；隐藏文件（含 `.credentials.yaml`）不可下载；SPA 注入尊重 `prefers-reduced-motion`、无玻璃拟态/渐变装饰。
 
 ## 架构
@@ -56,7 +56,7 @@ docker/                 # Docker 部署（全部 docker 相关文件集中于此
   dsh-register          #   自助注册 root 助手（sudoers 白名单，转发注册到监管进程）
   entrypoint.js         #   容器入口/监管进程：种子租户 + 运行时增删用户 + 控制 socket
   userctl.js            #   容器内 dsh-users 命令的转发客户端
-  healthcheck.js        #   健康检查（网关 + 所有租户端口）
+  healthcheck.js        #   健康检查（懒启动检查网关；eager 模式检查租户端口）
   dsh-gateway.sudoers   #   网关 sudoers 白名单（镜像内固定路径）
 units/                  # systemd 单元模板（网关 + 每用户实例由 userctl 生成）
 nginx/                  # TLS 反向代理示例配置（已占位化域名）
@@ -64,16 +64,26 @@ nginx/                  # TLS 反向代理示例配置（已占位化域名）
 
 ## Docker 可信网络测试
 
-Docker 测试镜像会在构建阶段从官方 `https://github.com/deepseek-ai/deepseek-harness.git` 的 `master` 分支浅克隆最新代码并完成构建，不读取本机同级 harness 仓库。构建阶段会在公共 profile 中实际执行一次 `dsh plugin --profile web add dsh-better-sidebar`；完整插件依赖树以 root 只读形式保存在 `/opt/dsh-public`。入口进程通过 DSH 原生插件管理器，在每个租户的独立 `web` profile 中登记指向该公共包的 `link:` 依赖；已有持久化用户和运行时新增用户都会覆盖，且不会复制插件依赖树。运行镜像包含 pnpm 以及安装其他原生插件所需的构建工具，并完整保留 `/opt/deepseek-harness` 源码与构建产物，以及 `/opt/dsh-server-deployment` 下的本部署仓库。网关与多个租户实例位于同一容器网络命名空间，但每个实例仍以独立的 `dsh-<name>` OS 账号和独立 `DSH_HOME` 运行。入口进程在启动租户前应用回环防火墙；隔离规则失败会直接终止容器。容器只需要 `NET_ADMIN` capability，不需要 `--privileged` 或容器内 systemd。
+Docker 测试镜像会在构建阶段从官方 `https://github.com/deepseek-ai/deepseek-harness.git` 的 `master` 分支浅克隆最新代码并完成构建，不读取本机同级 harness 仓库。构建阶段会在公共 profile 中实际执行一次 `dsh plugin --profile web add dsh-better-sidebar`；完整插件依赖树以 root 只读形式保存在 `/opt/dsh-public`。入口进程为每个租户写入轻量 `link:` 依赖和软链接，不在注册热路径启动 pnpm；已有持久化用户和运行时新增用户都会覆盖，且不会复制插件依赖树。运行镜像包含 pnpm 以及安装其他原生插件所需的构建工具，并完整保留 `/opt/deepseek-harness` 源码与构建产物，以及 `/opt/dsh-server-deployment` 下的本部署仓库。网关与多个租户实例位于同一容器网络命名空间，但每个实例仍以独立的 `dsh-<name>` OS 账号和独立 `DSH_HOME` 运行。入口进程在启动租户前应用线性规模的回环防火墙规则；隔离规则失败会直接终止容器。容器只需要 `NET_ADMIN` capability，不需要 `--privileged` 或容器内 systemd。
 
-所有 docker 文件都在 `docker/` 目录下，以下命令均从**仓库根目录**执行（compose 文件用 `-f` 指定；构建上下文是仓库根目录，因此 Dockerfile 用 `docker/Dockerfile` 相对路径）：
+所有 Docker 租户启动时都会应用部署级 patch `docker/disable-llm-deepseek.patch.yml`，以 `disabled: true` 停用内置 `llm-deepseek` 条目；`llm-pi-ai` 与每个用户自己的模型设置保持可用。该 patch 位于用户配置层之后，因此用户目录无需复制或修改这项部署策略。
+
+网关在已认证后代理的 DSH 页面中注入受信任网关标记；镜像构建时应用 `docker/patches/deepseek-harness-trusted-gateway.patch`，使局域网 IP 或反向代理域名下的浏览器使用 Host Settings Mirror。服务端仍执行会话、Host、Origin 与租户隔离校验；该适配只解除上游客户端对非 loopback 浏览器的 UI 限制。
+
+镜像拆分为两层：`docker/Dockerfile.base` 负责构建 DSH、应用 Harness 补丁、安装系统依赖和公共插件；`docker/Dockerfile` 只基于该 base 复制并安装本部署仓库。修改网关或入口代码时只需重建 final，无需重新编译 DSH。所有命令从**仓库根目录**执行：
 
 ```bash
-docker compose -f docker/compose.yml build --pull --no-cache
+# DSH、系统环境或公共插件变化时构建 base（耗时较长）
+docker build --pull -f docker/Dockerfile.base -t dsh-server-base:local .
+
+# 部署代码变化时只构建 final（通常只需数秒）
+docker compose -f docker/compose.yml build
 docker compose -f docker/compose.yml up -d
 docker compose -f docker/compose.yml ps
 docker compose -f docker/compose.yml logs --tail=100
 ```
+
+使用其他 base 标签时设置 `DSH_BASE_IMAGE`，例如：`DSH_BASE_IMAGE=registry.example.com/dsh-server-base:v1 docker compose -f docker/compose.yml build`。最终镜像包含全部父层，单独 `docker save dsh-server-deployment:local` 即可完整导出运行镜像。
 
 浏览器打开 `http://127.0.0.1:20810`，默认测试账号为：
 
@@ -102,16 +112,64 @@ docker compose -f docker/compose.yml exec dsh-multitenant dsh-users del carol   
 
 - 运行时新增的用户写入 `docker/data/gateway/users.json`（容器内 `/var/lib/dsh/gateway/users.json`），**容器重建/重启后依然存在**（重启时种子列表与存量用户合并，端口/口令/身份保持不变）。所有数据通过绑定挂载持久化在宿主机 `docker/data/`（容器内 `/var/lib/dsh`：`users/` 用户目录 + `gateway/` 状态），直接可见、可备份。
 - 删除用户请用 `dsh-users del`（会一并删除该用户的数据）；把用户从 `DSH_TENANTS_JSON` 里删掉**不会**删除已存在的用户。
-- `dsh-users` 与网关共享同一份用户库：新用户立即可登录，健康检查自动覆盖新端口（网关侧缓存最长 2 秒刷新）。
+- `dsh-users` 与网关共享同一份用户库：新用户立即可登录（网关侧缓存最长 2 秒刷新）。
 - 口令最少 8 位；`passwd` 会使该用户所有已签发会话立即失效。
+- 默认启用 `DSH_LAZY_TENANTS=1`：建号只创建 OS 账号、独立 HOME、端口记录、共享插件链接和防火墙规则，不启动 DSH。用户首次成功登录时网关调用监管进程启动该用户实例并等待就绪；实例运行到用户退出/浏览器离线回收或容器重启。设置 `DSH_LAZY_TENANTS=0` 可恢复启动容器/建号时立即拉起全部实例的旧行为。
+- 登录后的 DSH 页面在左侧栏“设置”正上方提供“退出登录”按钮，直接复用设置行的样式和宽/窄状态：侧栏展开时显示图标与文字，收起时只显示同尺寸图标。手动退出会撤销该用户全部已签发会话，先停止租户进程组，再按租户唯一 OS UID 强制清理任何脱离进程组的后台进程；不会删除或修改用户 HOME、工作区、会话文件、配置或凭据。浏览器页面通过标签页心跳登记在线状态，关闭最后一个标签页后默认宽限 5 秒再执行相同回收；多标签页只关闭其中一个不会停止。浏览器崩溃、断网或来不及发送关闭通知时，默认 120 秒心跳超时后兜底回收并注销。会话撤销写入持久化用户记录，容器重启后旧 Cookie 也不会恢复。可用 `DSH_BROWSER_STOP_GRACE_MS` 和 `DSH_BROWSER_PRESENCE_TTL_MS` 调整。
+
+### 持久化共享 Web 插件（无需修改 Dockerfile）
+
+日常安装直接使用容器内的管理命令，不需要修改环境变量、Dockerfile 或重启容器：
+
+```bash
+# 查看共享插件
+docker compose -f docker/compose.yml exec dsh-multitenant dsh-users plugin list
+
+# 安装/升级 registry 插件（包名可从 spec 自动推断）
+docker compose -f docker/compose.yml exec dsh-multitenant \
+  dsh-users plugin add @huanlin/dsh-plugin-better-sidebar-plugin-office@0.1.2
+
+# Git、文件或 alias 等无法自动推断包名的 spec，显式给出包名
+docker compose -f docker/compose.yml exec dsh-multitenant \
+  dsh-users plugin add 'file:/tmp/my-plugin' --name my-plugin
+
+# 删除运行时共享插件
+docker compose -f docker/compose.yml exec dsh-multitenant \
+  dsh-users plugin remove some-plugin
+```
+
+命令通过入口监管进程把插件安装到 `/var/lib/dsh/shared-plugins`，默认允许插件及其全部传递依赖执行 `preinstall`、`install`、`postinstall` 等构建脚本，不需要 `--allow-build`。随后将共享 `link:` 依赖和软链接同步到所有已有用户，并只重启各用户的 DSH 进程使插件生效（容器和网关不重启）。运行时新增用户在自己的 DSH 进程启动前自动执行同一同步，因此会直接拥有并启用当前全部共享插件。共享目录位于 `/var/lib/dsh` 持久化卷中，Pod 重建后仍然存在，不会为每个用户重复安装依赖。由于安装脚本以容器 root 权限执行，只应安装可信插件。
+
+插件命令会在当前终端实时显示 pnpm 下载、构建、用户同步和租户重启输出。内网 registry 必须配置到共享安装 HOME；普通 `npm config set registry` 默认写入 `/root/.npmrc`，不会被共享安装进程读取：
+
+```bash
+kubectl exec -n <namespace> <pod> -- \
+  env HOME=/var/lib/dsh/shared-plugins \
+  npm config set registry http://<内网-npm-registry>
+
+kubectl exec -n <namespace> <pod> -- \
+  env HOME=/var/lib/dsh/shared-plugins \
+  pnpm config get registry
+```
+
+`DSH_SHARED_WEB_PLUGINS_JSON` 仍可作为首次部署时的批量声明方式：
+
+```yaml
+env:
+  - name: DSH_SHARED_WEB_PLUGINS_JSON
+    value: >-
+      [{"name":"@huanlin/dsh-plugin-better-sidebar-plugin-office","spec":"@huanlin/dsh-plugin-better-sidebar-plugin-office@0.1.2"}]
+```
+
+每项必须提供 npm 包 `name`；`spec` 可指定版本或其他 pnpm 支持的安装规格，省略时等于 `name`。旧配置中的 `allowBuilds` 字段会被忽略。配置项从环境变量删除时，已安装的持久化共享插件不会被自动删除。若一个插件仍在环境变量中声明，使用命令删除后也应同步移除该声明，否则下次 Pod 启动会再次安装。可用 `DSH_SHARED_PLUGINS_HOME` 覆盖共享根目录，默认是 `DSH_USERS_DIR` 的同级 `shared-plugins/`。
 
 ### 自助注册（登录页，Docker 模式）
 
-登录页有「注册新账号」链接，用户可自行创建账号（默认**完全开放**）。注册请求经网关 → sudoers 白名单助手 `dsh-register` → 入口监管进程完成建号（OS 账号/端口/实例/防火墙），与 CLI 建号同一套流程：
+网关支持通过登录页的「注册新账号」链接自行创建账号，但本仓库的 Docker Compose 默认设置 `DSH_ENABLE_REGISTER=0`，因此该链接和页面均关闭。开启后，注册请求经网关 → sudoers 白名单助手 `dsh-register` → 入口监管进程完成建号（OS 账号/端口/目录/防火墙），与 CLI 建号同一套流程；默认不会在注册请求中启动 DSH，首次登录才启动：
 
-- **开启条件**：镜像内置 `dsh-register` 助手时自动开启（主机部署无此助手，自动关闭）；可用环境变量强制：`DSH_ENABLE_REGISTER=1` 开启 / `DSH_ENABLE_REGISTER=0` 关闭。
+- **开启条件**：本 Compose 默认关闭；显式设置 `DSH_ENABLE_REGISTER=1` 才开启。未设置该变量时，镜像内置 `dsh-register` 助手会让功能自动开启（主机部署无此助手，自动关闭）。
 - **限制**：用户名仅限字母/数字/下划线/连字符；密码至少 8 位；同 IP 注册失败限流（`MAX_REGISTER_ATTEMPTS`，默认 10 次/15 分钟，防刷）。
-- **注意**：开放注册意味着任何能访问登录页的人都能创建账号（每个账号 = 一个独立进程 + 端口）。公网部署建议改为邀请制或加 HTTPS，并自行评估。
+- **注意**：开放注册意味着任何能访问登录页的人都能创建账号；每个真正登录过的账号会占用一个独立 DSH 进程和端口。公网部署建议改为邀请制或加 HTTPS，并自行评估。
 
 ### 管理控制台（admin 账号）
 
@@ -156,7 +214,7 @@ curl -X POST http://<主机>:20810/api/register \
 # → 200 {"ok":true,"user":"alice2","port":3107}
 ```
 
-- 只创建用户（OS 账号/端口/实例）；**不接收 provider**（传了返回 400 并提示用②）。
+- 只创建用户（OS 账号/端口/目录/防火墙规则），不启动 DSH；**不接收 provider**（传了返回 400 并提示用②）。
 - 用户名/密码均校验；重复注册返回 409；无 token 返回 401。
 
 **② 模型注册接口（配置自定义提供商 + 写入 API Key）** `POST /api/users/<username>/provider`
@@ -172,7 +230,7 @@ curl -X POST http://<主机>:20810/api/users/alice2/provider \
 
 - **严格校验**：`provider` 必填（name 限字母/数字/下划线/连字符、baseURL 必须是 http(s) URL）；`provider.api` 可选，取值 `openai-completions`（默认）/ `openai-responses` / `anthropic-messages`，必须合法否则整个设置段会被拒绝、模型不可用；`apiKey` 必填；用户必须存在且非 admin。
 - **模型自动获取**：不传 `provider.model`（或 `models` 数组）时，网关用 `apiKey` 调 `GET <baseURL>/models` 自动拉取模型列表（上限 100 个）全部写入配置；拉取失败返回 502 并提示可显式传 `model` 兜底。显式传 `model`/`models` 则跳过拉取。响应里的 `models` 即生效的模型列表。
-- 效果：写入用户 `settings.yaml`（`llm-pi-ai.providers.<name>` OpenAI 兼容适配器 + `agent-default-model` 指向第一个模型）并**重启该用户实例使配置生效**；key 经回环 RPC 由用户自己的实例写入私有 `.credentials.yaml`（0600，属主仅本人），与 `/setup` 同一写路径。
+- 效果：写入用户 `settings.yaml`（`llm-pi-ai.providers.<name>` OpenAI 兼容适配器 + `agent-default-model` 指向第一个模型）以及私有 `.credentials.yaml`（0600，属主仅本人）。未登录用户保持休眠，不会因为配置 provider 而启动；若实例已经运行，则只重启该用户实例使配置立即生效。
 - 重复调用 = **覆盖更新**（换 baseURL/模型/Key 都行）；返回的 `ref` 是该提供商的凭证名（`<NAME>_API_KEY`）。
 - 配置完成后用户跳过 `/setup`，登录即默认使用该提供商。
 
@@ -185,7 +243,7 @@ docker compose -f docker/compose.yml exec dsh-multitenant runuser -u dsh-alice -
   curl -fsS --connect-timeout 2 http://127.0.0.1:3102/ -o /dev/null
 ```
 
-第二条命令应连接失败。镜像健康检查同时验证网关和所有租户后端端口。该 Compose 面向单机可信网络验收，不包含公网 TLS、HA、动态扩缩容或生产密钥管理。
+第二条命令应连接失败。默认懒启动模式下镜像健康检查验证网关；活跃租户异常退出会使入口监管进程终止容器，由 Kubernetes/Docker 重启策略恢复。`DSH_LAZY_TENANTS=0` 时健康检查仍验证所有租户后端端口。该 Compose 面向单机可信网络验收，不包含公网 TLS、HA、动态扩缩容或生产密钥管理。
 
 ## 快速部署（概览）
 
