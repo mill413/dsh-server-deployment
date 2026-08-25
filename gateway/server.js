@@ -698,6 +698,7 @@ function adminPage(csrf) {
     '#plugin-log{max-height:260px;overflow:auto;background:#111827;color:#d1fae5;border-radius:10px;padding:12px;font:12px/1.55 var(--ds-font-family-code,monospace);white-space:pre-wrap;margin:10px 0 0}',
     '@media(max-width:800px){.plugin-form{grid-template-columns:1fr}.card{overflow-x:auto}}',
     '</style>',
+    TENANT_LIFECYCLE_SCRIPT,
   ].join('');
   return impeccableShell('管理控制台', body);
 }

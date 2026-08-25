@@ -168,6 +168,7 @@ function check(name, cond) {
   check('admin DSH proxy works', r.status === 200 && r.body.indexOf('UPSTREAM-OK /some/path') >= 0);
   r = await req('GET', '/__gw/admin', { headers: { Cookie: 'dsh_session=' + adminSess } });
   check('admin console remains available', r.status === 200 && r.body.indexOf('管理控制台') >= 0);
+  check('admin console keeps browser presence lease', r.body.indexOf('__DSH_GATEWAY_LIFECYCLE__') >= 0);
   r = await req('GET', '/__gw/admin/users', { headers: { Cookie: 'dsh_session=' + adminSess } });
   const adminUsers = JSON.parse(r.body);
   const testerStats = adminUsers.users.find((u) => u.name === 'tester');
