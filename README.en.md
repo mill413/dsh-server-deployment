@@ -148,8 +148,8 @@ The gateway supports self-service account creation through the login-page regist
 
 ### Admin console (admin account)
 
-- **admin account**: created/updated at boot from the `DSH_ADMIN_PASSWORD` env var (scrypt-hashed into `users.json`, flagged `admin: true`). It is a **management-only account with no DSH instance** (no OS account / port / process). After login it is redirected to the `/__gw/admin` console.
-- **Online users**: `/__gw/admin` lists all users with online status (sessions are stateless HMAC cookies, so "online" = a valid session with a request within the last **15 minutes**; last-activity time and source IP are shown), auto-refreshing every 10s; `/__gw/admin/users` returns the same data as JSON.
+- **admin account**: created/updated from `DSH_ADMIN_PASSWORD` (scrypt-hashed in `users.json`, flagged `admin: true`). It is now a full isolated tenant with its own `dsh-admin` OS account, HOME, port and lazy DSH; legacy management-only records are migrated at boot. Admin login enters its own DSH, whose sidebar includes an Admin Console action; the console links back to the workspace.
+- **Users and resources**: `/__gw/admin` lists online state, DSH running/sleeping state, summed RSS and process count for each tenant OS user, last activity and source IP, refreshing every 10s; `/__gw/admin/users` returns the same JSON. Summed RSS can double-count shared pages and is intended as a per-user usage indicator rather than unique container memory.
 - **Access control**: non-admin sessions are redirected away from `/__gw/admin`; the registration endpoint rejects the `admin` username (reserved).
 - **Password change**: edit `DSH_ADMIN_PASSWORD` and restart the container (sessions are invalidated). Do not use `dsh-users passwd admin` — the env var overwrites it on the next boot.
 - To disable, unset `DSH_ADMIN_PASSWORD` and remove the admin record from `users.json`.
@@ -203,7 +203,7 @@ curl -X POST http://<host>:20810/api/users/alice2/provider \
 # → 200 {"ok":true,"user":"alice2","provider":{"name":"my-gateway","baseURL":"...","model":"gpt-4o-mini","apiKeyEnv":"MY_GATEWAY_API_KEY"},"ref":"MY_GATEWAY_API_KEY"}
 ```
 
-- **Strict validation**: `provider` is required (name limited to letters/digits/underscore/hyphen, baseURL must be an http(s) URL); `provider.api` is optional — `openai-completions` (default) / `openai-responses` / `anthropic-messages` — an invalid value makes the whole settings section rejected and the model unusable; `apiKey` is required; the user must exist and not be the admin.
+- **Strict validation**: `provider` is required (name limited to letters/digits/underscore/hyphen, baseURL must be an http(s) URL); `provider.api` is optional — `openai-completions` (default) / `openai-responses` / `anthropic-messages` — an invalid value makes the whole settings section rejected and the model unusable; `apiKey` is required; the target user must exist (admin included).
 - **Automatic model discovery**: when `provider.model` (or a `models` array) is omitted, the gateway calls `GET <baseURL>/models` with the API key and writes the fetched model list (capped at 100) into the user's config; a fetch failure returns 502 with a hint to pass `provider.model` explicitly. Passing `model`/`models` skips the fetch. The response's `models` array is the effective model list.
 - Effect: writes the user's `settings.yaml` (an `llm-pi-ai.providers.<name>` OpenAI-compatible profile plus `agent-default-model`) and owner-only `.credentials.yaml` (0600). A dormant user stays dormant; an already-running user's instance is restarted so the change applies immediately.
 - Re-calling the endpoint **replaces** the provider config and key (change baseURL/model/key anytime). The returned `ref` is the provider's credential name (`<NAME>_API_KEY`).

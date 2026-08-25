@@ -173,8 +173,8 @@ env:
 
 ### 管理控制台（admin 账号）
 
-- **admin 账号**：由 `DSH_ADMIN_PASSWORD` 环境变量在启动时创建/更新（scrypt 存入 `users.json`，标记 `admin: true`）。它是**纯管理账号，不占 DSH 实例**（无 OS 账号/端口/进程）。登录后自动进入 `/__gw/admin` 管理台。
-- **在线用户**：`/__gw/admin` 展示全部用户及在线状态（会话是无状态的 HMAC Cookie，因此"在线"= 会话有效且 **15 分钟内有过请求**，附带最近活跃时间与来源 IP），每 10 秒自动刷新；`/__gw/admin/users` 返回同数据的 JSON。
+- **admin 账号**：由 `DSH_ADMIN_PASSWORD` 环境变量在启动时创建/更新（scrypt 存入 `users.json`，标记 `admin: true`）。它现在是完整隔离租户，拥有自己的 `dsh-admin` OS 账号、HOME、端口和按需启动的 DSH；旧版纯管理记录会在启动时自动补齐这些字段。管理员登录默认进入自己的 DSH，左侧栏额外显示“管理后台”按钮，管理台也提供“返回工作区”。
+- **在线用户与资源**：`/__gw/admin` 展示全部用户的在线状态、DSH 运行/休眠状态、该用户所有进程的 RSS 内存合计、进程数、最近活跃时间与来源 IP，每 10 秒自动刷新；`/__gw/admin/users` 返回同数据的 JSON。RSS 会包含共享页的重复计数，适合观察单用户当前占用趋势，不等同于容器唯一物理内存。
 - **权限**：非 admin 账号访问 `/__gw/admin` 一律跳转登录页；注册接口拒绝使用 `admin` 用户名（保留名）。
 - **改密**：改 `DSH_ADMIN_PASSWORD` 环境变量后重启容器（会话自动失效）；不要用 `dsh-users passwd admin`（下次启动会被环境变量覆盖）。
 - 去掉 `DSH_ADMIN_PASSWORD` 并删除 `users.json` 里的 admin 记录即可关闭。
@@ -228,7 +228,7 @@ curl -X POST http://<主机>:20810/api/users/alice2/provider \
 # → 200 {"ok":true,"user":"alice2","provider":{"name":"my-gateway","baseURL":"...","model":"gpt-4o-mini","apiKeyEnv":"MY_GATEWAY_API_KEY"},"ref":"MY_GATEWAY_API_KEY"}
 ```
 
-- **严格校验**：`provider` 必填（name 限字母/数字/下划线/连字符、baseURL 必须是 http(s) URL）；`provider.api` 可选，取值 `openai-completions`（默认）/ `openai-responses` / `anthropic-messages`，必须合法否则整个设置段会被拒绝、模型不可用；`apiKey` 必填；用户必须存在且非 admin。
+- **严格校验**：`provider` 必填（name 限字母/数字/下划线/连字符、baseURL 必须是 http(s) URL）；`provider.api` 可选，取值 `openai-completions`（默认）/ `openai-responses` / `anthropic-messages`，必须合法否则整个设置段会被拒绝、模型不可用；`apiKey` 必填；目标用户必须存在（包括 admin）。
 - **模型自动获取**：不传 `provider.model`（或 `models` 数组）时，网关用 `apiKey` 调 `GET <baseURL>/models` 自动拉取模型列表（上限 100 个）全部写入配置；拉取失败返回 502 并提示可显式传 `model` 兜底。显式传 `model`/`models` 则跳过拉取。响应里的 `models` 即生效的模型列表。
 - 效果：写入用户 `settings.yaml`（`llm-pi-ai.providers.<name>` OpenAI 兼容适配器 + `agent-default-model` 指向第一个模型）以及私有 `.credentials.yaml`（0600，属主仅本人）。未登录用户保持休眠，不会因为配置 provider 而启动；若实例已经运行，则只重启该用户实例使配置立即生效。
 - 重复调用 = **覆盖更新**（换 baseURL/模型/Key 都行）；返回的 `ref` 是该提供商的凭证名（`<NAME>_API_KEY`）。

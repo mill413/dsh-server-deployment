@@ -29,10 +29,9 @@ services:
       # Disable the public self-service registration page/link. Administrators
       # can still provision accounts with dsh-users or the authenticated API.
       DSH_ENABLE_REGISTER: "0"
-      # Admin account (management only, no DSH instance). Created/updated at
-      # boot from this env var (scrypt-hashed into users.json). Unset it and
-      # remove users.json's admin record to disable. Login as admin lands on
-      # /__gw/admin (online users panel).
+      # Admin is a full isolated tenant plus management privileges. It gets an
+      # OS account, HOME, port and lazy DSH; the sidebar links its admin panel.
+      # The password is scrypt-hashed in users.json.
       DSH_ADMIN_PASSWORD: "${DSH_ADMIN_PASSWORD:-admin-test-password}"
       # External machine-to-machine API token (Bearer). When set, enables:
       #   POST /api/register                 {"username","password"}   -> create user
