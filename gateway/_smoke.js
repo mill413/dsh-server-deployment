@@ -11,16 +11,26 @@ const USERS_FILE = path.join(TMP, 'users.json');
 const TENANT_HELPER = path.join(TMP, 'dsh-register-test-helper');
 fs.mkdirSync(path.join(USERS_DIR, 'tester'), { recursive: true });
 fs.mkdirSync(path.join(USERS_DIR, 'nokey'), { recursive: true });
+fs.mkdirSync(path.join(USERS_DIR, 'admin'), { recursive: true });
 // The production gateway reaches the root supervisor through dsh-register for
 // lazy wake/sleep. This standalone smoke test already owns a mock upstream, so
 // use a tiny successful control helper instead of invoking host sudo.
-fs.writeFileSync(TENANT_HELPER, '#!/bin/sh\nprintf \'%s\\n\' \'{"ok":true,"result":{"started":true}}\'\n', { mode: 0o755 });
+fs.writeFileSync(TENANT_HELPER, [
+  '#!/bin/sh',
+  'if [ "$1" = "--stats" ]; then',
+  '  printf \'%s\\n\' \'{"ok":true,"result":{"tester":{"running":true,"processCount":2,"rssBytes":104857600},"admin":{"running":true,"processCount":1,"rssBytes":52428800}}}\'',
+  'else',
+  '  printf \'%s\\n\' \'{"ok":true,"result":{"started":true}}\'',
+  'fi',
+  '',
+].join('\n'), { mode: 0o755 });
 
 const users = {
   version: 1,
   users: {
     tester: { port: 3999, home: path.join(USERS_DIR, 'tester'), osUser: 'ubuntu', pwd: hashPassword('secret123'), keyConfigured: true },
     nokey: { port: 3999, home: path.join(USERS_DIR, 'nokey'), osUser: 'ubuntu', pwd: hashPassword('secret123'), keyConfigured: false },
+    admin: { admin: true, port: 3999, home: path.join(USERS_DIR, 'admin'), osUser: 'ubuntu', pwd: hashPassword('adminsecret'), keyConfigured: true },
   },
 };
 fs.writeFileSync(USERS_FILE, JSON.stringify(users));
@@ -147,6 +157,19 @@ function check(name, cond) {
 
   r = await req('GET', '/some/path', { headers: { 'Cookie': 'dsh_session=' + sess } });
   check('proxy upstream', r.status === 200 && r.body.indexOf('UPSTREAM-OK /some/path') >= 0);
+
+  const adminCsrf = cookies((await req('GET', '/login')).headers['set-cookie'])['dsh_csrf'];
+  r = await req('POST', '/login', { headers: { 'Cookie': 'dsh_csrf=' + adminCsrf }, body: 'csrf=' + adminCsrf + '&username=admin&password=adminsecret' });
+  check('admin login enters own DSH', r.status === 302 && r.headers.location === '/');
+  const adminSess = cookies(r.headers['set-cookie'])['dsh_session'];
+  r = await req('GET', '/some/path', { headers: { Cookie: 'dsh_session=' + adminSess } });
+  check('admin DSH proxy works', r.status === 200 && r.body.indexOf('UPSTREAM-OK /some/path') >= 0);
+  r = await req('GET', '/__gw/admin', { headers: { Cookie: 'dsh_session=' + adminSess } });
+  check('admin console remains available', r.status === 200 && r.body.indexOf('管理控制台') >= 0);
+  r = await req('GET', '/__gw/admin/users', { headers: { Cookie: 'dsh_session=' + adminSess } });
+  const adminUsers = JSON.parse(r.body);
+  const testerStats = adminUsers.users.find((u) => u.name === 'tester');
+  check('admin console includes process memory', r.status === 200 && testerStats.rssBytes === 104857600 && testerStats.processCount === 2);
 
   const csrf3 = cookies((await req('GET', '/login')).headers['set-cookie'])['dsh_csrf'];
   r = await req('POST', '/login', { headers: { 'Cookie': 'dsh_csrf=' + csrf3 }, body: 'csrf=' + csrf3 + '&username=nokey&password=secret123' });

@@ -412,8 +412,6 @@ function safeReturnTo(value) {
   }
 }
 function loginDestination(user, requested) {
-  const record = getUser(user);
-  if (record && record.admin === true) return '/__gw/admin';
   if (!hasKey(user)) return '/setup';
   return requested || '/';
 }
@@ -612,12 +610,13 @@ function registerPage(csrf, error) {
 // Admin panel data: every user with online status. "online" means a valid
 // session was seen within ACTIVE_WINDOW_MS (sessions are stateless cookies, so
 // this is last-activity, not a live presence).
-function adminUsersPayload() {
+function adminUsersPayload(processStats, statsError) {
   const db = loadUsers();
   const now = Date.now();
   const users = Object.keys(db.users || {}).sort().map((name) => {
     const u = db.users[name];
     const act = activeUsers.get(name);
+    const process = processStats[name] || {};
     return {
       name: name,
       admin: u.admin === true,
@@ -626,30 +625,43 @@ function adminUsersPayload() {
       ip: act ? act.ip : null,
       keyConfigured: !!u.keyConfigured,
       created: u.created || null,
+      dshRunning: process.running === true,
+      processCount: Number(process.processCount || 0),
+      rssBytes: Number(process.rssBytes || 0),
     };
   });
-  return { ok: true, now: now, onlineCount: users.filter((x) => x.online).length, users: users };
+  return {
+    ok: true,
+    now: now,
+    onlineCount: users.filter((x) => x.online).length,
+    runningCount: users.filter((x) => x.dshRunning).length,
+    totalRssBytes: users.reduce((sum, x) => sum + x.rssBytes, 0),
+    statsError: statsError || null,
+    users: users,
+  };
 }
 
 function adminPage(csrf) {
   const body = [
-    '<div class="card" style="max-width:880px"><div class="brand"><div class="logo">A</div><div><h1>管理控制台</h1><div class="sub">DeepSeek Harness · 在线用户</div></div></div>',
+    '<div class="card" style="max-width:1120px"><div class="brand"><div class="logo">A</div><div><h1>管理控制台</h1><div class="sub">DeepSeek Harness · 用户与资源</div></div></div>',
     '<p class="lead" id="stat">加载中…</p>',
-    '<table id="tbl"><thead><tr><th>用户</th><th>状态</th><th>IP</th><th>最近活跃</th><th>API Key</th><th>创建时间</th></tr></thead><tbody></tbody></table>',
+    '<table id="tbl"><thead><tr><th>用户</th><th>登录状态</th><th>DSH</th><th>内存（RSS）</th><th>进程</th><th>IP</th><th>最近活跃</th><th>API Key</th><th>创建时间</th></tr></thead><tbody></tbody></table>',
     '<div class="rule"></div>',
+    '<a href="/" class="ghost" style="display:inline-block;text-decoration:none;margin-left:0">返回工作区</a>',
     '<form method="post" action="/logout" style="display:inline"><input type="hidden" name="csrf" value="' + csrf + '"><button type="submit" class="ghost">退出登录</button></form>',
     '<button type="button" class="ghost" id="refresh" style="margin-left:10px">刷新</button>',
     '</div>',
     '<script>',
     'function esc(s){return String(s==null?"":s).replace(/[&<>"]/g,function(c){return{"&":"&amp;","<":"&lt;",">":"&gt;",\'"\':"&quot;"}[c];});}',
     'function fmt(ts){if(!ts)return "-";try{return new Date(ts).toLocaleString();}catch(e){return "-";}}',
+    'function mem(n){n=Number(n||0);if(n<=0)return "—";if(n<1048576)return Math.round(n/1024)+" KB";if(n<1073741824)return (n/1048576).toFixed(1)+" MB";return (n/1073741824).toFixed(2)+" GB";}',
     'function load(){fetch("/__gw/admin/users",{credentials:"same-origin"}).then(function(r){return r.json();}).then(function(j){',
     'if(!j.ok){document.getElementById("stat").textContent="加载失败";return;}',
-    'document.getElementById("stat").textContent="在线用户："+j.onlineCount+" · 用户总数："+j.users.length;',
+    'document.getElementById("stat").textContent="在线用户："+j.onlineCount+" · 运行实例："+j.runningCount+" · 总内存："+mem(j.totalRssBytes)+" · 用户总数："+j.users.length+(j.statsError?" · 内存统计失败":"");',
     'var tb=document.querySelector("#tbl tbody");tb.innerHTML="";',
     'j.users.forEach(function(u){var tr=document.createElement("tr");',
     'var st=u.online?"<span class=on>● 在线</span>":(u.lastActiveAt?"<span class=off>○ 离线</span>":"<span class=off>○ 从未活跃</span>");',
-    'tr.innerHTML="<td>"+esc(u.name)+(u.admin?" <span class=adm>管理员</span>":"")+"</td>"+"<td>"+st+"</td>"+"<td>"+esc(u.ip)+"</td>"+"<td>"+fmt(u.lastActiveAt)+"</td>"+"<td>"+(u.keyConfigured?"已配置":"—")+"</td>"+"<td>"+fmt(u.created)+"</td>";',
+    'tr.innerHTML="<td>"+esc(u.name)+(u.admin?" <span class=adm>管理员</span>":"")+"</td>"+"<td>"+st+"</td>"+"<td>"+(u.dshRunning?"<span class=on>运行中</span>":"<span class=off>休眠</span>")+"</td>"+"<td>"+mem(u.rssBytes)+"</td>"+"<td>"+u.processCount+"</td>"+"<td>"+esc(u.ip)+"</td>"+"<td>"+fmt(u.lastActiveAt)+"</td>"+"<td>"+(u.keyConfigured?"已配置":"—")+"</td>"+"<td>"+fmt(u.created)+"</td>";',
     'tb.appendChild(tr);});}).catch(function(){document.getElementById("stat").textContent="加载失败";});}',
     'document.getElementById("refresh").addEventListener("click",load);',
     'load();setInterval(load,10000);',
@@ -741,6 +753,20 @@ function runHelper(args, opts) {
   });
 }
 
+async function fetchTenantProcessStats() {
+  const controlSocket = path.join(path.dirname(USERS_FILE), 'control.sock');
+  const r = await runHelper([REGISTER_HELPER, '--stats', controlSocket], {
+    timeoutMs: 15000,
+    maxStdout: 1024 * 1024,
+  });
+  let reply = null;
+  try { reply = JSON.parse(r.stdout); } catch (e) {}
+  if (r.code !== 0 || !reply || reply.ok !== true || !reply.result) {
+    throw new Error((reply && reply.error) || String(r.stderr || '').trim() || 'process stats failed');
+  }
+  return reply.result;
+}
+
 // Tenant DSH processes are lazy: successful authentication wakes the user's
 // instance through the root-only supervisor. Cache readiness for this gateway
 // lifetime and coalesce concurrent browser/API/WebSocket requests so one user
@@ -750,7 +776,7 @@ const wakingTenants = new Map();
 const stoppingTenants = new Map();
 function ensureTenantInstance(name) {
   const record = getUser(name);
-  if (!record || record.admin === true || !record.port) return Promise.reject(new Error('user has no tenant instance'));
+  if (!record || !record.port) return Promise.reject(new Error('user has no tenant instance'));
   const marker = String(record.port) + ':' + String(record.created || '');
   if (readyTenants.get(name) === marker) return Promise.resolve();
   if (wakingTenants.has(name)) return wakingTenants.get(name);
@@ -920,6 +946,7 @@ function userHome(user) {
 // the Host settings mirror instead of the intentionally unavailable in-memory
 // fallback. Server-side session, Host and Origin checks remain authoritative.
 const BROWSER_BOOTSTRAP = '<script>(function(){window.__DSH_TRUSTED_GATEWAY__=true;if(!window.crypto||typeof window.crypto.randomUUID==="function")return;function u(){var b=window.crypto.getRandomValues(new Uint8Array(16));b[6]=(b[6]&15)|64;b[8]=(b[8]&63)|128;var h="";for(var i=0;i<16;i++){if(i===4||i===6||i===8||i===10)h+="-";h+=(b[i]<16?"0":"")+b[i].toString(16);}return h;}try{Object.defineProperty(window.crypto,"randomUUID",{value:u,configurable:true,writable:true});}catch(e){window.crypto.randomUUID=u;}})();</script>';
+const ADMIN_BROWSER_BOOTSTRAP = '<script>window.__DSH_GATEWAY_ADMIN__=true;</script>';
 
 const TENANT_LIFECYCLE_SCRIPT = [
   '<script>(function(){',
@@ -965,7 +992,21 @@ const FILES_LINK_HTML = [
   'document.addEventListener("keydown",function(e){if(e.key==="Escape")shutAll();});',
   'window.addEventListener("message",function(e){if(e.data==="dshgw-close")shutAll();if(e.data==="dshgw-open-files")open();});',
   'function cloneSidebarAction(settings,id,label,title,iconMarkup,onClick,popup){var button=settings.cloneNode(true);button.id=id;button.setAttribute("aria-label",label);button.setAttribute("title",title);button.removeAttribute("aria-expanded");if(popup)button.setAttribute("aria-haspopup","dialog");else button.removeAttribute("aria-haspopup");button.querySelectorAll("[data-slot]").forEach(function(node){node.removeAttribute("data-slot");});var icon=button.querySelector("svg");if(icon){while(icon.firstChild)icon.removeChild(icon.firstChild);icon.setAttribute("viewBox","0 0 16 16");icon.setAttribute("fill","none");icon.setAttribute("aria-hidden","true");icon.innerHTML=iconMarkup;}var labels=button.querySelectorAll("span");if(labels.length)labels[labels.length-1].textContent=label;button.addEventListener("click",function(){onClick(button);});return button;}',
-  'function syncSidebarActions(){var slot=document.querySelector("[data-slot=\\"sidebar.settings\\"]");var settings=slot&&slot.querySelector("button");var area=slot&&slot.parentElement;var foot=area&&area.parentElement;if(!settings||!area||!foot)return;var wide=!!settings.querySelector("span");var signature=String(settings.className)+"|"+(wide?"wide":"rail");var files=document.getElementById("dshgw-sidebar-files");var logout=document.getElementById("dshgw-sidebar-logout");if(files&&logout&&files.parentElement===foot&&files.nextElementSibling===logout&&logout.nextElementSibling===area&&files.getAttribute("data-signature")===signature&&logout.getAttribute("data-signature")===signature)return;if(files)files.remove();if(logout)logout.remove();var folderIcon="<path d=\\"M1.75 4.25h4l1.25 1.5h7.25v6.5H1.75z\\" stroke=\\"currentColor\\" stroke-width=\\"1.3\\" stroke-linejoin=\\"round\\"/><path d=\\"M1.75 4.25V3h3.5l1 1.25\\" stroke=\\"currentColor\\" stroke-width=\\"1.3\\" stroke-linejoin=\\"round\\"/>";var powerIcon="<path d=\\"M8 1.5v6\\" stroke=\\"currentColor\\" stroke-width=\\"1.4\\" stroke-linecap=\\"round\\"/><path d=\\"M4.25 3.5a5.25 5.25 0 1 0 7.5 0\\" stroke=\\"currentColor\\" stroke-width=\\"1.4\\" stroke-linecap=\\"round\\"/>";files=cloneSidebarAction(settings,"dshgw-sidebar-files","文件管理","浏览、下载与上传当前工作区的文件",folderIcon,function(){open();},true);logout=cloneSidebarAction(settings,"dshgw-sidebar-logout","退出登录","退出登录并停止当前用户的全部进程",powerIcon,function(button){window.__DSH_GATEWAY_LOGOUT__(button);},false);files.setAttribute("data-signature",signature);logout.setAttribute("data-signature",signature);foot.insertBefore(files,area);foot.insertBefore(logout,area);}',
+  'function syncSidebarActions(){',
+  'var slot=document.querySelector("[data-slot=\\"sidebar.settings\\"]"),settings=slot&&slot.querySelector("button"),area=slot&&slot.parentElement,foot=area&&area.parentElement;if(!settings||!area||!foot)return;',
+  'var wide=!!settings.querySelector("span"),signature=String(settings.className)+"|"+(wide?"wide":"rail"),adminRequired=window.__DSH_GATEWAY_ADMIN__===true;',
+  'var admin=document.getElementById("dshgw-sidebar-admin"),files=document.getElementById("dshgw-sidebar-files"),logout=document.getElementById("dshgw-sidebar-logout");',
+  'var ordered=files&&logout&&files.parentElement===foot&&files.nextElementSibling===logout&&logout.nextElementSibling===area;',
+  'if(adminRequired)ordered=ordered&&admin&&admin.parentElement===foot&&admin.nextElementSibling===files;else ordered=ordered&&!admin;',
+  'if(ordered&&files.getAttribute("data-signature")===signature&&logout.getAttribute("data-signature")===signature&&(!adminRequired||admin.getAttribute("data-signature")===signature))return;',
+  'if(admin)admin.remove();if(files)files.remove();if(logout)logout.remove();',
+  'var adminIcon="<path d=\\"M2 13.5h12M3.25 13.5V6.25h9.5v7.25M5.5 6.25V3.5h5v2.75M6 9h1.25M8.75 9H10M6 11.25h1.25M8.75 11.25H10\\" stroke=\\"currentColor\\" stroke-width=\\"1.2\\" stroke-linecap=\\"round\\" stroke-linejoin=\\"round\\"/>";',
+  'var folderIcon="<path d=\\"M1.75 4.25h4l1.25 1.5h7.25v6.5H1.75z\\" stroke=\\"currentColor\\" stroke-width=\\"1.3\\" stroke-linejoin=\\"round\\"/><path d=\\"M1.75 4.25V3h3.5l1 1.25\\" stroke=\\"currentColor\\" stroke-width=\\"1.3\\" stroke-linejoin=\\"round\\"/>";',
+  'var powerIcon="<path d=\\"M8 1.5v6\\" stroke=\\"currentColor\\" stroke-width=\\"1.4\\" stroke-linecap=\\"round\\"/><path d=\\"M4.25 3.5a5.25 5.25 0 1 0 7.5 0\\" stroke=\\"currentColor\\" stroke-width=\\"1.4\\" stroke-linecap=\\"round\\"/>";',
+  'if(adminRequired){admin=cloneSidebarAction(settings,"dshgw-sidebar-admin","管理后台","打开用户与资源管理后台",adminIcon,function(){window.location.href="/__gw/admin";},false);admin.setAttribute("data-signature",signature);foot.insertBefore(admin,area);}',
+  'files=cloneSidebarAction(settings,"dshgw-sidebar-files","文件管理","浏览、下载与上传当前工作区的文件",folderIcon,function(){open();},true);logout=cloneSidebarAction(settings,"dshgw-sidebar-logout","退出登录","退出登录并停止当前用户的全部进程",powerIcon,function(button){window.__DSH_GATEWAY_LOGOUT__(button);},false);',
+  'files.setAttribute("data-signature",signature);logout.setAttribute("data-signature",signature);foot.insertBefore(files,area);foot.insertBefore(logout,area);',
+  '}',
   'syncSidebarActions();',
   'var mo=new MutationObserver(function(){syncSidebarActions();});',
   'mo.observe(document.documentElement,{subtree:true,childList:true,attributes:true,attributeFilter:["class","style"]});',
@@ -1214,15 +1255,16 @@ function proxyRequest(req, res, port, user) {
         } catch (e) {}
       } else {
         let html = body.toString('utf8');
+        const roleBootstrap = getUser(user)?.admin === true ? ADMIN_BROWSER_BOOTSTRAP : '';
         // UUID shim must run before the SPA bundle: inject right after the
         // opening <head> tag (the DSH client scripts are deferred modules),
         // falling back to the very top of the document when there is no head.
         const headAt = html.toLowerCase().indexOf('<head');
         if (headAt >= 0) {
           const headEnd = html.indexOf('>', headAt);
-          html = html.slice(0, headEnd + 1) + BROWSER_BOOTSTRAP + TENANT_LIFECYCLE_SCRIPT + html.slice(headEnd + 1);
+          html = html.slice(0, headEnd + 1) + BROWSER_BOOTSTRAP + roleBootstrap + TENANT_LIFECYCLE_SCRIPT + html.slice(headEnd + 1);
         } else {
-          html = BROWSER_BOOTSTRAP + TENANT_LIFECYCLE_SCRIPT + html;
+          html = BROWSER_BOOTSTRAP + roleBootstrap + TENANT_LIFECYCLE_SCRIPT + html;
         }
         const at = html.toLowerCase().lastIndexOf('</body>');
         html = at >= 0 ? html.slice(0, at) + FILES_LINK_HTML + html.slice(at) : html + FILES_LINK_HTML;
@@ -1330,7 +1372,12 @@ const server = http.createServer(async (req, res) => {
       if (req.method === 'GET') return redirect(res, '/login');
       return json(res, 403, { ok: false, error: '需要管理员权限' });
     }
-    if (pathname === '/__gw/admin/users') return json(res, 200, adminUsersPayload());
+    if (pathname === '/__gw/admin/users') {
+      let stats = {};
+      let statsError = null;
+      try { stats = await fetchTenantProcessStats(); } catch (error) { statsError = error.message; }
+      return json(res, 200, adminUsersPayload(stats, statsError));
+    }
     const csrf = crypto.randomBytes(16).toString('hex');
     res.setHeader('Set-Cookie', cookieHeader(CSRF_COOKIE, csrf, { maxAge: 600, path: '/', sameSite: 'Lax' }));
     secHeaders(res);
@@ -1342,7 +1389,7 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'GET') {
       if (session) {
         const su = getUser(session.u);
-        return redirect(res, (su && su.admin) ? '/__gw/admin' : (hasKey(session.u) ? '/' : '/setup'));
+        return redirect(res, loginDestination(session.u, '/'));
       }
       const query = q < 0 ? '' : req.url.slice(q + 1);
       const okMsg = /(^|&)ok=1(&|$)/.test(query)
@@ -1396,7 +1443,7 @@ const server = http.createServer(async (req, res) => {
         return res.end(loginPage(csrf2, '用户名或密码错误'));
       }
       recordSuccess(req, username);
-      if (!u.admin) {
+      if (u.port) {
         try {
           await ensureTenantInstance(username);
         } catch (error) {
@@ -1410,8 +1457,7 @@ const server = http.createServer(async (req, res) => {
       }
       setSession(res, username);
       logLine(req, 302, 'login ' + username);
-      if (u.admin) return redirect(res, '/__gw/admin');
-      return redirect(res, hasKey(username) ? '/' : '/setup');
+      return redirect(res, loginDestination(username, '/'));
     }
     return json(res, 405, { ok: false, error: '方法不允许' });
   }
@@ -1512,7 +1558,7 @@ const server = http.createServer(async (req, res) => {
       return redirect(res, '/login');
     }
     const loginUser = getUser(login.user);
-    if (!loginUser.admin) {
+    if (loginUser.port) {
       try {
         await ensureTenantInstance(login.user);
       } catch (error) {
@@ -1601,7 +1647,6 @@ const server = http.createServer(async (req, res) => {
     }
     const u = getUser(name);
     if (!u || !u.port) return json(res, 404, { ok: false, error: 'user not found' });
-    if (u.admin === true) return json(res, 400, { ok: false, error: 'admin has no instance' });
     const regSocket = path.join(path.dirname(USERS_FILE), 'control.sock');
     const r = await runHelper(
       [PROVIDER_HELPER, name, regSocket, JSON.stringify({ name: pname, baseURL, api: papi, models })],
@@ -1624,7 +1669,7 @@ const server = http.createServer(async (req, res) => {
     if (req.method !== 'POST') return json(res, 405, { ok: false, error: 'method not allowed' });
     if (!session) return json(res, 401, { ok: false, error: 'not logged in' });
     const presenceUser = getUser(session.u);
-    if (!presenceUser || presenceUser.admin === true) return json(res, 204, {});
+    if (!presenceUser || !presenceUser.port) return json(res, 204, {});
     let body = '';
     try { body = await readBody(req, 4096); } catch (e) { return json(res, 413, { ok: false, error: 'payload too large' }); }
     const form = parseForm(body);
@@ -1655,7 +1700,7 @@ const server = http.createServer(async (req, res) => {
         return json(res, 403, { ok: false, error: 'CSRF 校验失败' });
       }
       const logoutUser = getUser(session.u);
-      if (logoutUser && logoutUser.admin !== true) {
+      if (logoutUser && logoutUser.port) {
         try {
           await stopTenantInstance(session.u, 'manual-logout');
         } catch (error) {
@@ -2089,11 +2134,6 @@ const server = http.createServer(async (req, res) => {
     return json(res, 403, { ok: false, error: '请先配置 API Key', redirect: '/setup' });
   }
   const u = getUser(session.u);
-  if (u && u.admin) {
-    // Admin has no DSH instance; send every page request to the panel.
-    if (req.method === 'GET' && !pathname.startsWith('/api/')) return redirect(res, '/__gw/admin');
-    return json(res, 403, { ok: false, error: '管理员账号不提供实例访问' });
-  }
   if (!u || !u.port) {
     clearSession(res);
     return json(res, 401, { ok: false, error: '账号不可用' });
