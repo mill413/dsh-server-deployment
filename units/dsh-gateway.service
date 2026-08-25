@@ -30,7 +30,7 @@ Environment=USERS_DIR=/opt/deepseek-harness/users
 Environment=DEEPSEEK_BASE_URL=https://api.deepseek.com
 Environment=COOKIE_SECURE=1
 Environment=SESSION_TTL=43200
-ExecStart=/usr/bin/node /opt/deepseek-harness/gateway/server.cjs
+ExecStart=/usr/bin/node /opt/deepseek-harness/gateway/server.js
 Restart=on-failure
 RestartSec=3
 # 会话 secret 常驻内存；sudo 助手的子进程也计入本 cgroup，需为并发留余量

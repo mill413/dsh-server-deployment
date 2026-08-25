@@ -4,6 +4,7 @@ const path = require('path');
 const { execFileSync } = require('child_process');
 const { hashPassword } = require('./auth.js');
 const { hasApiKey, setApiKey } = require('./credentials.js');
+const { readUsers, mutateUsers } = require('./store.js');
 
 const BASE_DIR = process.env.DSH_BASE_DIR || '/opt/deepseek-harness';
 const USERS_DIR = process.env.DSH_USERS_DIR || path.join(BASE_DIR, 'users');
@@ -45,23 +46,20 @@ function removeOsUser(name) {
   try { execFileSync('userdel', [osu]); } catch (e) {}
 }
 
-function loadUsers() {
-  try { return JSON.parse(fs.readFileSync(USERS_FILE, 'utf8')); }
-  catch (e) { return { version: 1, users: {} }; }
-}
-function saveUsers(db) {
-  fs.mkdirSync(path.dirname(USERS_FILE), { recursive: true, mode: 0o700 });
-  // Atomic write (temp + rename): a crash mid-write must never leave a
-  // truncated users.json - the gateway would treat it as "no users".
-  const tmp = USERS_FILE + '.tmp-' + process.pid;
-  fs.writeFileSync(tmp, JSON.stringify(db, null, 2) + '\n', { mode: 0o640 });
-  try { execFileSync('chown', [GATEWAY_OWNER + ':' + GATEWAY_OWNER, tmp]); } catch (e) {}
-  fs.renameSync(tmp, USERS_FILE);
-}
 // Owner of gateway runtime files (users.json / secret / state-cwd.json).
 // Override with DSH_GATEWAY_OWNER when the gateway runs as a dedicated
 // service account instead of the deploy user.
 const GATEWAY_OWNER = process.env.DSH_GATEWAY_OWNER || 'dsh-gateway';
+
+function loadUsers() {
+  return readUsers(USERS_FILE);
+}
+// All writes go through store.js's optimistic-concurrency read-modify-write:
+// the gateway mutates users.json concurrently (keyConfigured flags), and a
+// blind whole-file save could silently drop its change - or ours.
+function commitUsers(fn) {
+  return mutateUsers(USERS_FILE, fn, { chownOwner: GATEWAY_OWNER });
+}
 function allocPort(db) {
   const used = new Set();
   for (const k in (db.users || {})) used.add(db.users[k].port);
@@ -276,15 +274,34 @@ async function main() {
     if (clash) fail('username conflicts with existing user "' + clash + '" (OS account is lowercase, files would merge)');
     const password = rest[0] || await promptHidden('Password: ');
     if (!password) fail('password required');
-    const port = allocPort(db);
     const osu = osUserOf(user);
+    const pwd = hashPassword(password);
     createOsUser(user);
-    db.users[user] = { port: port, home: homeOf(user), osUser: osu, pwd: hashPassword(password), pwdVer: 1, keyConfigured: false, created: new Date().toISOString() };
-    createHome(user);
-    saveUsers(db);
-    writeUnit(user, port);
-    refreshLoopbackGuard(db);
-    console.log('Created user: ' + user + ' (port ' + port + ', os ' + osu + ')');
+    let portUsed = 0;
+    try {
+      commitUsers((d) => {
+        // Re-check inside the mutation: the store may have changed since the
+        // pre-checks above (concurrent admin, gateway flag writes).
+        if (d.users[user]) throw new Error('user already exists: ' + user);
+        const c = caseConflict(d, user);
+        if (c) throw new Error('username conflicts with existing user "' + c + '" (OS account is lowercase, files would merge)');
+        portUsed = allocPort(d);
+        d.users[user] = { port: portUsed, home: homeOf(user), osUser: osu, pwd: pwd, pwdVer: 1, keyConfigured: false, created: new Date().toISOString() };
+      });
+    } catch (e) { fail(e.message); }
+    try {
+      createHome(user);
+      writeUnit(user, portUsed);
+    } catch (e) {
+      // Leave no half-built user behind. The users.json record and the unit
+      // are rolled back; the OS account and home directory are data paths,
+      // never auto-deleted on error - tell the admin to clean them up.
+      removeUnit(user);
+      try { commitUsers((d) => { delete d.users[user]; }); } catch (e2) {}
+      fail('provisioning failed (record rolled back; OS account ' + osu + ' and ' + homeOf(user) + ' left for manual cleanup): ' + (e && e.message ? e.message : e));
+    }
+    refreshLoopbackGuard(loadUsers());
+    console.log('Created user: ' + user + ' (port ' + portUsed + ', os ' + osu + ')');
     return;
   }
 
@@ -292,10 +309,15 @@ async function main() {
     if (!db.users[user]) fail('user not found: ' + user);
     const password = rest[0] || await promptHidden('New password: ');
     if (!password) fail('password required');
-    db.users[user].pwd = hashPassword(password);
-    // Invalidate every outstanding gateway session token (tokens embed pwdVer).
-    db.users[user].pwdVer = (typeof db.users[user].pwdVer === 'number' ? db.users[user].pwdVer : 0) + 1;
-    saveUsers(db);
+    const pwd = hashPassword(password);
+    try {
+      commitUsers((d) => {
+        if (!d.users[user]) throw new Error('user not found: ' + user);
+        d.users[user].pwd = pwd;
+        // Invalidate every outstanding gateway session token (tokens embed pwdVer).
+        d.users[user].pwdVer = (typeof d.users[user].pwdVer === 'number' ? d.users[user].pwdVer : 0) + 1;
+      });
+    } catch (e) { fail(e.message); }
     console.log('Password updated: ' + user + ' (now scrypt, sessions revoked)');
     return;
   }
@@ -310,9 +332,10 @@ async function main() {
     removeUnit(user);
     removeOsUser(user);
     try { fs.rmSync(homeOf(user), { recursive: true, force: true }); } catch (e) {}
-    delete db.users[user];
-    saveUsers(db);
-    refreshLoopbackGuard(db);
+    try {
+      commitUsers((d) => { if (!d.users[user]) return false; delete d.users[user]; });
+    } catch (e) { fail('failed to update users.json: ' + e.message); }
+    refreshLoopbackGuard(loadUsers());
     console.log('Deleted user: ' + user);
     return;
   }
@@ -327,8 +350,12 @@ async function main() {
     // setApiKey chmods the home to 0700; keep the tree free of extended ACLs
     // so .credentials.yaml stays a plain 0600 owner-only file.
     stripGatewayAcl(homeOf(user));
-    db.users[user].keyConfigured = true;
-    saveUsers(db);
+    try {
+      commitUsers((d) => {
+        if (!d.users[user]) throw new Error('user not found: ' + user);
+        d.users[user].keyConfigured = true;
+      });
+    } catch (e) { fail(e.message); }
     console.log('API key saved for: ' + user);
     return;
   }
@@ -346,15 +373,22 @@ async function main() {
     execFileSync('chown', ['-R', osu + ':' + osu, homeOf(user)]);
     try { fs.chmodSync(homeOf(user), 0o700); } catch (e) {}
     stripGatewayAcl(homeOf(user));
-    db.users[user].osUser = osu;
-    if (db.users[user].keyConfigured === undefined) db.users[user].keyConfigured = hasApiKey(USERS_DIR, user);
-    if (typeof db.users[user].pwdVer !== 'number') db.users[user].pwdVer = 1;
-    saveUsers(db);
-    refreshLoopbackGuard(db);
+    let portUsed = db.users[user].port;
+    try {
+      const committed = commitUsers((d) => {
+        if (!d.users[user]) throw new Error('user not found: ' + user);
+        d.users[user].osUser = osu;
+        if (d.users[user].keyConfigured === undefined) d.users[user].keyConfigured = hasApiKey(USERS_DIR, user);
+        if (typeof d.users[user].pwdVer !== 'number') d.users[user].pwdVer = 1;
+        portUsed = d.users[user].port;
+      });
+      if (!committed) fail('user not found: ' + user);
+    } catch (e) { fail(e.message); }
     const file = '/etc/systemd/system/dsh-web-' + user + '.service';
-    fs.writeFileSync(file, unitFor(user, db.users[user].port), { mode: 0o644 });
+    fs.writeFileSync(file, unitFor(user, portUsed), { mode: 0o644 });
     execFileSync('systemctl', ['daemon-reload']);
     execFileSync('systemctl', ['restart', 'dsh-web-' + user + '.service']);
+    refreshLoopbackGuard(loadUsers());
     console.log('Rehomed user: ' + user + ' -> os ' + osu);
     return;
   }
@@ -365,15 +399,28 @@ async function main() {
     const clash = caseConflict(db, user);
     if (clash) fail('username conflicts with existing user "' + clash + '" (OS account is lowercase, files would merge)');
     if (!apr1 || apr1.indexOf('$apr1$') !== 0) fail('seed-legacy requires an $apr1$ hash');
-    const port = allocPort(db);
     const osu = osUserOf(user);
     createOsUser(user);
-    db.users[user] = { port: port, home: homeOf(user), osUser: osu, pwd: { algo: 'apr1', value: apr1 }, pwdVer: 1, keyConfigured: false, created: new Date().toISOString() };
-    createHome(user);
-    saveUsers(db);
-    writeUnit(user, port);
-    refreshLoopbackGuard(db);
-    console.log('Seeded legacy user: ' + user + ' (port ' + port + ', os ' + osu + ')');
+    let portUsed = 0;
+    try {
+      commitUsers((d) => {
+        if (d.users[user]) throw new Error('user already exists: ' + user);
+        const c = caseConflict(d, user);
+        if (c) throw new Error('username conflicts with existing user "' + c + '" (OS account is lowercase, files would merge)');
+        portUsed = allocPort(d);
+        d.users[user] = { port: portUsed, home: homeOf(user), osUser: osu, pwd: { algo: 'apr1', value: apr1 }, pwdVer: 1, keyConfigured: false, created: new Date().toISOString() };
+      });
+    } catch (e) { fail(e.message); }
+    try {
+      createHome(user);
+      writeUnit(user, portUsed);
+    } catch (e) {
+      removeUnit(user);
+      try { commitUsers((d) => { delete d.users[user]; }); } catch (e2) {}
+      fail('provisioning failed (record rolled back; OS account ' + osu + ' and ' + homeOf(user) + ' left for manual cleanup): ' + (e && e.message ? e.message : e));
+    }
+    refreshLoopbackGuard(loadUsers());
+    console.log('Seeded legacy user: ' + user + ' (port ' + portUsed + ', os ' + osu + ')');
     return;
   }
 

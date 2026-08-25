@@ -30,8 +30,7 @@
                                              └─ 文件访问走 sudo 助手: dsh-file-{list,stat,read,put}
 ```
 
-> 网关默认端口在运行部署中为 **3100**（本仓库示例为 3081，可用环境变量 `PORT` 覆盖）；每用户实例
-> 自 3101 递增，由 `userctl` 分配。
+> 网关默认端口为 **3100**（`server.js` 默认值、systemd 单元与 nginx 示例已统一；可用环境变量 `PORT` 覆盖，覆盖后需同步反代配置——回环防护会自动读取网关启动时写入的 `state-port.json`，无需手动改 `GW_PORT`）；每用户实例自 3101 递增，由 `userctl` 分配。
 
 多用户与数据隔离的完整说明见 [docs/multi-user-isolation.md](docs/multi-user-isolation.md)。
 
@@ -42,8 +41,10 @@ gateway/                # 网关本体（零依赖 Node）
   server.js             #   登录/会话/限流/CSRF/反代/SPA注入/文件抽屉/上传下载接口
   auth.js               #   scrypt + APR1 口令校验
   credentials.js        #   .credentials.yaml 读写（仅 userctl 使用）
+  store.js              #   users.json 乐观并发读改写（网关与 userctl 共用）
   userctl.js            #   用户管理：OS 账号/端口/实例/Key
   _smoke.js             #   网关冒烟测试（本地即可运行，无需 DSH）
+  _unit.js              #   纯逻辑单元测试（node gateway/_unit.js，无需 root）
   static/               #   登录前可访问的静态资源（manifest/favicon）
 bin/                    # 主机端入口与 root 助手
   dsh-users.sh          #   userctl 的 sudo 入口
@@ -62,6 +63,8 @@ nginx/                  # TLS 反向代理示例配置（已占位化域名）
    install -o root -g root -m 0755 bin/dsh-file-* /opt/deepseek-harness/bin/
    # /etc/sudoers.d/dsh-upload:
    # <服务账号> ALL=(root) NOPASSWD: /opt/deepseek-harness/bin/dsh-file-put, /opt/deepseek-harness/bin/dsh-file-stat, /opt/deepseek-harness/bin/dsh-file-read, /opt/deepseek-harness/bin/dsh-file-list
+   # 仅在调大上传上限时需要（助手默认 110000000 字节 ≈ 105MB）：
+   # Defaults!/opt/deepseek-harness/bin/dsh-file-put env_keep += "DSH_UPLOAD_MAX_BYTES"
    ```
 
    升级或自检时可在服务器上按以下清单验证助手（把 `<user>` 换成真实用户名）：
@@ -87,7 +90,8 @@ nginx/                  # TLS 反向代理示例配置（已占位化域名）
 | `DSH_USERS_DIR`、`DSH_USERS_FILE`、`DSH_SETTINGS_SRC`、`DSH_NODE_BIN`、`DSH_DSH_BIN` | userctl 细粒度覆盖 | 由 BASE_DIR 派生 |
 | `USERS_FILE`、`SECRET_FILE`、`USERS_DIR` | 网关 | `/opt/deepseek-harness/...` |
 | `UPLOAD_HELPER`、`FILE_STAT_HELPER`、`FILE_READ_HELPER`、`FILE_LIST_HELPER` | 网关调用助手的绝对路径 | `/opt/deepseek-harness/bin/dsh-file-*`（**自定义前缀时必须同步改 sudoers 与这四个变量**） |
-| `HOST`、`PORT`、`SESSION_TTL`、`COOKIE_SECURE`、`DEEPSEEK_BASE_URL`、`UPLOAD_MAX_MB`、`MAX_IP_ATTEMPTS`、`MAX_USER_ATTEMPTS`、`WINDOW_MS`、`LOCK_MS` | 网关 | 见 `gateway/server.js` |
+| `HOST`、`PORT`（默认 3100）、`SESSION_TTL`、`COOKIE_SECURE`、`DEEPSEEK_BASE_URL`、`UPLOAD_MAX_MB`、`MAX_IP_ATTEMPTS`、`MAX_USER_ATTEMPTS`、`WINDOW_MS`、`LOCK_MS`、`SNIFF_BUFFER_CONCURRENCY`（并发缓冲的 history 响应上限，默认 4） | 网关 | 见 `gateway/server.js` |
+| `DSH_UPLOAD_MAX_BYTES` | dsh-file-put（root 助手，经 sudoers `env_keep` 传入） | `110000000`（调大 `UPLOAD_MAX_MB` 时需同步） |
 | `DSH_TRUSTED_HOST` | userctl（实例 `--trusted-host`） | `127.0.0.1:1145` |
 
 `bin/dsh-users.sh` 与 `bin/dsh-file-list` 已按自身位置自定位：任意目录检出即可直接运行（`dsh-users.sh` 首次调用自动重提权为 root；node 解析相对脚本位置，缺失时回退 `PATH`）。自定义安装前缀时 systemd 单元用上面的 `sed` 命令生成；网关 systemd 单元还支持 `EnvironmentFile=-/etc/default/dsh-gateway`，可在该文件里统一注入上述环境变量。
@@ -103,7 +107,7 @@ nginx/                  # TLS 反向代理示例配置（已占位化域名）
 - **安装树完整性（最关键）**：`/opt/deepseek-harness` 整棵树——含 DSH monorepo 源码（`packages/`、`apps/`、`node_modules/`）与 `.agents/` 技能库——不得带 group/other 写位。所有租户实例**共享执行**这份代码，任何可写点都是跨租户注入点（改共享代码或技能文件 → 以其他租户身份执行 → 窃取其 API Key）。部署/升级后必须自检：`find /opt/deepseek-harness -not -path '*/users*' -perm /022 | wc -l` 输出 0（`users/` 用户目录除外）。
 - `gateway/` 目录保持 `root:dsh-gateway 0770`：网关需要在其内做 tmp+rename 原子写（users.json / secret / state-cwd.json）；目录内代码文件（server/userctl/auth/credentials/static）归 root:root 0644。`bin/` 全部归 root:root。
 - 网关以专用系统账号 `dsh-gateway`（无 shell）运行，**切勿**用 `ubuntu` 等自带 NOPASSWD sudo 的云镜像账号运行网关；其 sudo 能力仅限 `/etc/sudoers.d/dsh-upload` 白名单中的四个文件助手。网关 systemd 单元**不可**设置 `NoNewPrivileges=yes`（会阻断 sudo 调 root 助手，上传/下载/列表全部失效）。
-- **回环租户隔离**（`bin/dsh-loopback-guard` + `units/dsh-loopback-guard.service`）：DSH 实例的特权接口按「Host 头是回环」放行，而所有实例同处 127.0.0.1--任何租户的 agent 都能伪造 Host 直连他人端口窃取 API Key。防护为 iptables OUTPUT 链：每个 `dsh-<name>` 只能连自己的实例端口，其他租户端口与网关端口被 REJECT，root/网关账号不受影响。userctl 增删用户自动刷新规则；规则按**目标端口**逐条 REJECT（不可按 uid 全量拒绝，否则会掐断内核回包路径）。
+- **回环租户隔离**（`bin/dsh-loopback-guard` + `units/dsh-loopback-guard.service`）：DSH 实例的特权接口按「Host 头是回环」放行，而所有实例同处 127.0.0.1--任何租户的 agent 都能伪造 Host 直连他人端口窃取 API Key。防护为 iptables OUTPUT 链：每个 `dsh-<name>` 只能连自己的实例端口，其他租户端口与网关端口被 REJECT，root/网关账号不受影响。网关端口解析顺序为 `GW_PORT` 环境变量 > 网关启动时写入的 `state-port.json` > 默认 3100。userctl 增删用户自动刷新规则（经 `iptables-restore --noflush` 单次提交，刷新期间无防护空窗）；规则按**目标端口**逐条 REJECT（不可按 uid 全量拒绝，否则会掐断内核回包路径）。
 - 每用户实例带 systemd 资源限制（TasksMax/MemoryMax/CPUQuota，可经 `DSH_MEM_MAX`/`DSH_CPU_QUOTA` 调整）与内核加固项。
 - 文件助手（dsh-file-put/read/stat/list）root 仅做参数字符串校验与身份切换，所有文件操作经 `runuser -u dsh-<name>` 以用户自身身份执行（修复 issue #1 的 TOCTOU 竞态）；助手内的 realpath 前缀校验仅保留退出码语义，不再是安全边界。依赖 util-linux 的 `runuser`。**上传助手为 v2 长度协议**（`BYTES <n>` 头 + 精确字节校验）：网关流式转发请求体，中断/超时/超限的上传会以 exit 6 拒绝提交，不会留下截断文件。
 - 用户凭据文件必须保持仅属主可读（0600）：DSH 启动时会强制检查（`assertOwnerOnly`）。本网关的 root 助手模型天然满足，不要给用户目录添加任何 ACL 读取授权（曾因此触发实例拒绝启动）。

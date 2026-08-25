@@ -9,9 +9,14 @@ const url = require('url');
 const { spawn } = require('child_process');
 const zlib = require('zlib');
 const { verifyPassword, timingSafeStr } = require('./auth.js');
+const { mutateUsers } = require('./store.js');
 
 const HOST = process.env.HOST || '127.0.0.1';
-const PORT = parseInt(process.env.PORT || '3081', 10);
+// Default aligned with units/dsh-gateway.service, nginx/dsh-https-1145.conf
+// and the loopback guard's GW_PORT (all 3100). Overriding PORT still
+// requires syncing the reverse proxy; the guard auto-reads the port the
+// gateway persists to state-port.json at startup.
+const PORT = parseInt(process.env.PORT || '3100', 10);
 const USERS_FILE = process.env.USERS_FILE || '/opt/deepseek-harness/gateway/users.json';
 const SECRET_FILE = process.env.SECRET_FILE || '/opt/deepseek-harness/gateway/secret';
 const USERS_DIR = process.env.USERS_DIR || '/opt/deepseek-harness/users';
@@ -45,6 +50,11 @@ const HISTORY_TRIM_MESSAGES = parseInt(process.env.HISTORY_TRIM_MESSAGES || '6',
 const HISTORY_TRIM_MIN_EVENTS = parseInt(process.env.HISTORY_TRIM_MIN_EVENTS || '2000', 10);
 const GZIP_MIN_BYTES = parseInt(process.env.GZIP_MIN_BYTES || '256', 10);
 const HISTORY_BUF_MAX = 64 * 1024 * 1024;
+// How many concurrent history responses may be buffered (64MB each) for
+// trimming/gzip. Beyond this, extra history responses stream through
+// untouched - the gateway stays memory-bounded instead of OOMing the
+// cgroup (which would restart it and drop every tenant's connection).
+const SNIFF_BUFFER_CONCURRENCY = parseInt(process.env.SNIFF_BUFFER_CONCURRENCY || '4', 10);
 
 function loadSecret() {
   try {
@@ -101,19 +111,19 @@ function hasKey(user) {
 
 // Atomically update one user record inside users.json (read-modify-write via
 // temp file + rename) so a crash never leaves a truncated store and the
-// in-memory cache is refreshed immediately.
+// in-memory cache is refreshed immediately. Concurrency with host-side
+// userctl writes is controlled by store.js (mtime re-check + replay).
 function mutateUserStore(user, fn) {
-  let db;
-  try { db = JSON.parse(fs.readFileSync(USERS_FILE, 'utf8')); }
-  catch (e) { db = { version: 1, users: {} }; }
-  if (db.users && db.users[user]) fn(db.users[user]);
   try {
-    const tmp = USERS_FILE + '.tmp-' + process.pid + '-' + Date.now().toString(36);
-    fs.writeFileSync(tmp, JSON.stringify(db, null, 2) + '\n', { mode: 0o640 });
-    fs.renameSync(tmp, USERS_FILE);
+    const db = mutateUsers(USERS_FILE, (d) => {
+      if (!d.users[user]) return false;
+      fn(d.users[user]);
+    });
+    if (db) {
+      usersCache = db;
+      usersCacheAt = Date.now();
+    }
   } catch (e) { console.error('users.json write failed:', e.message); }
-  usersCache = db;
-  usersCacheAt = Date.now();
 }
 
 // Persist the flag and refresh the in-memory cache so the very next request
@@ -281,20 +291,6 @@ function readBody(req, limit) {
       chunks.push(c);
     });
     req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
-    req.on('error', reject);
-  });
-}
-// Raw binary body reader (uploads); rejects past the limit.
-function readBodyBuf(req, limit) {
-  return new Promise((resolve, reject) => {
-    const chunks = [];
-    let size = 0;
-    req.on('data', (c) => {
-      size += c.length;
-      if (size > limit) { reject(new Error('payload too large')); req.destroy(); return; }
-      chunks.push(c);
-    });
-    req.on('end', () => resolve(Buffer.concat(chunks)));
     req.on('error', reject);
   });
 }
@@ -583,6 +579,8 @@ const FILES_LINK_HTML = [
 ].join('');
 
 // ---------- reverse proxy ----------
+// Live count of history responses currently held in the 64MB trim buffer.
+let bufferedSniffCount = 0;
 const HOP = new Set(['connection', 'proxy-connection', 'keep-alive', 'transfer-encoding', 'te', 'trailer', 'upgrade', 'proxy-authorization', 'proxy-authenticate', 'content-length']);
 function cleanHeaders(h) {
   const out = {};
@@ -660,7 +658,9 @@ function feedSessionList(user, items) {
     e.cwd = resolved;
     e.at = Date.now();
     scheduleCwdPersist();
-    console.log('cwd-track ' + user + ' -> ' + resolved);
+    // Log only the last path segment: full workspace paths of every tenant
+    // do not belong in the journal.
+    console.log('cwd-track ' + user + ' -> ' + path.basename(resolved));
   }
 }
 function currentCwd(user) {
@@ -754,16 +754,43 @@ function proxyRequest(req, res, port, user) {
     // tracking, session history for page trimming. Oversized bodies fall
     // back to a plain untouched stream.
     const MAX_BUF = sniffHistoryRes ? HISTORY_BUF_MAX : 8 * 1024 * 1024;
+    // History pages may buffer up to HISTORY_BUF_MAX each; cap how many may
+    // be buffered at once so concurrent huge sessions cannot OOM the
+    // gateway's cgroup (an OOM restart drops every tenant). Extra history
+    // responses stream through untouched.
+    let sniffSlot = false;
+    const releaseSniffSlot = () => {
+      if (sniffSlot) { sniffSlot = false; bufferedSniffCount--; }
+    };
     let buf = [];
     let size = 0;
     let settled = false;
     upstreamRes.on('data', (c) => {
       if (settled) return;
+      if (sniffHistoryRes && !sniffSlot) {
+        if (bufferedSniffCount >= SNIFF_BUFFER_CONCURRENCY) {
+          // out of buffering budget: plain passthrough, no trim/gzip
+          settled = true;
+          res.writeHead(upstreamRes.statusCode || 502, rh);
+          for (const b of buf) res.write(b);
+          buf = [];
+          res.write(c);
+          upstreamRes.pipe(res);
+          return;
+        }
+        sniffSlot = true;
+        bufferedSniffCount++;
+      }
       size += c.length;
       if (size > MAX_BUF) {
         settled = true;
+        releaseSniffSlot();
         res.writeHead(upstreamRes.statusCode || 502, rh);
         for (const b of buf) res.write(b);
+        // Write the chunk that crossed the cap too: a listener attached
+        // mid-emit (pipe) does not receive the event being emitted, so
+        // piping without writing c would silently drop these bytes.
+        res.write(c);
         buf = [];
         upstreamRes.pipe(res);
       } else {
@@ -773,6 +800,7 @@ function proxyRequest(req, res, port, user) {
     upstreamRes.on('end', () => {
       if (settled) return;
       settled = true;
+      releaseSniffSlot();
       let body = Buffer.concat(buf);
       let outHeaders = rh;
       if (sniffListRes) {
@@ -806,10 +834,10 @@ function proxyRequest(req, res, port, user) {
       res.end(body);
     });
     upstreamRes.on('error', () => {
-      if (!settled) { settled = true; if (!res.headersSent) { try { res.writeHead(502, { 'Content-Type': 'text/plain; charset=utf-8' }); } catch (e) {} } }
+      if (!settled) { settled = true; releaseSniffSlot(); if (!res.headersSent) { try { res.writeHead(502, { 'Content-Type': 'text/plain; charset=utf-8' }); } catch (e) {} } }
       try { res.destroy(); } catch (e) {}
     });
-    upstreamRes.on('aborted', () => { try { res.destroy(); } catch (e) {} });
+    upstreamRes.on('aborted', () => { releaseSniffSlot(); try { res.destroy(); } catch (e) {} });
   });
   upstreamReq.on('error', (e) => {
     console.error('proxy error ->', port, e.message);
@@ -820,15 +848,39 @@ function proxyRequest(req, res, port, user) {
   res.on('error', () => upstreamReq.destroy());
   res.on('close', () => { try { upstreamReq.destroy(); } catch (e) {} });
   if (sniffHistoryReq) {
-    readBodyBuf(req, 256 * 1024).then((body) => {
+    // Sniff the request body to learn the session being opened, but never
+    // kill a legitimate oversized request for it: past the sniff budget we
+    // flush what we buffered and switch to a plain pipe to the upstream.
+    const SNIFF_REQ_MAX = 256 * 1024;
+    const pre = [];
+    let preLen = 0;
+    let forwarded = false;
+    req.on('data', (c) => {
+      if (forwarded) return;
+      preLen += c.length;
+      if (preLen > SNIFF_REQ_MAX) {
+        forwarded = true;
+        // Write the chunk that tripped the budget too: a listener attached
+        // mid-emit (pipe) does not receive the event being emitted, so
+        // piping without writing c would drop these bytes.
+        for (const b of pre) upstreamReq.write(b);
+        upstreamReq.write(c);
+        pre.length = 0;
+        req.pipe(upstreamReq);
+        return;
+      }
+      pre.push(c);
+    });
+    req.on('end', () => {
+      if (forwarded) return; // pipe already ended the upstream
+      let sid = null;
       try {
-        const j = JSON.parse(body.toString('utf8'));
-        const sid = j && j.payload && j.payload.sessionId;
-        if (typeof sid === 'string' && sid) rememberCurrentSession(user, sid);
+        const j = JSON.parse(Buffer.concat(pre).toString('utf8'));
+        sid = j && j.payload && j.payload.sessionId;
       } catch (e) {}
-      upstreamReq.write(body);
-      upstreamReq.end();
-    }).catch(() => { try { upstreamReq.destroy(); } catch (e) {} });
+      if (typeof sid === 'string' && sid) rememberCurrentSession(user, sid);
+      upstreamReq.end(Buffer.concat(pre));
+    });
     return;
   }
   req.pipe(upstreamReq);
@@ -859,7 +911,13 @@ function proxyUpgrade(req, socket, head, port) {
 
 // ---------- request logging ----------
 function logLine(req, status, extra) {
-  console.log(new Date().toISOString() + ' ' + clientIp(req) + ' ' + req.method + ' ' + req.url + ' ' + status + (extra ? ' ' + extra : ''));
+  // Gateway pages carry user workspace paths in their query string
+  // (?dir=/?path=); strip it so the journal records the endpoint, not
+  // every tenant's directory layout.
+  const q = req.url.indexOf('?');
+  const pathOnly = q < 0 ? req.url : req.url.slice(0, q);
+  const logged = pathOnly.startsWith('/__gw/') ? pathOnly : req.url;
+  console.log(new Date().toISOString() + ' ' + clientIp(req) + ' ' + req.method + ' ' + logged + ' ' + status + (extra ? ' ' + extra : ''));
 }
 
 // ---------- server ----------
@@ -869,7 +927,20 @@ const STATIC_ASSETS = {
   '/favicon.svg': { file: path.join(__dirname, 'static', 'favicon.svg'), type: 'image/svg+xml' },
 };
 
-const server = http.createServer(async (req, res) => {
+const server = http.createServer((req, res) => {
+  // A single unexpected throw inside the async handler must not reject an
+  // unhandled promise (Node >= 15 exits the process on that, restarting the
+  // gateway for every tenant). Log, then close just this connection.
+  handle(req, res).catch((e) => {
+    console.error('request handler crashed:', (e && e.stack) || e);
+    try {
+      if (!res.headersSent) { json(res, 500, { ok: false, error: '服务器内部错误' }); return; }
+    } catch (e2) {}
+    try { res.destroy(); } catch (e2) {}
+  });
+});
+
+async function handle(req, res) {
   const q = req.url.indexOf('?');
   const pathname = q < 0 ? req.url : req.url.slice(0, q);
   const session = getSession(req);
@@ -1218,10 +1289,14 @@ const server = http.createServer(async (req, res) => {
       if (size >= 0) head['Content-Length'] = String(size);
       const child = spawn('sudo', ['-n', FILE_READ_HELPER, home, abs], { stdio: ['ignore', 'pipe', 'ignore'] });
       let started = false;
+      let throttled = false;
       child.stdout.on('data', (c) => {
         if (!started) { res.writeHead(200, head); started = true; }
-        res.write(c);
+        // Honor socket backpressure: without pause/resume a large file to a
+        // slow client buffers unboundedly inside the gateway.
+        if (!res.write(c)) { throttled = true; child.stdout.pause(); }
       });
+      res.on('drain', () => { if (throttled) { throttled = false; child.stdout.resume(); } });
       child.on('error', () => { try { res.destroy(); } catch (e) {} });
       child.on('exit', (code) => {
         if (!started) {
@@ -1362,7 +1437,7 @@ const server = http.createServer(async (req, res) => {
     return json(res, 401, { ok: false, error: '账号不可用' });
   }
   proxyRequest(req, res, u.port, session.u);
-});
+}
 
 server.on('upgrade', (req, socket, head) => {
   const session = getSession(req);
@@ -1373,8 +1448,18 @@ server.on('upgrade', (req, socket, head) => {
   proxyUpgrade(req, socket, head, u.port);
 });
 
+// Publish the actual listen port so bin/dsh-loopback-guard-apply can derive
+// GW_PORT without configuration (a manually overridden PORT used to leave the
+// guard rejecting the default port - i.e. protecting nothing). Read order:
+// GW_PORT env > this file > default 3100.
+const PORT_STATE_FILE = process.env.PORT_STATE_FILE || path.join(path.dirname(USERS_FILE), 'state-port.json');
+
 server.listen(PORT, HOST, () => {
   console.log('dsh-gateway listening on ' + HOST + ':' + PORT);
+  if (PORT > 0) {
+    try { fs.writeFileSync(PORT_STATE_FILE, JSON.stringify({ port: PORT, at: Date.now() }) + '\n', { mode: 0o600 }); }
+    catch (e) { console.error('cannot persist port state for loopback guard:', e.message); }
+  }
 });
 
 // Graceful shutdown: stop accepting, let in-flight proxies/uploads finish.
@@ -1384,3 +1469,13 @@ function shutdown() {
 }
 process.on('SIGTERM', shutdown);
 process.on('SIGINT', shutdown);
+
+// Last-resort process-level guards. A rejected promise from anywhere (not
+// just the request handler) is logged and survived; a synchronous uncaught
+// exception means unknown state, so log and let systemd restart us.
+process.on('unhandledRejection', (e) => { console.error('unhandled rejection:', (e && e.stack) || e); });
+process.on('uncaughtException', (e) => { console.error('uncaught exception:', (e && e.stack) || e); process.exit(1); });
+
+// Pure helpers exported for gateway/_unit.js (requiring this file also
+// starts the listener; tests set PORT=0 and a temp USERS_FILE).
+module.exports = { parseForm, trimHistoryValue, esc, dlContentType };

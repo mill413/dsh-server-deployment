@@ -31,7 +31,7 @@ Browser ──https──▶ reverse proxy (TLS, e.g. OpenResty) ──▶ dsh-g
                                              └─ file access via sudo helpers: dsh-file-{list,stat,read,put}
 ```
 
-> The gateway's default port is **3100** in the live deployment (this repo's example uses 3081; override with the `PORT` environment variable); per-user instances increment from 3101, allocated by `userctl`.
+> The gateway's default port is **3100** (the `server.js` default, the systemd unit and the nginx example are now aligned; override with the `PORT` environment variable — if you do, also update the reverse proxy; the loopback guard auto-reads the port the gateway persists to `state-port.json` at startup, so `GW_PORT` needs no manual change); per-user instances increment from 3101, allocated by `userctl`.
 
 See [docs/multi-user-isolation.md](docs/multi-user-isolation.md) for the full multi-user and data-isolation story.
 
@@ -42,8 +42,10 @@ gateway/                # the gateway itself (zero-dependency Node)
   server.js             #   login/session/throttle/CSRF/reverse proxy/SPA injection/file drawer/upload-download
   auth.js               #   scrypt + APR1 password verification
   credentials.js        #   .credentials.yaml read/write (userctl only)
+  store.js              #   users.json optimistic-concurrency read-modify-write (shared by gateway and userctl)
   userctl.js            #   user management: OS accounts/ports/instances/keys
   _smoke.js             #   gateway smoke tests (runs locally, no DSH needed)
+  _unit.js              #   pure-logic unit tests (node gateway/_unit.js, no root needed)
   static/               #   pre-login static assets (manifest/favicon)
 bin/                    # host-side entry points and root helpers
   dsh-users.sh          #   sudo entry for userctl
@@ -62,6 +64,8 @@ nginx/                  # TLS reverse-proxy example config (placeholder domain)
    install -o root -g root -m 0755 bin/dsh-file-* /opt/deepseek-harness/bin/
    # /etc/sudoers.d/dsh-upload:
    # <service-account> ALL=(root) NOPASSWD: /opt/deepseek-harness/bin/dsh-file-put, /opt/deepseek-harness/bin/dsh-file-stat, /opt/deepseek-harness/bin/dsh-file-read, /opt/deepseek-harness/bin/dsh-file-list
+   # Only needed when raising the upload cap (helper default: 110000000 bytes ≈ 105MB):
+   # Defaults!/opt/deepseek-harness/bin/dsh-file-put env_keep += "DSH_UPLOAD_MAX_BYTES"
    ```
 
    After upgrades or for self-checks, verify the helpers on the server against this checklist (replace `<user>` with a real username):
@@ -87,7 +91,8 @@ nginx/                  # TLS reverse-proxy example config (placeholder domain)
 | `DSH_USERS_DIR`, `DSH_USERS_FILE`, `DSH_SETTINGS_SRC`, `DSH_NODE_BIN`, `DSH_DSH_BIN` | fine-grained userctl overrides | derived from BASE_DIR |
 | `USERS_FILE`, `SECRET_FILE`, `USERS_DIR` | gateway | `/opt/deepseek-harness/...` |
 | `UPLOAD_HELPER`, `FILE_STAT_HELPER`, `FILE_READ_HELPER`, `FILE_LIST_HELPER` | absolute paths of helpers called by the gateway | `/opt/deepseek-harness/bin/dsh-file-*` (**if you customize the prefix you MUST update sudoers and these four variables in sync**) |
-| `HOST`, `PORT`, `SESSION_TTL`, `COOKIE_SECURE`, `DEEPSEEK_BASE_URL`, `UPLOAD_MAX_MB`, `MAX_IP_ATTEMPTS`, `MAX_USER_ATTEMPTS`, `WINDOW_MS`, `LOCK_MS` | gateway | see `gateway/server.js` |
+| `HOST`, `PORT` (default 3100), `SESSION_TTL`, `COOKIE_SECURE`, `DEEPSEEK_BASE_URL`, `UPLOAD_MAX_MB`, `MAX_IP_ATTEMPTS`, `MAX_USER_ATTEMPTS`, `WINDOW_MS`, `LOCK_MS`, `SNIFF_BUFFER_CONCURRENCY` (max concurrently buffered history responses, default 4) | gateway | see `gateway/server.js` |
+| `DSH_UPLOAD_MAX_BYTES` | dsh-file-put (root helper, passed through sudoers `env_keep`) | `110000000` (raise together with `UPLOAD_MAX_MB`) |
 | `DSH_TRUSTED_HOST` | userctl (instance `--trusted-host`) | `127.0.0.1:1145` |
 
 `bin/dsh-users.sh` and `bin/dsh-file-list` locate themselves relative to their own path: any checkout directory works as-is (`dsh-users.sh` auto-re-privileges to root on first call; node resolves relative to the script location, falling back to `PATH`). When using a custom installation prefix, generate the systemd units with the `sed` command above; the gateway systemd unit also supports `EnvironmentFile=-/etc/default/dsh-gateway` for injecting the environment variables above in one place.

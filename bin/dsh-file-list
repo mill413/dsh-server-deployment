@@ -13,7 +13,7 @@ dir="${2:-}"
 here="$(cd "$(dirname "$0")" && pwd)"
 node_bin="$here/../runtime/bin/node"
 [ -x "$node_bin" ] || node_bin="$(command -v node || true)"
-[ -n "$node_bin" ] || exit 4
+[ -n "$node_bin" ] || { echo "error: node not found - install Node.js (or provide $here/../runtime/bin/node)" >&2; exit 4; }
 osu="dsh-$(printf '%s' "$(basename "$home")" | tr 'A-Z' 'a-z')"
 case "$osu" in
   dsh-?*) ;;
