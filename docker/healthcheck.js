@@ -43,9 +43,8 @@ function checkGateway() {
     return;
   }
   const db = JSON.parse(fs.readFileSync(usersFile, 'utf8'));
-  // Admin records are management-only (no instance); skip them.
   const ports = Object.values(db.users || {})
-    .filter((user) => user && user.admin !== true && Number.isInteger(Number(user.port)))
+    .filter((user) => user && Number.isInteger(Number(user.port)))
     .map((user) => Number(user.port));
   if (ports.length === 0 || ports.some((port) => !Number.isInteger(port))) throw new Error('no valid tenants');
   await Promise.all([checkGateway(), ...ports.map(checkTcp)]);

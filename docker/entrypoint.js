@@ -49,9 +49,8 @@ const LAZY_TENANTS = process.env.DSH_LAZY_TENANTS !== '0';
 const LOOPBACK_GUARD = '/usr/local/libexec/dsh/dsh-loopback-guard';
 const GATEWAY_SERVER = '/opt/dsh-server-deployment/gateway/server.js';
 const MIN_PASSWORD_LENGTH = 8;
-// Admin account: a management-only user (no DSH instance / OS account / port).
-// Provisioned at boot from DSH_ADMIN_PASSWORD, marked admin:true in users.json;
-// the gateway serves them the admin panel instead of a tenant instance.
+// Admin account: a full tenant provisioned from DSH_ADMIN_PASSWORD with its
+// own OS account / HOME / port / lazy DSH, plus admin:true authorization.
 const ADMIN_NAME = (process.env.DSH_ADMIN_NAME || 'admin').trim();
 const ADMIN_PASSWORD = process.env.DSH_ADMIN_PASSWORD;
 const children = [];
@@ -620,24 +619,24 @@ function readJson(file, fallback) {
   }
 }
 
-// Create or update the admin record in the user store. The password comes from
-// DSH_ADMIN_PASSWORD (scrypt-hashed, never stored in plaintext); an unchanged
-// password keeps the existing hash and pwdVer so sessions survive restarts.
-function upsertAdmin(db) {
+// Create or migrate the admin as a full tenant. The password still comes from
+// DSH_ADMIN_PASSWORD, but admin now owns an OS account, HOME, port and lazy DSH
+// process just like every other user while retaining the authorization flag.
+function provisionAdmin(db, previousUsers, identities, usedPortsSet) {
   if (ADMIN_PASSWORD === undefined || ADMIN_PASSWORD === '') return;
   if (!/^[A-Za-z0-9_-]{1,64}$/.test(ADMIN_NAME)) throw new Error(`invalid DSH_ADMIN_NAME: ${ADMIN_NAME}`);
   if (typeof ADMIN_PASSWORD !== 'string' || ADMIN_PASSWORD.length < MIN_PASSWORD_LENGTH) {
     throw new Error(`DSH_ADMIN_PASSWORD must contain at least ${MIN_PASSWORD_LENGTH} characters`);
   }
-  const existing = db.users[ADMIN_NAME];
-  const unchanged = existing && existing.pwd && verifyPassword(ADMIN_PASSWORD, existing.pwd);
-  db.users[ADMIN_NAME] = {
-    admin: true,
-    pwd: unchanged ? existing.pwd : hashPassword(ADMIN_PASSWORD),
-    pwdVer: unchanged ? (existing.pwdVer || 1) : ((existing && existing.pwdVer) || 0) + 1,
-    keyConfigured: true, // admin has no DSH instance; bypass the /setup gate
-    created: (existing && existing.created) || new Date().toISOString(),
-  };
+  const existing = previousUsers[ADMIN_NAME];
+  let port;
+  if (existing && Number.isInteger(existing.port) && !usedPortsSet.has(existing.port)) port = existing.port;
+  else port = nextFreePort(usedPortsSet);
+  usedPortsSet.add(port);
+  const identity = identities[ADMIN_NAME.toLowerCase()];
+  const record = provisionTenant({ name: ADMIN_NAME, password: ADMIN_PASSWORD }, port, identity.uid, existing);
+  if (existing && existing.provider) record.provider = existing.provider;
+  db.users[ADMIN_NAME] = { ...record, admin: true };
 }
 
 function assignUids(tenants) {
@@ -789,11 +788,11 @@ function nextFreePort(used) {
 }
 
 // Rebuild the tenant loopback firewall from the live user set. Called at boot
-// and after every add/del so isolation rules always match reality. Admin has
-// no OS account / port and is excluded.
+// and after every add/del so isolation rules always match reality. Admin is a
+// full tenant and receives the same loopback isolation rule as other users.
 function applyLoopbackGuard() {
   const specs = Object.values(state.db.users)
-    .filter((record) => record && !record.admin && record.osUser && Number.isInteger(record.port))
+    .filter((record) => record && record.osUser && Number.isInteger(record.port))
     .map((record) => `${record.osUser}:${record.port}`);
   execFileSync(LOOPBACK_GUARD, ['--apply', ...specs], {
     stdio: 'inherit',
@@ -844,6 +843,40 @@ function killAllProcessesForOsUser(osUser) {
   return killed;
 }
 
+function tenantProcessStats() {
+  const uidToName = new Map();
+  const stats = {};
+  for (const [name, record] of Object.entries(state.db.users)) {
+    if (!record || !record.osUser) continue;
+    try {
+      const uid = Number(execFileSync('id', ['-u', record.osUser], { encoding: 'utf8' }).trim());
+      if (!Number.isInteger(uid)) continue;
+      uidToName.set(uid, name);
+      const active = state.tenants.get(name);
+      stats[name] = {
+        running: !!active,
+        launcherPid: active ? active.child.pid : null,
+        processCount: 0,
+        rssBytes: 0,
+      };
+    } catch (e) {}
+  }
+  for (const entry of fs.readdirSync('/proc')) {
+    if (!/^\d+$/.test(entry)) continue;
+    try {
+      const status = fs.readFileSync(`/proc/${entry}/status`, 'utf8');
+      const uidMatch = /^Uid:\s+(\d+)/m.exec(status);
+      if (!uidMatch) continue;
+      const name = uidToName.get(Number(uidMatch[1]));
+      if (!name) continue;
+      const rssMatch = /^VmRSS:\s+(\d+)\s+kB/m.exec(status);
+      stats[name].processCount += 1;
+      if (rssMatch) stats[name].rssBytes += Number(rssMatch[1]) * 1024;
+    } catch (e) {}
+  }
+  return stats;
+}
+
 async function ensureTenantStarted(name, record) {
   if (state.tenantStarts.has(name)) return state.tenantStarts.get(name);
   if (state.tenants.has(name)) return { name, port: record.port, started: false };
@@ -871,7 +904,7 @@ async function ensureTenantStarted(name, record) {
 function syncSharedPluginsToAllUsers() {
   let count = 0;
   for (const record of Object.values(state.db.users)) {
-    if (!record || record.admin === true) continue;
+    if (!record || !record.home || !record.osUser) continue;
     ensureSharedWebPluginsProfile(record.home);
     execFileSync('chown', ['-hR', `${record.osUser}:${record.osUser}`, path.join(record.home, 'profiles', 'web')]);
     count += 1;
@@ -960,7 +993,6 @@ async function controlWake(payload) {
   const { name } = payload;
   const record = state.db.users[name];
   if (!record) throw new Error(`user not found: ${name}`);
-  if (record.admin === true) throw new Error('admin has no instance');
   const result = await ensureTenantStarted(name, record);
   return { ok: true, result };
 }
@@ -969,7 +1001,6 @@ async function controlSleep(payload) {
   const { name } = payload;
   const record = state.db.users[name];
   if (!record) throw new Error(`user not found: ${name}`);
-  if (record.admin === true) throw new Error('admin has no instance');
   const startup = state.tenantStarts.get(name);
   if (startup) {
     try { await startup; } catch (e) {}
@@ -1031,6 +1062,10 @@ function controlList() {
       };
     }),
   };
+}
+
+function controlStats() {
+  return { ok: true, result: tenantProcessStats() };
 }
 
 function controlSetKey(payload) {
@@ -1122,7 +1157,6 @@ async function controlSetProvider(payload) {
   const { name } = payload;
   const record = state.db.users[name];
   if (!record) throw new Error(`user not found: ${name}`);
-  if (record.admin === true) throw new Error('admin has no instance');
   const provider = validateProvider(payload.provider);
   const key = payload.key;
   if (typeof key !== 'string' || key.length === 0) throw new Error('provider API key required');
@@ -1157,6 +1191,7 @@ async function handleControl(payload, onProgress = () => {}) {
     case 'passwd': return controlPasswd(payload);
     case 'del': return controlDel(payload);
     case 'list': return controlList();
+    case 'stats': return controlStats();
     case 'set-key': return controlSetKey(payload);
     case 'key-status': return controlKeyStatus(payload);
     case 'set-provider': return controlSetProvider(payload);
@@ -1223,7 +1258,13 @@ function shutdown(exitCode = 0) {
 async function main() {
   if (process.getuid() !== 0) throw new Error('container entrypoint must run as root');
   if (!fs.existsSync(DSH_BIN)) throw new Error(`built dsh CLI not found: ${DSH_BIN}`);
-  const seedTenants = parseTenants();
+  const allSeedTenants = parseTenants();
+  const adminEnabled = ADMIN_PASSWORD !== undefined && ADMIN_PASSWORD !== '';
+  // When DSH_ADMIN_PASSWORD owns the reserved name, provision it once through
+  // the full-admin migration path below instead of also treating it as a seed.
+  const seedTenants = adminEnabled
+    ? allSeedTenants.filter((tenant) => tenant.name.toLowerCase() !== ADMIN_NAME.toLowerCase())
+    : allSeedTenants;
   fs.mkdirSync(USERS_DIR, { recursive: true, mode: 0o711 });
   fs.chmodSync(USERS_DIR, 0o711);
   fs.mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 });
@@ -1239,11 +1280,10 @@ async function main() {
   const previousDb = readJson(USERS_FILE, { version: 1, users: {} });
   const previousUsers = (previousDb && previousDb.users) || {};
   const seedNames = new Set(seedTenants.map((t) => t.name.toLowerCase()));
+  if (adminEnabled) seedNames.add(ADMIN_NAME.toLowerCase());
   const preserved = [];
   for (const [name, record] of Object.entries(previousUsers)) {
     if (seedNames.has(name.toLowerCase())) continue;
-    // Admin records are management-only (no home/port/osUser); keep verbatim.
-    if (record && record.admin === true) { preserved.push({ name, record }); continue; }
     if (!record || typeof record !== 'object' ||
         typeof record.home !== 'string' || typeof record.osUser !== 'string' ||
         !Number.isInteger(record.port) || !record.pwd || typeof record.pwd !== 'object') {
@@ -1253,12 +1293,14 @@ async function main() {
     preserved.push({ name, record });
   }
 
-  const identities = assignUids([...seedTenants, ...preserved.filter((p) => p.record.admin !== true).map((p) => ({ name: p.name }))]);
+  const identityRequests = [...seedTenants, ...preserved.map((p) => ({ name: p.name }))];
+  if (adminEnabled) identityRequests.push({ name: ADMIN_NAME });
+  const identities = assignUids(identityRequests);
   const db = { version: 1, users: {} };
   // Only preserved users occupy ports from the start; a seed user reuses its
   // OWN previous port (so restarts never shuffle ports) and only truly new
   // users draw from the free range.
-  const used = new Set(preserved.filter((p) => p.record.admin !== true).map((p) => p.record.port));
+  const used = new Set(preserved.map((p) => p.record.port));
   for (const tenant of seedTenants) {
     const identity = identities[tenant.name.toLowerCase()];
     const prev = previousUsers[tenant.name];
@@ -1269,12 +1311,11 @@ async function main() {
     db.users[tenant.name] = provisionTenant(tenant, port, identity.uid, prev);
   }
   for (const { name, record } of preserved) {
-    if (record.admin === true) { db.users[name] = record; continue; }
     const identity = identities[name.toLowerCase()];
     db.users[name] = ensurePreservedRecord(name, record, identity.uid);
     used.add(record.port);
   }
-  upsertAdmin(db);
+  provisionAdmin(db, previousUsers, identities, used);
   state.db = db;
   saveUsersDb(db);
 
@@ -1283,11 +1324,9 @@ async function main() {
 
   if (!LAZY_TENANTS) {
     for (const [name, record] of Object.entries(db.users)) {
-      if (record.admin === true) continue;
       startTenant(name, record);
     }
     await Promise.all(Object.values(db.users)
-      .filter((record) => record.admin !== true)
       .map((record) => waitForPort(record.port)));
   }
   spawnManaged('gateway', 'runuser', gatewayArgs());

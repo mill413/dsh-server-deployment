@@ -6,6 +6,7 @@
 //                    (password on stdin)
 //        dsh-register --wake <username> [control-socket]
 //        dsh-register --sleep <username> [control-socket] [reason]
+//        dsh-register --stats [control-socket]
 //
 // Runs as root via sudo from the gateway (pinned in the dsh-gateway sudoers
 // allowlist). Like the dsh-file-* helpers, it only forwards a validated
@@ -27,10 +28,11 @@ const net = require('net');
 const path = require('path');
 
 const STATE_DIR = process.env.DSH_GATEWAY_STATE_DIR || '/var/lib/dsh-gateway';
-const mode = process.argv[2] === '--wake' ? 'wake' : (process.argv[2] === '--sleep' ? 'sleep' : 'add');
+const mode = process.argv[2] === '--wake' ? 'wake'
+  : (process.argv[2] === '--sleep' ? 'sleep' : (process.argv[2] === '--stats' ? 'stats' : 'add'));
 const helperMode = mode !== 'add';
-const name = helperMode ? process.argv[3] : process.argv[2];
-const SOCKET = (helperMode ? process.argv[4] : process.argv[3])
+const name = mode === 'stats' ? null : (helperMode ? process.argv[3] : process.argv[2]);
+const SOCKET = (mode === 'stats' ? process.argv[3] : (helperMode ? process.argv[4] : process.argv[3]))
   || process.env.DSH_CONTROL_SOCKET || path.join(STATE_DIR, 'control.sock');
 // Provisioning may initialize a profile, register shared plugins and refresh
 // firewall rules before the supervisor can reply. Keep this longer than the
@@ -43,7 +45,7 @@ function fail(msg, code) {
   process.exit(code);
 }
 
-if (!name || !/^[A-Za-z0-9_-]{1,64}$/.test(name)) fail('invalid username', 2);
+if (mode !== 'stats' && (!name || !/^[A-Za-z0-9_-]{1,64}$/.test(name))) fail('invalid username', 2);
 let password = '';
 if (!helperMode) {
   try {
@@ -54,11 +56,11 @@ if (!helperMode) {
   if (password.length < 8) fail('password must contain at least 8 characters', 2);
 }
 
-const payload = mode === 'wake'
-  ? { cmd: 'wake', name: name }
-  : (mode === 'sleep'
-    ? { cmd: 'sleep', name: name, reason: String(process.argv[5] || 'logout').slice(0, 64), revokeSessions: true }
-    : { cmd: 'add', name: name, password: password });
+const payload = mode === 'stats' ? { cmd: 'stats' }
+  : (mode === 'wake' ? { cmd: 'wake', name: name }
+    : (mode === 'sleep'
+      ? { cmd: 'sleep', name: name, reason: String(process.argv[5] || 'logout').slice(0, 64), revokeSessions: true }
+      : { cmd: 'add', name: name, password: password }));
 const providerRaw = helperMode ? null : process.argv[4];
 if (providerRaw) {
   try {
