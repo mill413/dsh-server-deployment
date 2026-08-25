@@ -13,6 +13,7 @@ state-cwd.json
 
 # docker image export artifact
 dsh-server-deployment-local.tar.gz
+dsh-server-*.tar.gz
 
 # docker runtime data (bind mount ./data)
 docker/data/
@@ -23,4 +24,3 @@ docs/dsh-portal-handover.md
 docs/dsh-server-deployment-issues.md
 docs/dsh-web-deploy-patches.md
 units/dsh-web-*.service
-
