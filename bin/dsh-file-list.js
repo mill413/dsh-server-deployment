@@ -11,14 +11,17 @@ function fail(code) { process.exit(code); }
 if (!home || home.indexOf('\0') >= 0 || dir.indexOf('\0') >= 0) fail(2);
 let hd;
 try { hd = fs.realpathSync(home); } catch (e) { fail(3); }
+// Visible workspace root: <home>/workspace (created at provisioning); fall
+// back to the home itself only when the workspace directory is missing.
+let root;
+try { root = fs.realpathSync(path.join(hd, 'workspace')); } catch (e) { root = hd; }
 let target;
 if (dir) {
   try { target = fs.realpathSync(dir); } catch (e) { fail(4); }
 } else {
-  const ws = path.join(hd, 'workspace');
-  try { target = fs.realpathSync(ws); } catch (e) { target = hd; }
+  target = root;
 }
-if (target !== hd && !target.startsWith(hd + path.sep)) fail(3);
+if (target !== root && !target.startsWith(root + path.sep)) fail(3);
 let st;
 try { st = fs.statSync(target); } catch (e) { fail(4); }
 if (!st.isDirectory()) fail(4);
@@ -38,4 +41,4 @@ try {
 } catch (e) { fail(4); }
 const truncated = entries.length > 2000;
 if (truncated) entries = entries.slice(0, 2000);
-process.stdout.write(JSON.stringify({ home: hd, dir: target, truncated, entries }));
+process.stdout.write(JSON.stringify({ home: root, dir: target, truncated, entries }));

@@ -36,6 +36,9 @@ case "$osu" in
   *[!a-z0-9_-]*) exit 3 ;;
 esac
 hd="$(realpath "$home")" || exit 3
+# Visible workspace root: <home>/workspace (created at provisioning); fall
+# back to the home itself only when the workspace directory is missing.
+ws="$(realpath "$home/workspace" 2>/dev/null)" && hd="$ws"
 [ -d "$dir" ] || exit 4
 pd="$(realpath "$dir")" || exit 3
 case "$pd" in "$hd"|"$hd"/*) ;; *) exit 3 ;; esac
