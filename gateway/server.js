@@ -647,6 +647,12 @@ function adminPage(csrf) {
     '<p class="lead" id="stat">加载中…</p>',
     '<table id="tbl"><thead><tr><th>用户</th><th>登录状态</th><th>DSH</th><th>内存（RSS）</th><th>进程</th><th>IP</th><th>最近活跃</th><th>API Key</th><th>创建时间</th></tr></thead><tbody></tbody></table>',
     '<div class="rule"></div>',
+    '<section class="plugins"><div class="section-head"><div><h2>共享插件</h2><p>安装一次并同步到所有现有及后续新增用户。</p></div><button type="button" class="ghost" id="plugin-refresh">刷新插件</button></div>',
+    '<div class="plugin-form"><input id="plugin-spec" placeholder="插件 spec，例如 package@1.2.3"><input id="plugin-name" placeholder="package name（Git/file spec 时填写）"><button type="button" id="plugin-add">安装 / 升级</button></div>',
+    '<div class="plugin-msg" id="plugin-msg"></div>',
+    '<table id="plugin-table"><thead><tr><th>插件</th><th>版本</th><th>来源</th><th>路径</th><th>操作</th></tr></thead><tbody></tbody></table>',
+    '<pre id="plugin-log" hidden></pre></section>',
+    '<div class="rule"></div>',
     '<a href="/" class="ghost" style="display:inline-block;text-decoration:none;margin-left:0">返回工作区</a>',
     '<form method="post" action="/logout" style="display:inline"><input type="hidden" name="csrf" value="' + csrf + '"><button type="submit" class="ghost">退出登录</button></form>',
     '<button type="button" class="ghost" id="refresh" style="margin-left:10px">刷新</button>',
@@ -664,7 +670,15 @@ function adminPage(csrf) {
     'tr.innerHTML="<td>"+esc(u.name)+(u.admin?" <span class=adm>管理员</span>":"")+"</td>"+"<td>"+st+"</td>"+"<td>"+(u.dshRunning?"<span class=on>运行中</span>":"<span class=off>休眠</span>")+"</td>"+"<td>"+mem(u.rssBytes)+"</td>"+"<td>"+u.processCount+"</td>"+"<td>"+esc(u.ip)+"</td>"+"<td>"+fmt(u.lastActiveAt)+"</td>"+"<td>"+(u.keyConfigured?"已配置":"—")+"</td>"+"<td>"+fmt(u.created)+"</td>";',
     'tb.appendChild(tr);});}).catch(function(){document.getElementById("stat").textContent="加载失败";});}',
     'document.getElementById("refresh").addEventListener("click",load);',
+    'var watchedJob=null,jobTimer=null;',
+    'function pluginMessage(text,bad){var m=document.getElementById("plugin-msg");m.textContent=text||"";m.className="plugin-msg"+(bad?" bad":"");}',
+    'function watchJob(id){watchedJob=id;if(jobTimer)clearTimeout(jobTimer);fetch("/__gw/admin/plugin-job?id="+encodeURIComponent(id),{credentials:"same-origin"}).then(function(r){return r.json();}).then(function(j){if(!j.ok)throw new Error(j.error||"任务不存在");var job=j.job,log=document.getElementById("plugin-log");log.hidden=false;log.textContent=job.log||"等待输出…";log.scrollTop=log.scrollHeight;pluginMessage(job.status==="running"?"插件操作进行中…":(job.status==="success"?"操作完成":"操作失败："+(job.error||"未知错误")),job.status==="error");if(job.status==="running")jobTimer=setTimeout(function(){watchJob(id);},1000);else{watchedJob=null;pluginLoad();load();}}).catch(function(e){pluginMessage("任务查询失败："+e.message,true);});}',
+    'function pluginRun(path,body){pluginMessage("正在提交操作…",false);fetch(path,{method:"POST",credentials:"same-origin",headers:{"Content-Type":"application/json","X-DSH-Gateway-Action":"admin-plugin"},body:JSON.stringify(body)}).then(function(r){return r.json().then(function(j){if(!r.ok||!j.ok)throw new Error(j.error||("HTTP "+r.status));return j;});}).then(function(j){watchJob(j.job.id);}).catch(function(e){pluginMessage(e.message,true);});}',
+    'function pluginLoad(){fetch("/__gw/admin/plugins",{credentials:"same-origin"}).then(function(r){return r.json();}).then(function(j){if(!j.ok)throw new Error(j.error||"加载失败");var tb=document.querySelector("#plugin-table tbody");tb.innerHTML="";j.plugins.forEach(function(p){var tr=document.createElement("tr"),name=document.createElement("td"),ver=document.createElement("td"),src=document.createElement("td"),dir=document.createElement("td"),act=document.createElement("td");name.textContent=p.name;ver.textContent=p.version||"—";src.textContent=p.source==="image"?"镜像内置":"运行时共享";dir.textContent=p.dir||"—";dir.title=p.dir||"";if(p.source==="image"){act.textContent="不可移除";}else{var b=document.createElement("button");b.type="button";b.className="small danger";b.textContent="移除";b.addEventListener("click",function(){if(window.confirm("从所有用户移除插件 "+p.name+"？"))pluginRun("/__gw/admin/plugins/remove",{name:p.name});});act.appendChild(b);}tr.append(name,ver,src,dir,act);tb.appendChild(tr);});if(j.activeJob&&j.activeJob.status==="running"&&!watchedJob)watchJob(j.activeJob.id);}).catch(function(e){pluginMessage("插件列表加载失败："+e.message,true);});}',
+    'document.getElementById("plugin-add").addEventListener("click",function(){var spec=document.getElementById("plugin-spec").value.trim(),name=document.getElementById("plugin-name").value.trim();if(!spec){pluginMessage("请输入插件 spec",true);return;}pluginRun("/__gw/admin/plugins/add",{spec:spec,name:name});});',
+    'document.getElementById("plugin-refresh").addEventListener("click",pluginLoad);',
     'load();setInterval(load,10000);',
+    'pluginLoad();',
     '</scr' + 'ipt>',
     '<style>',
     'table{width:100%;border-collapse:collapse;font-size:13px}',
@@ -674,6 +688,15 @@ function adminPage(csrf) {
     '.adm{color:var(--gold);font-size:11px;border:1px solid var(--hairline);padding:1px 6px;border-radius:6px;margin-left:6px}',
     '.ghost{background:transparent;border:1px solid var(--hairline);border-radius:9px;color:var(--gold);padding:9px 18px;font-size:13px;font-weight:600;cursor:pointer;width:auto;margin-top:0}',
     '.ghost:hover{background:rgba(226,185,97,.08)}',
+    '.plugins h2{font-size:16px;margin:0;color:var(--ink)}.plugins p{font-size:12.5px;color:var(--faint);margin:4px 0 0}',
+    '.section-head{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:12px}',
+    '.plugin-form{display:grid;grid-template-columns:minmax(260px,2fr) minmax(200px,1fr) auto;gap:8px;align-items:center}',
+    '.plugin-form input{margin:0;padding:9px 11px;font-size:13px}.plugin-form button{width:auto;margin:0;padding:9px 16px}',
+    '.plugin-msg{min-height:20px;margin:8px 0;color:var(--ok);font-size:12.5px}.plugin-msg.bad{color:var(--err)}',
+    '#plugin-table td:nth-child(4){max-width:310px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
+    '.small{width:auto;margin:0;padding:5px 11px;border-radius:8px;font-size:12px}.small.danger{background:transparent;color:var(--err);border:1px solid rgba(224,135,122,.4)}',
+    '#plugin-log{max-height:260px;overflow:auto;background:#111827;color:#d1fae5;border-radius:10px;padding:12px;font:12px/1.55 var(--ds-font-family-code,monospace);white-space:pre-wrap;margin:10px 0 0}',
+    '@media(max-width:800px){.plugin-form{grid-template-columns:1fr}.card{overflow-x:auto}}',
     '</style>',
   ].join('');
   return impeccableShell('管理控制台', body);
@@ -720,7 +743,7 @@ function redirect(res, loc) {
 // for the duration of a listing/upload).
 function runHelper(args, opts) {
   return new Promise((resolve) => {
-    const o = Object.assign({ timeoutMs: 15000, maxStdout: 8 * 1024 * 1024 }, opts || {});
+    const o = Object.assign({ timeoutMs: 15000, maxStdout: 8 * 1024 * 1024, maxStderr: 8 * 1024 * 1024 }, opts || {});
     let child;
     try {
       const direct = process.env.DSH_HELPER_DIRECT === '1';
@@ -730,20 +753,26 @@ function runHelper(args, opts) {
     } catch (e) { return resolve({ code: null, stdout: '', stderr: String(e && e.message || e) }); }
     let out = [];
     let outLen = 0;
-    let err = '';
+    let err = [];
+    let errLen = 0;
     let done = false;
     const timer = setTimeout(() => { try { child.kill('SIGKILL'); } catch (e) {} }, o.timeoutMs);
     const finish = (code) => {
       if (done) return;
       done = true;
       clearTimeout(timer);
-      resolve({ code: code, stdout: Buffer.concat(out).toString('utf8'), stderr: err });
+      resolve({ code: code, stdout: Buffer.concat(out).toString('utf8'), stderr: Buffer.concat(err).toString('utf8') });
     };
     child.stdout.on('data', (c) => {
       outLen += c.length;
       if (outLen <= o.maxStdout) out.push(c);
+      if (typeof o.onStdout === 'function') o.onStdout(c.toString('utf8'));
     });
-    child.stderr.on('data', (c) => { err += c.toString('utf8'); });
+    child.stderr.on('data', (c) => {
+      errLen += c.length;
+      if (errLen <= o.maxStderr) err.push(c);
+      if (typeof o.onStderr === 'function') o.onStderr(c.toString('utf8'));
+    });
     child.on('error', () => finish(null));
     child.on('close', (code) => finish(code));
     if (o.input !== undefined) {
@@ -765,6 +794,110 @@ async function fetchTenantProcessStats() {
     throw new Error((reply && reply.error) || String(r.stderr || '').trim() || 'process stats failed');
   }
   return reply.result;
+}
+
+function validPluginPackageName(value) {
+  return typeof value === 'string' && /^(?:@[A-Za-z0-9._-]+\/)?[A-Za-z0-9._-]+$/.test(value);
+}
+
+function inferPluginPackageName(spec) {
+  if (typeof spec !== 'string' || !spec) return null;
+  if (spec.startsWith('@')) {
+    const slash = spec.indexOf('/');
+    if (slash < 2) return null;
+    const versionAt = spec.indexOf('@', slash);
+    const name = versionAt < 0 ? spec : spec.slice(0, versionAt);
+    return validPluginPackageName(name) ? name : null;
+  }
+  const versionAt = spec.indexOf('@');
+  const name = versionAt < 0 ? spec : spec.slice(0, versionAt);
+  return validPluginPackageName(name) ? name : null;
+}
+
+async function fetchSharedPluginList() {
+  const controlSocket = path.join(path.dirname(USERS_FILE), 'control.sock');
+  const r = await runHelper([REGISTER_HELPER, '--plugin-list', controlSocket], {
+    timeoutMs: 15000,
+    maxStdout: 1024 * 1024,
+  });
+  let reply = null;
+  try { reply = JSON.parse(r.stdout); } catch (e) {}
+  if (r.code !== 0 || !reply || reply.ok !== true || !Array.isArray(reply.result)) {
+    throw new Error((reply && reply.error) || String(r.stderr || '').trim() || 'plugin list failed');
+  }
+  return reply.result;
+}
+
+const pluginJobs = new Map();
+let activePluginJobId = null;
+function appendPluginJobLog(job, text) {
+  job.log = (job.log + String(text || '')).slice(-256 * 1024);
+}
+
+function startPluginJob(action, name, spec) {
+  if (activePluginJobId) {
+    const active = pluginJobs.get(activePluginJobId);
+    if (active && active.status === 'running') throw new Error('另一个插件操作仍在运行');
+  }
+  const id = crypto.randomBytes(12).toString('hex');
+  const job = {
+    id,
+    action,
+    name,
+    spec: spec || null,
+    status: 'running',
+    startedAt: Date.now(),
+    finishedAt: null,
+    log: '',
+    result: null,
+    error: null,
+  };
+  pluginJobs.set(id, job);
+  activePluginJobId = id;
+  while (pluginJobs.size > 20) pluginJobs.delete(pluginJobs.keys().next().value);
+  const controlSocket = path.join(path.dirname(USERS_FILE), 'control.sock');
+  const args = action === 'add'
+    ? [REGISTER_HELPER, '--plugin-add', name, spec, controlSocket]
+    : [REGISTER_HELPER, '--plugin-remove', name, controlSocket];
+  appendPluginJobLog(job, `${action === 'add' ? '安装' : '移除'} ${spec || name}\n`);
+  runHelper(args, {
+    timeoutMs: 1800000,
+    maxStdout: 1024 * 1024,
+    maxStderr: 1024 * 1024,
+    onStderr: (chunk) => { appendPluginJobLog(job, chunk); },
+  }).then((r) => {
+    let reply = null;
+    try { reply = JSON.parse(r.stdout); } catch (e) {}
+    if (r.code !== 0 || !reply || reply.ok !== true) {
+      throw new Error((reply && reply.error) || String(r.stderr || '').trim() || 'plugin operation failed');
+    }
+    job.status = 'success';
+    job.result = reply.result;
+    appendPluginJobLog(job, '\n操作完成。\n');
+  }).catch((error) => {
+    job.status = 'error';
+    job.error = error.message;
+    appendPluginJobLog(job, `\n错误：${error.message}\n`);
+  }).finally(() => {
+    job.finishedAt = Date.now();
+    if (activePluginJobId === id) activePluginJobId = null;
+  });
+  return job;
+}
+
+function publicPluginJob(job) {
+  return job && {
+    id: job.id,
+    action: job.action,
+    name: job.name,
+    spec: job.spec,
+    status: job.status,
+    startedAt: job.startedAt,
+    finishedAt: job.finishedAt,
+    log: job.log,
+    result: job.result,
+    error: job.error,
+  };
 }
 
 // Tenant DSH processes are lazy: successful authentication wakes the user's
@@ -1366,7 +1499,9 @@ const server = http.createServer(async (req, res) => {
   }
 
   // ---------- admin panel (admin account only) ----------
-  if (pathname === '/__gw/admin' || pathname === '/__gw/admin/users') {
+  if (pathname === '/__gw/admin' || pathname === '/__gw/admin/users'
+      || pathname === '/__gw/admin/plugins' || pathname === '/__gw/admin/plugin-job'
+      || pathname === '/__gw/admin/plugins/add' || pathname === '/__gw/admin/plugins/remove') {
     const au = session && getUser(session.u);
     if (!session || !au || au.admin !== true) {
       if (req.method === 'GET') return redirect(res, '/login');
@@ -1377,6 +1512,52 @@ const server = http.createServer(async (req, res) => {
       let statsError = null;
       try { stats = await fetchTenantProcessStats(); } catch (error) { statsError = error.message; }
       return json(res, 200, adminUsersPayload(stats, statsError));
+    }
+    if (pathname === '/__gw/admin/plugins' && req.method === 'GET') {
+      try {
+        return json(res, 200, {
+          ok: true,
+          plugins: await fetchSharedPluginList(),
+          activeJob: publicPluginJob(activePluginJobId && pluginJobs.get(activePluginJobId)),
+        });
+      } catch (error) {
+        return json(res, 503, { ok: false, error: error.message });
+      }
+    }
+    if (pathname === '/__gw/admin/plugin-job' && req.method === 'GET') {
+      let id = '';
+      try { id = new URL(req.url, 'http://gw').searchParams.get('id') || ''; } catch (e) {}
+      const job = pluginJobs.get(id);
+      if (!job) return json(res, 404, { ok: false, error: 'job not found' });
+      return json(res, 200, { ok: true, job: publicPluginJob(job) });
+    }
+    if ((pathname === '/__gw/admin/plugins/add' || pathname === '/__gw/admin/plugins/remove') && req.method === 'POST') {
+      if (req.headers['x-dsh-gateway-action'] !== 'admin-plugin') {
+        return json(res, 403, { ok: false, error: 'CSRF 校验失败' });
+      }
+      let body;
+      try { body = await readJsonBody(req, 4096); } catch (e) { return json(res, 400, { ok: false, error: 'invalid JSON' }); }
+      try {
+        let job;
+        if (pathname.endsWith('/add')) {
+          const spec = String(body.spec || '').trim();
+          if (!spec || spec.length > 512 || spec.startsWith('-') || /[\r\n\0]/.test(spec)) {
+            return json(res, 400, { ok: false, error: '插件 spec 无效' });
+          }
+          const name = String(body.name || '').trim() || inferPluginPackageName(spec);
+          if (!validPluginPackageName(name)) {
+            return json(res, 400, { ok: false, error: '无法推断包名，请填写 package name' });
+          }
+          job = startPluginJob('add', name, spec);
+        } else {
+          const name = String(body.name || '').trim();
+          if (!validPluginPackageName(name)) return json(res, 400, { ok: false, error: '插件包名无效' });
+          job = startPluginJob('remove', name, null);
+        }
+        return json(res, 202, { ok: true, job: publicPluginJob(job) });
+      } catch (error) {
+        return json(res, 409, { ok: false, error: error.message });
+      }
     }
     const csrf = crypto.randomBytes(16).toString('hex');
     res.setHeader('Set-Cookie', cookieHeader(CSRF_COOKIE, csrf, { maxAge: 600, path: '/', sameSite: 'Lax' }));

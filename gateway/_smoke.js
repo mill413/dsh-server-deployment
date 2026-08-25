@@ -17,11 +17,13 @@ fs.mkdirSync(path.join(USERS_DIR, 'admin'), { recursive: true });
 // use a tiny successful control helper instead of invoking host sudo.
 fs.writeFileSync(TENANT_HELPER, [
   '#!/bin/sh',
-  'if [ "$1" = "--stats" ]; then',
-  '  printf \'%s\\n\' \'{"ok":true,"result":{"tester":{"running":true,"processCount":2,"rssBytes":104857600},"admin":{"running":true,"processCount":1,"rssBytes":52428800}}}\'',
-  'else',
-  '  printf \'%s\\n\' \'{"ok":true,"result":{"started":true}}\'',
-  'fi',
+  'case "$1" in',
+  '  --stats) printf \'%s\\n\' \'{"ok":true,"result":{"tester":{"running":true,"processCount":2,"rssBytes":104857600},"admin":{"running":true,"processCount":1,"rssBytes":52428800}}}\' ;;',
+  '  --plugin-list) printf \'%s\\n\' \'{"ok":true,"result":[{"name":"dsh-better-sidebar","version":"0.15.2","source":"image","dir":"/opt/shared"}]}\' ;;',
+  '  --plugin-add) printf \'%s\\n\' \'{"ok":true,"result":{"name":"test-plugin","users":3,"restarted":1}}\' ;;',
+  '  --plugin-remove) printf \'%s\\n\' \'{"ok":true,"result":{"name":"test-plugin","users":3,"restarted":1}}\' ;;',
+  '  *) printf \'%s\\n\' \'{"ok":true,"result":{"started":true}}\' ;;',
+  'esac',
   '',
 ].join('\n'), { mode: 0o755 });
 
@@ -170,6 +172,23 @@ function check(name, cond) {
   const adminUsers = JSON.parse(r.body);
   const testerStats = adminUsers.users.find((u) => u.name === 'tester');
   check('admin console includes process memory', r.status === 200 && testerStats.rssBytes === 104857600 && testerStats.processCount === 2);
+  r = await req('GET', '/__gw/admin/plugins', { headers: { Cookie: 'dsh_session=' + adminSess } });
+  const pluginList = JSON.parse(r.body);
+  check('admin plugin list', r.status === 200 && pluginList.plugins[0].name === 'dsh-better-sidebar');
+  r = await req('POST', '/__gw/admin/plugins/add', {
+    headers: { Cookie: 'dsh_session=' + adminSess, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ spec: 'test-plugin@1.0.0' }),
+  });
+  check('admin plugin mutation requires action header', r.status === 403);
+  r = await req('POST', '/__gw/admin/plugins/add', {
+    headers: { Cookie: 'dsh_session=' + adminSess, 'Content-Type': 'application/json', 'X-DSH-Gateway-Action': 'admin-plugin' },
+    body: JSON.stringify({ spec: 'test-plugin@1.0.0' }),
+  });
+  const pluginJob = JSON.parse(r.body).job;
+  check('admin starts plugin install job', r.status === 202 && pluginJob.status === 'running');
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  r = await req('GET', '/__gw/admin/plugin-job?id=' + pluginJob.id, { headers: { Cookie: 'dsh_session=' + adminSess } });
+  check('admin plugin job completes', r.status === 200 && JSON.parse(r.body).job.status === 'success');
 
   const csrf3 = cookies((await req('GET', '/login')).headers['set-cookie'])['dsh_csrf'];
   r = await req('POST', '/login', { headers: { 'Cookie': 'dsh_csrf=' + csrf3 }, body: 'csrf=' + csrf3 + '&username=nokey&password=secret123' });
