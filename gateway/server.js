@@ -346,6 +346,7 @@ function getSession(req) {
   if (!tok) return null;
   const p = verifyToken(tok);
   if (!p || !p.u) return null;
+  if (p.n && revokedSessionNonces.has(p.n)) return null;
   if (!getUser(p.u)) return null;
   // Reject tokens minted before the current password generation. Tokens
   // without a generation number are pre-migration relics: they must not
@@ -678,13 +679,15 @@ function setupPage(csrf, error, warning) {
     '</form>', msgDiv,
     '<div class="rule"></div>',
     '<div class="hint">可在 <code>platform.deepseek.com</code> → API Keys 创建 Key。Key 仅保存在你的私有目录中，仅你本人可用。</div>',
+    '<button type="button" id="logout" style="background:transparent;border:1px solid var(--hairline);color:var(--faint)">退出登录</button>',
     '</div>',
     '<script>',
     'var m=document.getElementById("msg");',
     error ? 'm.className="msg err";m.textContent=' + JSON.stringify(error) + ';' : '',
     warning ? 'm.className="msg ok";m.textContent=' + JSON.stringify(warning) + ';' : '',
     'document.getElementById("f").addEventListener("submit",function(){var b=document.getElementById("btn");if(b){b.disabled=true;b.textContent="保存中…";}});',
-    '</scr' + 'ipt>',
+    'document.getElementById("logout").addEventListener("click",function(){window.__DSH_GATEWAY_LOGOUT__(this);});',
+    '</scr' + 'ipt>', TENANT_LIFECYCLE_SCRIPT,
   ].join('');
   return impeccableShell('配置 API Key', body);
 }
@@ -708,7 +711,10 @@ function runHelper(args, opts) {
     const o = Object.assign({ timeoutMs: 15000, maxStdout: 8 * 1024 * 1024 }, opts || {});
     let child;
     try {
-      child = spawn('sudo', ['-n'].concat(args), { stdio: o.input !== undefined ? ['pipe', 'pipe', 'pipe'] : ['ignore', 'pipe', 'pipe'] });
+      const direct = process.env.DSH_HELPER_DIRECT === '1';
+      child = spawn(direct ? args[0] : 'sudo', direct ? args.slice(1) : ['-n'].concat(args), {
+        stdio: o.input !== undefined ? ['pipe', 'pipe', 'pipe'] : ['ignore', 'pipe', 'pipe'],
+      });
     } catch (e) { return resolve({ code: null, stdout: '', stderr: String(e && e.message || e) }); }
     let out = [];
     let outLen = 0;
@@ -734,6 +740,134 @@ function runHelper(args, opts) {
     }
   });
 }
+
+// Tenant DSH processes are lazy: successful authentication wakes the user's
+// instance through the root-only supervisor. Cache readiness for this gateway
+// lifetime and coalesce concurrent browser/API/WebSocket requests so one user
+// can never spawn duplicate processes.
+const readyTenants = new Map(); // username -> stable record marker (port + created)
+const wakingTenants = new Map();
+const stoppingTenants = new Map();
+function ensureTenantInstance(name) {
+  const record = getUser(name);
+  if (!record || record.admin === true || !record.port) return Promise.reject(new Error('user has no tenant instance'));
+  const marker = String(record.port) + ':' + String(record.created || '');
+  if (readyTenants.get(name) === marker) return Promise.resolve();
+  if (wakingTenants.has(name)) return wakingTenants.get(name);
+  const wake = (async () => {
+    const controlSocket = path.join(path.dirname(USERS_FILE), 'control.sock');
+    const r = await runHelper([REGISTER_HELPER, '--wake', name, controlSocket], {
+      timeoutMs: 130000,
+      maxStdout: 64 * 1024,
+    });
+    let reply = null;
+    try { reply = JSON.parse(r.stdout); } catch (e) {}
+    if (r.code !== 0 || !reply || reply.ok !== true) {
+      throw new Error((reply && reply.error) || String(r.stderr || '').trim() || 'tenant startup failed');
+    }
+    readyTenants.set(name, marker);
+  })();
+  wakingTenants.set(name, wake);
+  return wake.finally(() => wakingTenants.delete(name));
+}
+
+function stopTenantInstance(name, reason) {
+  if (stoppingTenants.has(name)) return stoppingTenants.get(name);
+  const stop = (async () => {
+    const controlSocket = path.join(path.dirname(USERS_FILE), 'control.sock');
+    const r = await runHelper([REGISTER_HELPER, '--sleep', name, controlSocket, reason || 'logout'], {
+      timeoutMs: 150000,
+      maxStdout: 64 * 1024,
+    });
+    let reply = null;
+    try { reply = JSON.parse(r.stdout); } catch (e) {}
+    if (r.code !== 0 || !reply || reply.ok !== true) {
+      throw new Error((reply && reply.error) || String(r.stderr || '').trim() || 'tenant stop failed');
+    }
+    readyTenants.delete(name);
+    usersCacheAt = 0;
+    return reply.result;
+  })();
+  stoppingTenants.set(name, stop);
+  return stop.finally(() => stoppingTenants.delete(name));
+}
+
+// Browser presence drives automatic process recycling. pagehide/sendBeacon
+// handles normal tab closes quickly; heartbeat expiry handles crashes, force
+// quits and lost networks. A short zero-tab grace avoids stopping/restarting
+// DSH during reloads. Multiple tabs and devices are coalesced per user.
+const PRESENCE_HEARTBEAT_MS = 10000;
+const PRESENCE_TTL_MS = Math.max(30000, Number(process.env.DSH_BROWSER_PRESENCE_TTL_MS || '120000'));
+const PRESENCE_STOP_GRACE_MS = Math.max(1000, Number(process.env.DSH_BROWSER_STOP_GRACE_MS || '5000'));
+const tenantTabs = new Map();       // user -> Map(tabId -> { at, nonce })
+const presenceNonces = new Map();   // user -> Set(session nonce)
+const pendingPresenceStops = new Map();
+const revokedSessionNonces = new Map(); // nonce -> token expiry epoch ms
+
+function revokePresenceSessions(user) {
+  const nonces = presenceNonces.get(user);
+  if (!nonces) return;
+  const expiresAt = Date.now() + SESSION_TTL * 1000;
+  for (const nonce of nonces) revokedSessionNonces.set(nonce, expiresAt);
+  presenceNonces.delete(user);
+}
+
+function cancelPresenceStop(user) {
+  const timer = pendingPresenceStops.get(user);
+  if (timer) clearTimeout(timer);
+  pendingPresenceStops.delete(user);
+}
+
+function schedulePresenceStop(user, reason) {
+  if (pendingPresenceStops.has(user)) return;
+  const timer = setTimeout(async () => {
+    pendingPresenceStops.delete(user);
+    const tabs = tenantTabs.get(user);
+    if (tabs && tabs.size > 0) return;
+    revokePresenceSessions(user);
+    tenantTabs.delete(user);
+    activeUsers.delete(user);
+    try {
+      await stopTenantInstance(user, reason || 'browser-close');
+      console.log(`tenant-presence stopped ${user} (${reason || 'browser-close'})`);
+    } catch (error) {
+      console.error(`tenant-presence stop failed ${user}: ${error.message}`);
+    }
+  }, PRESENCE_STOP_GRACE_MS);
+  timer.unref();
+  pendingPresenceStops.set(user, timer);
+}
+
+function updateTenantPresence(session, tabId, event) {
+  const user = session.u;
+  let tabs = tenantTabs.get(user);
+  if (!tabs) { tabs = new Map(); tenantTabs.set(user, tabs); }
+  let nonces = presenceNonces.get(user);
+  if (!nonces) { nonces = new Set(); presenceNonces.set(user, nonces); }
+  nonces.add(String(session.n || ''));
+  if (event === 'close') {
+    const existing = tabs.get(tabId);
+    if (!existing || existing.nonce === session.n) tabs.delete(tabId);
+    if (tabs.size === 0) schedulePresenceStop(user, 'browser-close');
+    return;
+  }
+  tabs.set(tabId, { at: Date.now(), nonce: session.n });
+  cancelPresenceStop(user);
+}
+
+const presenceSweep = setInterval(() => {
+  const now = Date.now();
+  for (const [user, tabs] of tenantTabs) {
+    for (const [tabId, value] of tabs) {
+      if (!value || now - value.at > PRESENCE_TTL_MS) tabs.delete(tabId);
+    }
+    if (tabs.size === 0) schedulePresenceStop(user, 'browser-heartbeat-timeout');
+  }
+  for (const [nonce, expiresAt] of revokedSessionNonces) {
+    if (expiresAt <= now) revokedSessionNonces.delete(nonce);
+  }
+}, Math.min(10000, Math.max(2000, Math.floor(PRESENCE_TTL_MS / 3))));
+presenceSweep.unref();
 
 // ---------- user file browser & download (deliverables) ----------
 // User homes are 0700 owned by their dsh-<name> account; userctl grants the
@@ -767,35 +901,43 @@ function userHome(user) {
   return (u && u.home) || path.join(USERS_DIR, user);
 }
 
-// In-page file-management widget injected into the SPA shell: ONE draggable
-// capsule (文件管理) opening a single restrained white drawer (light
-// paper/ink tokens, per the impeccable design reference). The drawer embeds
-// /__gw/files?embed=1, which already carries breadcrumb browsing, download
-// links, and an upload-to-current-directory bar - the previously separate
-// 上传文件 capsule was redundant (issue #4 of the portal review) and is gone.
-// No page navigation; the embedded page closes the drawer via postMessage.
-// The capsule hides while the SPA shows any dialog (settings panel, modals)
-// so the floating button never covers app chrome. No backdrop blur or
-// gradient chrome; focus rings, ESC/backdrop close, reduced-motion respected.
+// In-page file-management widget injected into the SPA shell. Its trigger is
+// cloned from the native Settings row and placed above Logout + Settings, so
+// it follows the sidebar's expanded-label / collapsed-icon geometry exactly.
+// The restrained white drawer embeds /__gw/files?embed=1 for browsing,
+// downloads and uploads; no page navigation, and ESC/backdrop/postMessage all
+// close it. No backdrop blur or gradient chrome.
 
-// crypto.randomUUID shim injected into every proxied HTML page, BEFORE the
+// Trusted-gateway marker + crypto.randomUUID shim injected into every proxied
+// HTML page, BEFORE the
 // SPA bundle: browsers only expose Crypto.randomUUID() in secure contexts
 // (HTTPS or localhost), so plain-HTTP LAN access (http://192.168.x.x) leaves
 // it undefined and the DSH web client throws "crypto.randomUUID is not a
 // function" when creating messages / the events.mux RPC downlink. This
 // runtime fallback (getRandomValues-based UUID v4) restores it for insecure
-// origins. It is response injection, not a DSH source patch - consistent with
-// the gateway's existing SPA-injection model.
-const UUID_SHIM = '<script>(function(){if(!window.crypto||typeof window.crypto.randomUUID==="function")return;function u(){var b=window.crypto.getRandomValues(new Uint8Array(16));b[6]=(b[6]&15)|64;b[8]=(b[8]&63)|128;var h="";for(var i=0;i<16;i++){if(i===4||i===6||i===8||i===10)h+="-";h+=(b[i]<16?"0":"")+b[i].toString(16);}return h;}try{Object.defineProperty(window.crypto,"randomUUID",{value:u,configurable:true,writable:true});}catch(e){window.crypto.randomUUID=u;}})();</script>';
+// origins. The marker tells the patched DSH client that this authenticated
+// gateway owns the privileged Host RPC boundary, so LAN/domain browsers use
+// the Host settings mirror instead of the intentionally unavailable in-memory
+// fallback. Server-side session, Host and Origin checks remain authoritative.
+const BROWSER_BOOTSTRAP = '<script>(function(){window.__DSH_TRUSTED_GATEWAY__=true;if(!window.crypto||typeof window.crypto.randomUUID==="function")return;function u(){var b=window.crypto.getRandomValues(new Uint8Array(16));b[6]=(b[6]&15)|64;b[8]=(b[8]&63)|128;var h="";for(var i=0;i<16;i++){if(i===4||i===6||i===8||i===10)h+="-";h+=(b[i]<16?"0":"")+b[i].toString(16);}return h;}try{Object.defineProperty(window.crypto,"randomUUID",{value:u,configurable:true,writable:true});}catch(e){window.crypto.randomUUID=u;}})();</script>';
+
+const TENANT_LIFECYCLE_SCRIPT = [
+  '<script>(function(){',
+  'if(window.__DSH_GATEWAY_LIFECYCLE__)return;window.__DSH_GATEWAY_LIFECYCLE__=true;',
+  'var tabId=(window.crypto&&typeof window.crypto.randomUUID==="function")?window.crypto.randomUUID():(Date.now().toString(36)+Math.random().toString(36).slice(2));',
+  'var presenceTimer=null,loggingOut=false;',
+  'function presence(event,closing){var body="tab="+encodeURIComponent(tabId)+"&event="+encodeURIComponent(event);if(closing&&navigator.sendBeacon){try{return navigator.sendBeacon("/__gw/presence",body);}catch(e){}}fetch("/__gw/presence",{method:"POST",credentials:"same-origin",headers:{"Content-Type":"application/x-www-form-urlencoded"},body:body,keepalive:!!closing}).catch(function(){});}',
+  'function startPresence(){presence("open",false);if(presenceTimer)clearInterval(presenceTimer);presenceTimer=setInterval(function(){presence("heartbeat",false);},' + PRESENCE_HEARTBEAT_MS + ');}',
+  'startPresence();',
+  'window.addEventListener("pageshow",function(e){if(e.persisted)startPresence();});',
+  'window.addEventListener("pagehide",function(e){if(loggingOut||e.persisted)return;if(presenceTimer)clearInterval(presenceTimer);presence("close",true);});',
+  'document.addEventListener("visibilitychange",function(){if(!document.hidden)presence("heartbeat",false);});',
+  'window.__DSH_GATEWAY_LOGOUT__=function(button){if(loggingOut)return;if(!window.confirm("退出登录并停止当前用户的全部运行进程？用户文件不会删除。"))return;loggingOut=true;if(button){button.disabled=true;button.textContent="正在退出…";}if(presenceTimer)clearInterval(presenceTimer);fetch("/logout",{method:"POST",credentials:"same-origin",headers:{"X-DSH-Gateway-Action":"logout"}}).then(function(r){if(!r.ok)throw new Error("HTTP "+r.status);window.location.replace("/login");}).catch(function(e){loggingOut=false;if(button){button.disabled=false;button.textContent="⏻ 退出登录";}window.alert("退出失败："+e.message);});};',
+  '})();</scr' + 'ipt>',
+].join('');
 
 const FILES_LINK_HTML = [
   '<style>',
-  '#dshgw-fab-stack{position:fixed;right:20px;bottom:20px;z-index:2147483000;display:flex;flex-direction:column;gap:10px;align-items:flex-end;touch-action:none;user-select:none}',
-  '.dshgw-fab{display:inline-flex;align-items:center;gap:8px;background:#fcfcfd;color:#1e293b;border:1px solid #e2e8f0;font:600 13px/1.2 -apple-system,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif;padding:10px 16px;border-radius:999px;box-shadow:0 1px 2px rgba(16,24,40,.06),0 4px 12px rgba(16,24,40,.08);cursor:grab;transition:box-shadow .16s ease,transform .16s ease}',
-  '.dshgw-fab:hover{box-shadow:0 2px 4px rgba(16,24,40,.08),0 8px 20px rgba(16,24,40,.14);transform:translateY(-1px)}',
-  '.dshgw-fab:active{cursor:grabbing}',
-  '.dshgw-fab:focus-visible{outline:2px solid #2563eb;outline-offset:2px}',
-  '#dshgw-fab-stack.dragging .dshgw-fab{transition:none;box-shadow:0 4px 8px rgba(16,24,40,.10),0 16px 36px rgba(16,24,40,.18)}',
   '.dshgw-ov{display:none;position:fixed;inset:0;z-index:2147483100;background:rgba(16,24,40,.45);align-items:center;justify-content:center;padding:24px}',
   '.dshgw-ov.open{display:flex}',
   '.dshgw-panel{position:relative;width:min(900px,100%);height:min(82vh,760px);background:#fcfcfd;border:1px solid #e2e8f0;border-radius:16px;box-shadow:0 1px 2px rgba(16,24,40,.06),0 8px 24px rgba(16,24,40,.12),0 32px 80px rgba(16,24,40,.18);overflow:hidden;display:flex;flex-direction:column;opacity:0;transform:translateY(10px) scale(.985);transition:opacity .18s ease,transform .18s ease}',
@@ -804,11 +946,8 @@ const FILES_LINK_HTML = [
   '.dshgw-x:hover{background:#e2e8f0;color:#0f172a}',
   '.dshgw-x:focus-visible{outline:2px solid #2563eb;outline-offset:2px}',
   '.dshgw-frame{flex:1;width:100%;border:0;background:#fcfcfd}',
-  '@media (prefers-reduced-motion: reduce){.dshgw-fab,.dshgw-panel{transition:none}}',
+  '@media (prefers-reduced-motion: reduce){.dshgw-panel{transition:none}}',
   '</style>',
-  '<div id="dshgw-fab-stack">',
-  '  <button class="dshgw-fab" id="dshgw-fab-files" type="button" aria-haspopup="dialog" title="浏览、下载与上传当前工作区的文件">&#128193; 文件管理</button>',
-  '</div>',
   '<div class="dshgw-ov" id="dshgw-ov-files" role="dialog" aria-modal="true" aria-label="文件管理">',
   '  <div class="dshgw-panel">',
   '    <button class="dshgw-x" type="button" aria-label="关闭">&#215;</button>',
@@ -817,28 +956,51 @@ const FILES_LINK_HTML = [
   '</div>',
   '<script>',
   '(function(){',
-  'var stack=document.getElementById("dshgw-fab-stack");',
-  'var fab=document.getElementById("dshgw-fab-files");',
   'var ov=document.getElementById("dshgw-ov-files");',
   'var frame=ov.querySelector("iframe");',
   'var loaded=false;',
-  'var moved=false;',
-  'function open(){if(moved){moved=false;return;}if(!loaded){frame.src="/__gw/files?embed=1";loaded=true;}ov.classList.add("open");ov.querySelector(".dshgw-x").focus();}',
+  'function open(){if(!loaded){frame.src="/__gw/files?embed=1";loaded=true;}ov.classList.add("open");ov.querySelector(".dshgw-x").focus();}',
   'function shutAll(){ov.classList.remove("open");}',
-  'fab.addEventListener("click",open);',
   'var x=ov.querySelector(".dshgw-x");x.addEventListener("click",shutAll);ov.addEventListener("click",function(e){if(e.target===ov)shutAll();});',
   'document.addEventListener("keydown",function(e){if(e.key==="Escape")shutAll();});',
   'window.addEventListener("message",function(e){if(e.data==="dshgw-close")shutAll();if(e.data==="dshgw-open-files")open();});',
-  'var mo=new MutationObserver(function(){var dialogs=document.querySelectorAll("[role=dialog]");var visible=false;for(var i=0;i<dialogs.length;i++){var d=dialogs[i];if(d.getClientRects().length>0){visible=true;break;}}stack.style.display=visible?"none":"";});',
+  'function cloneSidebarAction(settings,id,label,title,iconMarkup,onClick,popup){var button=settings.cloneNode(true);button.id=id;button.setAttribute("aria-label",label);button.setAttribute("title",title);button.removeAttribute("aria-expanded");if(popup)button.setAttribute("aria-haspopup","dialog");else button.removeAttribute("aria-haspopup");button.querySelectorAll("[data-slot]").forEach(function(node){node.removeAttribute("data-slot");});var icon=button.querySelector("svg");if(icon){while(icon.firstChild)icon.removeChild(icon.firstChild);icon.setAttribute("viewBox","0 0 16 16");icon.setAttribute("fill","none");icon.setAttribute("aria-hidden","true");icon.innerHTML=iconMarkup;}var labels=button.querySelectorAll("span");if(labels.length)labels[labels.length-1].textContent=label;button.addEventListener("click",function(){onClick(button);});return button;}',
+  'function syncSidebarActions(){var slot=document.querySelector("[data-slot=\\"sidebar.settings\\"]");var settings=slot&&slot.querySelector("button");var area=slot&&slot.parentElement;var foot=area&&area.parentElement;if(!settings||!area||!foot)return;var wide=!!settings.querySelector("span");var signature=String(settings.className)+"|"+(wide?"wide":"rail");var files=document.getElementById("dshgw-sidebar-files");var logout=document.getElementById("dshgw-sidebar-logout");if(files&&logout&&files.parentElement===foot&&files.nextElementSibling===logout&&logout.nextElementSibling===area&&files.getAttribute("data-signature")===signature&&logout.getAttribute("data-signature")===signature)return;if(files)files.remove();if(logout)logout.remove();var folderIcon="<path d=\\"M1.75 4.25h4l1.25 1.5h7.25v6.5H1.75z\\" stroke=\\"currentColor\\" stroke-width=\\"1.3\\" stroke-linejoin=\\"round\\"/><path d=\\"M1.75 4.25V3h3.5l1 1.25\\" stroke=\\"currentColor\\" stroke-width=\\"1.3\\" stroke-linejoin=\\"round\\"/>";var powerIcon="<path d=\\"M8 1.5v6\\" stroke=\\"currentColor\\" stroke-width=\\"1.4\\" stroke-linecap=\\"round\\"/><path d=\\"M4.25 3.5a5.25 5.25 0 1 0 7.5 0\\" stroke=\\"currentColor\\" stroke-width=\\"1.4\\" stroke-linecap=\\"round\\"/>";files=cloneSidebarAction(settings,"dshgw-sidebar-files","文件管理","浏览、下载与上传当前工作区的文件",folderIcon,function(){open();},true);logout=cloneSidebarAction(settings,"dshgw-sidebar-logout","退出登录","退出登录并停止当前用户的全部进程",powerIcon,function(button){window.__DSH_GATEWAY_LOGOUT__(button);},false);files.setAttribute("data-signature",signature);logout.setAttribute("data-signature",signature);foot.insertBefore(files,area);foot.insertBefore(logout,area);}',
+  'syncSidebarActions();',
+  'var mo=new MutationObserver(function(){syncSidebarActions();});',
   'mo.observe(document.documentElement,{subtree:true,childList:true,attributes:true,attributeFilter:["class","style"]});',
-  'var dragging=false,sx=0,sy=0,ox=0,oy=0,posKey="dshgw-fab-pos-v2";',
-  'try{var saved=JSON.parse(localStorage.getItem(posKey)||"null");if(saved&&typeof saved.x==="number"&&typeof saved.y==="number"){stack.style.right="auto";stack.style.bottom="auto";stack.style.left=saved.x+"px";stack.style.top=saved.y+"px";}}catch(e){}',
-  'stack.addEventListener("pointerdown",function(ev){if(ev.button!==0)return;dragging=true;moved=false;sx=ev.clientX;sy=ev.clientY;var r=stack.getBoundingClientRect();ox=r.left;oy=r.top;stack.classList.add("dragging");});',
-  'document.addEventListener("pointermove",function(ev){if(!dragging)return;var dx=ev.clientX-sx,dy=ev.clientY-sy;if(!moved&&Math.abs(dx)<6&&Math.abs(dy)<6)return;moved=true;var w=window.innerWidth,h=window.innerHeight,r=stack.getBoundingClientRect();var nx=Math.max(8,Math.min(ox+dx,w-r.width-8)),ny=Math.max(8,Math.min(oy+dy,h-r.height-8));stack.style.right="auto";stack.style.bottom="auto";stack.style.left=nx+"px";stack.style.top=ny+"px";});',
-  'document.addEventListener("pointerup",function(){if(!dragging)return;dragging=false;stack.classList.remove("dragging");if(moved){var r=stack.getBoundingClientRect();try{localStorage.setItem(posKey,JSON.stringify({x:Math.round(r.left),y:Math.round(r.top)}));}catch(e){}}});',
   '})();',
   '</scr' + 'ipt>',
 ].join('');
+
+// Recoverable error page for the /__gw/files embed: a bare JSON 403/404 would
+// leave the popup iframe on a dead page with no way back until the whole app
+// refreshes. This page offers 回到工作区 (re-list the helper default, which is
+// the workspace root) and 关闭 (close the drawer through the FAB's dshgw-close
+// message).
+function filesErrorPage(reason) {
+  const back = '/__gw/files?embed=1';
+  return [
+    '<!doctype html><html lang="zh"><head><meta charset="utf-8">',
+    '<meta name="viewport" content="width=device-width,initial-scale=1">',
+    '<title>文件管理</title>',
+    '<style>',
+    'body{background:#f6f8fa;color:#0f172a;font:14px/1.6 -apple-system,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif;margin:0;display:flex;align-items:center;justify-content:center;min-height:100vh}',
+    '.card{max-width:440px;background:#fff;border:1px solid #e2e8f0;border-radius:14px;padding:26px 28px;box-shadow:0 1px 2px rgba(16,24,40,.05)}',
+    'h1{font-size:16px;margin:0 0 10px}',
+    'p{color:#475569;margin:0 0 18px}',
+    '.row{display:flex;gap:10px;align-items:center}',
+    'a.ghost{color:#2563eb;background:#fff;border:1px solid #bfdbfe;border-radius:10px;padding:8px 16px;text-decoration:none;font-weight:600}',
+    'button{color:#64748b;background:#fff;border:1px solid #e2e8f0;border-radius:10px;padding:8px 16px;cursor:pointer;font:600 13px inherit}',
+    '</style></head><body><div class="card">',
+    '<h1>&#128193; 文件管理</h1>',
+    '<p>' + esc(reason) + '</p>',
+    '<div class="row"><a class="ghost" href="' + back + '">回到工作区</a>',
+    '<button type="button" id="close">关闭</button></div>',
+    '<scr' + 'ipt>document.getElementById("close").addEventListener("click",function(){if(window.parent!==window){try{parent.postMessage("dshgw-close","*");}catch(e){}}})</scr' + 'ipt>',
+    '</div></body></html>',
+  ].join('');
+}
 
 // ---------- reverse proxy ----------
 const HOP = new Set(['connection', 'proxy-connection', 'keep-alive', 'transfer-encoding', 'te', 'trailer', 'upgrade', 'proxy-authorization', 'proxy-authenticate', 'content-length']);
@@ -1058,9 +1220,9 @@ function proxyRequest(req, res, port, user) {
         const headAt = html.toLowerCase().indexOf('<head');
         if (headAt >= 0) {
           const headEnd = html.indexOf('>', headAt);
-          html = html.slice(0, headEnd + 1) + UUID_SHIM + html.slice(headEnd + 1);
+          html = html.slice(0, headEnd + 1) + BROWSER_BOOTSTRAP + TENANT_LIFECYCLE_SCRIPT + html.slice(headEnd + 1);
         } else {
-          html = UUID_SHIM + html;
+          html = BROWSER_BOOTSTRAP + TENANT_LIFECYCLE_SCRIPT + html;
         }
         const at = html.toLowerCase().lastIndexOf('</body>');
         html = at >= 0 ? html.slice(0, at) + FILES_LINK_HTML + html.slice(at) : html + FILES_LINK_HTML;
@@ -1184,7 +1346,7 @@ const server = http.createServer(async (req, res) => {
       }
       const query = q < 0 ? '' : req.url.slice(q + 1);
       const okMsg = /(^|&)ok=1(&|$)/.test(query)
-        ? '注册成功！你的实例正在启动，几秒后即可登录。'
+        ? '注册成功！首次登录时将自动启动你的实例。'
         : null;
       const csrf = crypto.randomBytes(16).toString('hex');
       res.setHeader('Set-Cookie', cookieHeader(CSRF_COOKIE, csrf, { maxAge: 600, path: '/', sameSite: 'Lax' }));
@@ -1234,6 +1396,18 @@ const server = http.createServer(async (req, res) => {
         return res.end(loginPage(csrf2, '用户名或密码错误'));
       }
       recordSuccess(req, username);
+      if (!u.admin) {
+        try {
+          await ensureTenantInstance(username);
+        } catch (error) {
+          logLine(req, 503, 'tenant-start-fail ' + username + ' ' + String(error.message).slice(0, 160));
+          const csrf2 = crypto.randomBytes(16).toString('hex');
+          res.setHeader('Set-Cookie', cookieHeader(CSRF_COOKIE, csrf2, { maxAge: 600, path: '/', sameSite: 'Lax' }));
+          secHeaders(res);
+          res.writeHead(503, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+          return res.end(loginPage(csrf2, '账号验证成功，但实例启动失败，请稍后重试：' + error.message));
+        }
+      }
       setSession(res, username);
       logLine(req, 302, 'login ' + username);
       if (u.admin) return redirect(res, '/__gw/admin');
@@ -1285,7 +1459,7 @@ const server = http.createServer(async (req, res) => {
       // which strips custom env vars (env_reset), so it cannot rely on
       // DSH_GATEWAY_STATE_DIR. The socket lives next to users.json.
       const regSocket = path.join(path.dirname(USERS_FILE), 'control.sock');
-      const r = await runHelper([REGISTER_HELPER, username, regSocket], { input: password, timeoutMs: 20000, maxStdout: 64 * 1024 });
+      const r = await runHelper([REGISTER_HELPER, username, regSocket], { input: password, timeoutMs: 130000, maxStdout: 64 * 1024 });
       let reply = null;
       try { reply = JSON.parse(r.stdout); } catch (e) {}
       if (r.code !== 0 || !reply || reply.ok !== true) {
@@ -1337,6 +1511,15 @@ const server = http.createServer(async (req, res) => {
       logLine(req, 302, 'external-login invalid');
       return redirect(res, '/login');
     }
+    const loginUser = getUser(login.user);
+    if (!loginUser.admin) {
+      try {
+        await ensureTenantInstance(login.user);
+      } catch (error) {
+        logLine(req, 503, 'external-tenant-start-fail ' + login.user + ' ' + String(error.message).slice(0, 160));
+        return json(res, 503, { ok: false, error: '实例启动失败，请重新登录：' + error.message });
+      }
+    }
     setSession(res, login.user);
     res.setHeader('Referrer-Policy', 'no-referrer');
     const destination = loginDestination(login.user, login.returnTo);
@@ -1359,7 +1542,7 @@ const server = http.createServer(async (req, res) => {
     if (!/^[A-Za-z0-9_-]{1,64}$/.test(username)) return json(res, 400, { ok: false, error: 'invalid username' });
     if (password.length < 8) return json(res, 400, { ok: false, error: 'password must be at least 8 characters' });
     const regSocket = path.join(path.dirname(USERS_FILE), 'control.sock');
-    const r = await runHelper([REGISTER_HELPER, username, regSocket], { input: password, timeoutMs: 20000, maxStdout: 64 * 1024 });
+    const r = await runHelper([REGISTER_HELPER, username, regSocket], { input: password, timeoutMs: 130000, maxStdout: 64 * 1024 });
     let reply = null;
     try { reply = JSON.parse(r.stdout); } catch (e) {}
     if (r.code !== 0 || !reply || reply.ok !== true) {
@@ -1374,8 +1557,8 @@ const server = http.createServer(async (req, res) => {
 
   // ---------- model registration API: POST /api/users/<name>/provider ----------
   // Registers (or replaces) the user's custom provider AND writes its API key.
-  // The supervisor writes the provider config and restarts the instance; the
-  // key is written by the user's own instance via the loopback credentials RPC.
+  // The supervisor writes both provider config and owner-only key. Dormant
+  // tenants stay dormant; already-active instances are restarted.
   const apiProviderMatch = /^\/api\/users\/([A-Za-z0-9_-]{1,64})\/provider$/.exec(pathname);
   if (apiProviderMatch && req.method === 'POST') {
     if (!apiAuthorized(req)) return json(res, 401, { ok: false, error: 'unauthorized' });
@@ -1420,7 +1603,10 @@ const server = http.createServer(async (req, res) => {
     if (!u || !u.port) return json(res, 404, { ok: false, error: 'user not found' });
     if (u.admin === true) return json(res, 400, { ok: false, error: 'admin has no instance' });
     const regSocket = path.join(path.dirname(USERS_FILE), 'control.sock');
-    const r = await runHelper([PROVIDER_HELPER, name, regSocket, JSON.stringify({ name: pname, baseURL, api: papi, models })], { timeoutMs: 90000, maxStdout: 64 * 1024 });
+    const r = await runHelper(
+      [PROVIDER_HELPER, name, regSocket, JSON.stringify({ name: pname, baseURL, api: papi, models })],
+      { input: key, timeoutMs: 160000, maxStdout: 64 * 1024 },
+    );
     let reply = null;
     try { reply = JSON.parse(r.stdout); } catch (e) {}
     if (r.code !== 0 || !reply || reply.ok !== true) {
@@ -1429,23 +1615,27 @@ const server = http.createServer(async (req, res) => {
       return json(res, 409, { ok: false, error: detail });
     }
     const ref = reply.result.provider.apiKeyEnv;
-    const saved = await rpcCredentialSetRetry(u.port, ref, key);
-    if (!saved.ok) {
-      // The provider config IS live in the user's settings - only the key
-      // write failed. Say so explicitly so the caller can retry the key (or
-      // fix the instance) instead of thinking registration failed.
-      logLine(req, 502, 'api-provider key-fail ' + name + ' ' + String(saved.detail).slice(0, 160));
-      return json(res, 502, {
-        ok: false,
-        error: 'provider configured but API key write failed: ' + saved.detail,
-        provider: reply.result.provider,
-        keyWrite: { ok: false, detail: saved.detail },
-      });
-    }
-    setUserKeyFlag(name, true);
     usersCacheAt = 0;
     logLine(req, 200, 'api-provider ' + name + ' ref=' + ref + ' models=' + models.length);
     return json(res, 200, { ok: true, user: name, provider: reply.result.provider, ref: ref, models: models });
+  }
+
+  if (pathname === '/__gw/presence') {
+    if (req.method !== 'POST') return json(res, 405, { ok: false, error: 'method not allowed' });
+    if (!session) return json(res, 401, { ok: false, error: 'not logged in' });
+    const presenceUser = getUser(session.u);
+    if (!presenceUser || presenceUser.admin === true) return json(res, 204, {});
+    let body = '';
+    try { body = await readBody(req, 4096); } catch (e) { return json(res, 413, { ok: false, error: 'payload too large' }); }
+    const form = parseForm(body);
+    const tabId = String(form.tab || '');
+    const event = String(form.event || 'heartbeat');
+    if (!/^[A-Za-z0-9_-]{8,128}$/.test(tabId) || !['open', 'heartbeat', 'close'].includes(event)) {
+      return json(res, 400, { ok: false, error: 'invalid presence event' });
+    }
+    updateTenantPresence(session, tabId, event);
+    res.writeHead(204, { 'Cache-Control': 'no-store' });
+    return res.end();
   }
 
   if (pathname === '/logout') {
@@ -1460,8 +1650,26 @@ const server = http.createServer(async (req, res) => {
       try { body = await readBody(req, 4096); } catch (e) {}
       const form = parseForm(body);
       const tok = form.csrf || req.headers['x-csrf-token'] || '';
-      if (!c[CSRF_COOKIE] || !timingSafeStr(String(tok), c[CSRF_COOKIE])) {
+      const trustedAction = req.headers['x-dsh-gateway-action'] === 'logout';
+      if (!trustedAction && (!c[CSRF_COOKIE] || !timingSafeStr(String(tok), c[CSRF_COOKIE]))) {
         return json(res, 403, { ok: false, error: 'CSRF 校验失败' });
+      }
+      const logoutUser = getUser(session.u);
+      if (logoutUser && logoutUser.admin !== true) {
+        try {
+          await stopTenantInstance(session.u, 'manual-logout');
+        } catch (error) {
+          logLine(req, 503, 'tenant-stop-fail ' + session.u + ' ' + String(error.message).slice(0, 160));
+          return json(res, 503, { ok: false, error: '退出失败，用户进程未能停止：' + error.message });
+        }
+        cancelPresenceStop(session.u);
+        tenantTabs.delete(session.u);
+        let nonces = presenceNonces.get(session.u);
+        if (!nonces) { nonces = new Set(); presenceNonces.set(session.u, nonces); }
+        nonces.add(String(session.n || ''));
+        revokePresenceSessions(session.u);
+        activeUsers.delete(session.u);
+        logLine(req, 302, 'logout-stop ' + session.u);
       }
     }
     clearSession(res);
@@ -1741,7 +1949,23 @@ const server = http.createServer(async (req, res) => {
     // the gateway's service account has no read access to user homes by design).
     // Default target: the user's current conversation cwd (tracked from the
     // SPA's session RPCs), else the workspace directory.
-    const dirParam = String(q.dir || '') || currentCwd(session.u) || '';
+    const embed = String(q.embed || '') === '1';
+    // The visible root is the workspace directory; the real home root holds
+    // DSH internals (profiles/, storages/, cordis.patch.yml, ...) and is out
+    // of scope. Deriving it HERE keeps the "根目录" crumb and every clamp
+    // consistent no matter what the helper reports as its `home` field. Do NOT
+    // probe the filesystem for it: the gateway service account has no access
+    // into the 0700 user homes (all file work runs through the root helpers),
+    // so fs.existsSync would always report false. The helpers realpath the
+    // workspace themselves and fall back to the home when it is missing.
+    const wsRoot = path.join(home, 'workspace');
+    let dirParam = String(q.dir || '') || currentCwd(session.u) || '';
+    if (dirParam && dirParam !== wsRoot && !dirParam.startsWith(wsRoot + path.sep)) {
+      // A stale crumb or tracked cwd pointing above the workspace (e.g. the
+      // old home root) would 403 and strand the popup iframe: clamp to the
+      // visible root before listing.
+      dirParam = wsRoot;
+    }
     let listing = null;
     {
       const r = await runHelper([FILE_LIST_HELPER, home, dirParam]);
@@ -1756,15 +1980,24 @@ const server = http.createServer(async (req, res) => {
       }
       if (!listing) {
         const code = r.code;
-        return json(res, code === 3 ? 403 : 404, { ok: false, error: code === 3 ? '路径超出你的工作区' : '目录不存在或无法读取' });
+        const reason = code === 3 ? '路径超出你的工作区' : '目录不存在或无法读取';
+        if (embed) {
+          // Recoverable page INSIDE the popup iframe: a bare JSON error would
+          // leave the drawer stuck until the whole app refreshes.
+          secHeaders(res);
+          res.writeHead(403, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+          return res.end(filesErrorPage(reason));
+        }
+        return json(res, code === 3 ? 403 : 404, { ok: false, error: reason });
       }
     }
     const dir = listing.dir;
-    const root = listing.home || home;
+    const root = listing.home === home ? wsRoot : (listing.home || wsRoot);
     const crumbs = [];
     {
       const rel = path.relative(root, dir);
-      const parts = rel ? rel.split(path.sep) : [];
+      const safe = !rel || (!rel.startsWith('..') && !path.isAbsolute(rel));
+      const parts = safe ? (rel ? rel.split(path.sep) : []) : [];
       let acc = root;
       crumbs.push('<a href="/__gw/files?dir=' + encodeURIComponent(root) + '">&#127968; 根目录</a>');
       for (const part of parts) {
@@ -1782,7 +2015,6 @@ const server = http.createServer(async (req, res) => {
       }
     }
     const truncated = listing.truncated === true;
-    const embed = String(q.embed || '') === '1';
     const body = [
       '<div class="dlcard' + (embed ? ' embed' : '') + '">',
       '<div class="dlhead"><div><h1>&#128193; 文件管理</h1><p class="sub">任务产出的文件保存在你的工作区里：点击「下载」保存到本地，也可以从本机上传文件到当前目录。</p></div>',
@@ -1866,15 +2098,26 @@ const server = http.createServer(async (req, res) => {
     clearSession(res);
     return json(res, 401, { ok: false, error: '账号不可用' });
   }
+  try {
+    await ensureTenantInstance(session.u);
+  } catch (error) {
+    logLine(req, 503, 'tenant-start-fail ' + session.u + ' ' + String(error.message).slice(0, 160));
+    return json(res, 503, { ok: false, error: '实例启动失败，请稍后重试：' + error.message });
+  }
   proxyRequest(req, res, u.port, session.u);
 });
 
-server.on('upgrade', (req, socket, head) => {
+server.on('upgrade', async (req, socket, head) => {
   const session = getSession(req);
   if (!session) { socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n'); socket.destroy(); return; }
   if (!hasKey(session.u)) { socket.write('HTTP/1.1 403 Forbidden\r\n\r\n'); socket.destroy(); return; }
   const u = getUser(session.u);
   if (!u || !u.port) { socket.destroy(); return; }
+  try { await ensureTenantInstance(session.u); } catch (error) {
+    socket.write('HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n');
+    socket.destroy();
+    return;
+  }
   proxyUpgrade(req, socket, head, u.port);
 });
 

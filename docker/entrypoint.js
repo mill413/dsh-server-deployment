@@ -6,11 +6,13 @@
 //   - seeds tenants from DSH_TENANTS_JSON at boot (bootstrap only), merging
 //     with users that were added at runtime and persisted in the volume-backed
 //     users.json, so runtime users survive container restarts;
-//   - spawns one DSH web instance per tenant (runuser -> dsh-<name>) and the
-//     gateway, re-applies the loopback firewall whenever the user set changes;
+//   - spawns the gateway and, by default, starts each tenant DSH web instance
+//     on first successful login (runuser -> dsh-<name>), while re-applying the
+//     loopback firewall whenever the registered user set changes;
 //   - exposes a root-only Unix control socket (DSH_CONTROL_SOCKET) so the
 //     in-container `dsh-users` CLI can add / passwd / delete / list / set-key
-//     users at runtime without editing compose.yml or recreating the container.
+//     users and persistent shared plugins at runtime without editing
+//     compose.yml or recreating the container.
 
 const fs = require('fs');
 const http = require('http');
@@ -18,7 +20,7 @@ const net = require('net');
 const path = require('path');
 const { execFileSync, spawn } = require('child_process');
 const { hashPassword, verifyPassword } = require('../gateway/auth.js');
-const { hasApiKey, setApiKey } = require('../gateway/credentials.js');
+const { hasApiKey, setApiKey, setCredential } = require('../gateway/credentials.js');
 
 const APP_DIR = process.env.DSH_APP_DIR || '/opt/deepseek-harness';
 const USERS_DIR = process.env.DSH_USERS_DIR || '/srv/dsh/users';
@@ -29,13 +31,21 @@ const SECRET_FILE = process.env.SECRET_FILE || path.join(STATE_DIR, 'secret');
 const CWD_STATE_FILE = process.env.CWD_STATE_FILE || path.join(STATE_DIR, 'state-cwd.json');
 const CONTROL_SOCKET = process.env.DSH_CONTROL_SOCKET || path.join(STATE_DIR, 'control.sock');
 const DSH_BIN = process.env.DSH_DSH_BIN || path.join(APP_DIR, 'apps/cli/lib/bin.js');
+const DEPLOYMENT_PATCH = '/opt/dsh-server-deployment/docker/disable-llm-deepseek.patch.yml';
 const BETTER_SIDEBAR_PACKAGE = 'dsh-better-sidebar';
 const BETTER_SIDEBAR_DIR = '/opt/dsh-public/profiles/web/node_modules/dsh-better-sidebar';
 const BETTER_SIDEBAR_SPEC = `link:${BETTER_SIDEBAR_DIR}`;
+const RUNTIME_SHARED_HOME = process.env.DSH_SHARED_PLUGINS_HOME
+  || path.join(path.dirname(USERS_DIR), 'shared-plugins');
+const RUNTIME_SHARED_PROFILE = path.join(RUNTIME_SHARED_HOME, 'profiles', 'web');
+const RUNTIME_SHARED_RECEIPTS = path.join(RUNTIME_SHARED_HOME, 'install-receipts.json');
+const SHARED_PLUGINS_FILE = '.dsh-shared-plugins.json';
+const WEB_PROFILE_BUNDLES = ['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-web-app'];
 const NODE_BIN = process.execPath;
 const GATEWAY_PORT = numberEnv('DSH_GATEWAY_PORT', 3100);
 const TENANT_PORT_BASE = numberEnv('DSH_TENANT_PORT_BASE', 3101);
 const SKIP_KEY_SETUP = process.env.DSH_SKIP_KEY_SETUP === '1';
+const LAZY_TENANTS = process.env.DSH_LAZY_TENANTS !== '0';
 const LOOPBACK_GUARD = '/usr/local/libexec/dsh/dsh-loopback-guard';
 const GATEWAY_SERVER = '/opt/dsh-server-deployment/gateway/server.js';
 const MIN_PASSWORD_LENGTH = 8;
@@ -50,6 +60,9 @@ const children = [];
 const state = {
   db: { version: 1, users: {} }, // live users.json mirror
   tenants: new Map(),            // exact username -> { record, child }
+  tenantStarts: new Map(),        // exact username -> in-flight readiness promise
+  sharedWebPlugins: [],           // immutable image plugin + persistent runtime plugins
+  sharedPluginBusy: false,        // serialize shared package mutations
   stopping: false,
   controlServer: null,
 };
@@ -119,22 +132,254 @@ function searchPatchContent() {
   ].join('\n');
 }
 
-// The image installs better-sidebar once through DSH's native plugin manager.
-// Each tenant then registers a DSH-managed link dependency to that immutable
-// root-owned package, retaining an independent profile without duplicating the
-// plugin dependency tree.
-function ensureBetterSidebarProfile(home, osUser) {
-  const sharedManifest = path.join(BETTER_SIDEBAR_DIR, 'package.json');
-  if (!fs.existsSync(sharedManifest)) {
-    throw new Error(`shared better-sidebar package is missing: ${sharedManifest}`);
+function validPackageName(name) {
+  return typeof name === 'string'
+    && /^(?:@[A-Za-z0-9._-]+\/)?[A-Za-z0-9._-]+$/.test(name);
+}
+
+function validateSharedPluginConfig(value, label = 'shared plugin') {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error(`${label} must be an object`);
   }
+  const name = value.name;
+  const spec = value.spec === undefined ? name : value.spec;
+  if (!validPackageName(name) || name === BETTER_SIDEBAR_PACKAGE) {
+    throw new Error(`${label} has an invalid or reserved name`);
+  }
+  if (typeof spec !== 'string' || spec.length === 0 || spec.length > 512
+      || spec.startsWith('-') || /[\r\n\0]/.test(spec)) {
+    throw new Error(`${label} has an invalid spec`);
+  }
+  return { name, spec };
+}
+
+function parseSharedPluginConfigs() {
+  let values;
+  try {
+    values = JSON.parse(process.env.DSH_SHARED_WEB_PLUGINS_JSON || '[]');
+  } catch (error) {
+    throw new Error(`DSH_SHARED_WEB_PLUGINS_JSON is not valid JSON: ${error.message}`);
+  }
+  if (!Array.isArray(values)) throw new Error('DSH_SHARED_WEB_PLUGINS_JSON must be an array');
+  const names = new Set();
+  return values.map((value, index) => {
+    const config = validateSharedPluginConfig(value, `shared plugin ${index}`);
+    const { name } = config;
+    if (names.has(name)) throw new Error(`duplicate shared plugin name: ${name}`);
+    names.add(name);
+    return config;
+  });
+}
+
+function readManifest(file, label) {
+  let value;
+  try { value = JSON.parse(fs.readFileSync(file, 'utf8')); } catch (error) {
+    throw new Error(`cannot read ${label} manifest ${file}: ${error.message}`);
+  }
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error(`${label} manifest must contain a JSON object: ${file}`);
+  }
+  return value;
+}
+
+function ensureDirectoryLink(link, target) {
+  fs.mkdirSync(path.dirname(link), { recursive: true, mode: 0o700 });
+  let stat;
+  try { stat = fs.lstatSync(link); } catch (error) {
+    if (error.code !== 'ENOENT') throw error;
+  }
+  const correct = stat && stat.isSymbolicLink() && fs.readlinkSync(link) === target;
+  if (stat && !correct) {
+    if (stat.isSymbolicLink()) fs.unlinkSync(link);
+    else fs.rmSync(link, { recursive: true, force: true });
+  }
+  if (!correct) fs.symlinkSync(target, link, 'dir');
+}
+
+function workspaceContent() {
+  return [
+    'packages:',
+    '  - .',
+    '',
+    'nodeLinker: hoisted',
+    'autoInstallPeers: false',
+    // Shared-plugin management is root-only. Per deployment policy, trust all
+    // selected plugin dependency lifecycle scripts without per-package flags.
+    'dangerouslyAllowAllBuilds: true',
+    '',
+  ].join('\n');
+}
+
+function ensureRuntimeSharedProfileSkeleton() {
+  fs.mkdirSync(RUNTIME_SHARED_PROFILE, { recursive: true, mode: 0o755 });
+  const manifestFile = path.join(RUNTIME_SHARED_PROFILE, 'package.json');
+  let manifest = fs.existsSync(manifestFile)
+    ? readManifest(manifestFile, 'runtime shared profile')
+    : { name: 'dsh-runtime-shared-web-plugins', private: true, dependencies: {}, dsh: { profile: { bundles: [...WEB_PROFILE_BUNDLES] } } };
+  const dependencies = manifest.dependencies && typeof manifest.dependencies === 'object'
+    && !Array.isArray(manifest.dependencies) ? manifest.dependencies : {};
+  dependencies[BETTER_SIDEBAR_PACKAGE] = BETTER_SIDEBAR_SPEC;
+  const dsh = manifest.dsh && typeof manifest.dsh === 'object' && !Array.isArray(manifest.dsh) ? manifest.dsh : {};
+  const profile = dsh.profile && typeof dsh.profile === 'object' && !Array.isArray(dsh.profile) ? dsh.profile : {};
+  const bundles = Array.isArray(profile.bundles) ? profile.bundles : [...WEB_PROFILE_BUNDLES];
+  if (!bundles.includes(BETTER_SIDEBAR_PACKAGE)) bundles.push(BETTER_SIDEBAR_PACKAGE);
+  manifest = { ...manifest, private: true, dependencies, dsh: { ...dsh, profile: { ...profile, bundles } } };
+  writeAtomic(manifestFile, `${JSON.stringify(manifest, null, 2)}\n`, 0o644);
+  const patchFile = path.join(RUNTIME_SHARED_PROFILE, 'cordis.patch.yml');
+  if (!fs.existsSync(patchFile)) fs.writeFileSync(patchFile, '[]\n', { mode: 0o644 });
+  writeAtomic(path.join(RUNTIME_SHARED_PROFILE, 'pnpm-workspace.yaml'), workspaceContent(), 0o644);
+  ensureDirectoryLink(path.join(RUNTIME_SHARED_PROFILE, 'node_modules', BETTER_SIDEBAR_PACKAGE), BETTER_SIDEBAR_DIR);
+}
+
+function healRuntimeSharedFallback() {
+  execFileSync(NODE_BIN, ['--input-type=module', '-e',
+    'const m=await import("/opt/deepseek-harness/packages/boot/app-boot/lib/index.js"); m.healProfilesModuleFallback("/opt/deepseek-harness/apps/cli/package.json", process.env.DSH_SHARED_PLUGINS_HOME)'], {
+    stdio: 'inherit',
+    env: { ...process.env, DSH_SHARED_PLUGINS_HOME: RUNTIME_SHARED_HOME },
+  });
+}
+
+function runRuntimeSharedPluginCommand(action, spec, onProgress) {
+  const streamOutput = typeof onProgress === 'function';
+  return new Promise((resolve, reject) => {
+    const child = spawn(NODE_BIN, [DSH_BIN, 'plugin', '--profile', 'web', action, spec], {
+      cwd: RUNTIME_SHARED_HOME,
+      stdio: streamOutput ? ['ignore', 'pipe', 'pipe'] : 'inherit',
+      env: {
+        ...process.env,
+        DSH_HOME: RUNTIME_SHARED_HOME,
+        HOME: RUNTIME_SHARED_HOME,
+        SHELL: '/bin/bash',
+        NPM_CONFIG_UPDATE_NOTIFIER: 'false',
+      },
+    });
+    if (streamOutput) {
+      const forward = (target) => (chunk) => {
+        target.write(chunk);
+        onProgress(chunk.toString('utf8'));
+      };
+      child.stdout.on('data', forward(process.stdout));
+      child.stderr.on('data', forward(process.stderr));
+    }
+    child.once('error', reject);
+    child.once('close', (code, signal) => {
+      if (code === 0) resolve();
+      else reject(new Error(`dsh plugin ${action} failed (code=${code}, signal=${signal || 'none'})`));
+    });
+  });
+}
+
+function discoverRuntimeSharedPlugins() {
+  const manifestFile = path.join(RUNTIME_SHARED_PROFILE, 'package.json');
+  if (!fs.existsSync(manifestFile)) return [];
+  const manifest = readManifest(manifestFile, 'runtime shared profile');
+  const dependencies = manifest.dependencies && typeof manifest.dependencies === 'object' ? manifest.dependencies : {};
+  const bundles = manifest.dsh && manifest.dsh.profile && Array.isArray(manifest.dsh.profile.bundles)
+    ? manifest.dsh.profile.bundles : [];
+  const result = [];
+  for (const name of bundles) {
+    if (name === BETTER_SIDEBAR_PACKAGE || !Object.prototype.hasOwnProperty.call(dependencies, name)) continue;
+    const dir = path.join(RUNTIME_SHARED_PROFILE, 'node_modules', name);
+    const packageFile = path.join(dir, 'package.json');
+    if (!fs.existsSync(packageFile)) throw new Error(`runtime shared plugin is missing: ${packageFile}`);
+    const pluginManifest = readManifest(packageFile, `runtime shared plugin ${name}`);
+    if (!pluginManifest.dsh || !pluginManifest.dsh.bundle || typeof pluginManifest.dsh.bundle.patch !== 'string') {
+      throw new Error(`runtime shared dependency ${name} does not declare dsh.bundle.patch`);
+    }
+    result.push({ name, dir });
+  }
+  return result;
+}
+
+async function ensureRuntimeSharedPlugins(configs, onProgress) {
+  const sharedManifest = path.join(BETTER_SIDEBAR_DIR, 'package.json');
+  if (!fs.existsSync(sharedManifest)) throw new Error(`shared better-sidebar package is missing: ${sharedManifest}`);
+  const alreadyExists = fs.existsSync(path.join(RUNTIME_SHARED_PROFILE, 'package.json'));
+  if (configs.length === 0 && !alreadyExists) return [{ name: BETTER_SIDEBAR_PACKAGE, dir: BETTER_SIDEBAR_DIR }];
+
+  ensureRuntimeSharedProfileSkeleton();
+  const receipts = readJson(RUNTIME_SHARED_RECEIPTS, { version: 1, specs: {} });
+  if (!receipts.specs || typeof receipts.specs !== 'object') receipts.specs = {};
+  for (const config of configs) {
+    const packageFile = path.join(RUNTIME_SHARED_PROFILE, 'node_modules', config.name, 'package.json');
+    const profileManifest = readManifest(path.join(RUNTIME_SHARED_PROFILE, 'package.json'), 'runtime shared profile');
+    const installed = fs.existsSync(packageFile)
+      && profileManifest.dependencies && Object.prototype.hasOwnProperty.call(profileManifest.dependencies, config.name)
+      && profileManifest.dsh && profileManifest.dsh.profile && Array.isArray(profileManifest.dsh.profile.bundles)
+      && profileManifest.dsh.profile.bundles.includes(config.name)
+      && receipts.specs[config.name] === config.spec;
+    if (installed) continue;
+    console.log(`installing runtime shared plugin ${config.name} from ${config.spec}`);
+    const previousDependencies = new Set(Object.keys(profileManifest.dependencies || {}));
+    await runRuntimeSharedPluginCommand('add', config.spec, onProgress);
+    try {
+      const installedManifest = readManifest(packageFile, `runtime shared plugin ${config.name}`);
+      if (installedManifest.name !== config.name) {
+        throw new Error(`spec installed ${installedManifest.name || 'an unnamed package'}, expected ${config.name}`);
+      }
+      if (!installedManifest.dsh || !installedManifest.dsh.bundle
+          || typeof installedManifest.dsh.bundle.patch !== 'string') {
+        throw new Error(`${config.name} does not declare dsh.bundle.patch`);
+      }
+    } catch (error) {
+      // A wrong --name or a non-DSH package must not poison the persistent
+      // profile. Remove every dependency introduced by this failed add.
+      const failedManifest = readManifest(path.join(RUNTIME_SHARED_PROFILE, 'package.json'), 'runtime shared profile');
+      const addedNames = Object.keys(failedManifest.dependencies || {})
+        .filter((name) => !previousDependencies.has(name) && name !== BETTER_SIDEBAR_PACKAGE);
+      for (const addedName of addedNames) {
+        try { await runRuntimeSharedPluginCommand('remove', addedName, onProgress); } catch (removeError) {
+          console.error(`WARNING: DSH could not roll back ${addedName}: ${removeError.message}`);
+        }
+      }
+      const cleanedManifest = readManifest(path.join(RUNTIME_SHARED_PROFILE, 'package.json'), 'runtime shared profile');
+      for (const addedName of addedNames) {
+        if (cleanedManifest.dependencies && typeof cleanedManifest.dependencies === 'object') {
+          delete cleanedManifest.dependencies[addedName];
+        }
+        if (cleanedManifest.dsh && cleanedManifest.dsh.profile && Array.isArray(cleanedManifest.dsh.profile.bundles)) {
+          cleanedManifest.dsh.profile.bundles = cleanedManifest.dsh.profile.bundles.filter((name) => name !== addedName);
+        }
+      }
+      writeAtomic(path.join(RUNTIME_SHARED_PROFILE, 'package.json'), `${JSON.stringify(cleanedManifest, null, 2)}\n`, 0o644);
+      throw new Error(`shared plugin ${config.spec} was rejected and rolled back: ${error.message}`);
+    }
+    receipts.specs[config.name] = config.spec;
+  }
+  healRuntimeSharedFallback();
+  writeAtomic(RUNTIME_SHARED_RECEIPTS, `${JSON.stringify(receipts, null, 2)}\n`, 0o600);
+  execFileSync('chown', ['-hR', 'root:root', RUNTIME_SHARED_HOME]);
+  execFileSync('chmod', ['-R', 'a+rX', RUNTIME_SHARED_HOME]);
+  execFileSync('chmod', ['-R', 'go-w', RUNTIME_SHARED_HOME]);
+  return [
+    { name: BETTER_SIDEBAR_PACKAGE, dir: BETTER_SIDEBAR_DIR },
+    ...discoverRuntimeSharedPlugins(),
+  ];
+}
+
+function sharedPluginDetails(plugin) {
+  const manifest = readManifest(path.join(plugin.dir, 'package.json'), `shared plugin ${plugin.name}`);
+  return {
+    name: plugin.name,
+    version: typeof manifest.version === 'string' ? manifest.version : null,
+    source: plugin.name === BETTER_SIDEBAR_PACKAGE ? 'image' : 'runtime',
+    dir: plugin.dir,
+  };
+}
+
+// Synchronize every image/runtime shared bundle into one tenant profile. The
+// tracking file lets a future shared-plugin removal clean only links managed
+// by this deployment while preserving plugins the tenant installed itself.
+function ensureSharedWebPluginsProfile(home) {
+  const sharedPlugins = state.sharedWebPlugins;
 
   const profileDir = path.join(home, 'profiles', 'web');
   const profileManifest = path.join(profileDir, 'package.json');
+  const profilePatch = path.join(profileDir, 'cordis.patch.yml');
   const profileWorkspace = path.join(profileDir, 'pnpm-workspace.yaml');
   fs.mkdirSync(profileDir, { recursive: true, mode: 0o700 });
 
-  let manifest = null;
+  let manifest;
   if (fs.existsSync(profileManifest)) {
     try {
       manifest = JSON.parse(fs.readFileSync(profileManifest, 'utf8'));
@@ -144,16 +389,42 @@ function ensureBetterSidebarProfile(home, osUser) {
     if (!manifest || typeof manifest !== 'object' || Array.isArray(manifest)) {
       throw new Error(`web profile manifest must contain a JSON object: ${profileManifest}`);
     }
+  } else {
+    manifest = {
+      name: 'dsh-profile-web',
+      private: true,
+      dependencies: {},
+      dsh: { profile: { bundles: [...WEB_PROFILE_BUNDLES] } },
+    };
   }
 
-  const dependency = manifest && manifest.dependencies && manifest.dependencies[BETTER_SIDEBAR_PACKAGE];
-  const bundles = manifest && manifest.dsh && manifest.dsh.profile && manifest.dsh.profile.bundles;
-  const installedDir = path.join(profileDir, 'node_modules', BETTER_SIDEBAR_PACKAGE);
-  let resolvesToSharedPackage = false;
-  try { resolvesToSharedPackage = fs.realpathSync(installedDir) === BETTER_SIDEBAR_DIR; } catch {}
-  if (dependency === BETTER_SIDEBAR_SPEC && Array.isArray(bundles)
-      && bundles.includes(BETTER_SIDEBAR_PACKAGE) && resolvesToSharedPackage) return;
+  const dependencies = manifest.dependencies && typeof manifest.dependencies === 'object'
+    && !Array.isArray(manifest.dependencies) ? manifest.dependencies : {};
+  const trackingFile = path.join(profileDir, SHARED_PLUGINS_FILE);
+  const tracked = readJson(trackingFile, { version: 1, plugins: [] });
+  const previousNames = Array.isArray(tracked.plugins) ? tracked.plugins.filter(validPackageName) : [];
+  const currentNames = sharedPlugins.map((plugin) => plugin.name);
+  for (const name of previousNames) {
+    if (currentNames.includes(name)) continue;
+    const spec = dependencies[name];
+    if (typeof spec === 'string' && (spec.startsWith(`link:${RUNTIME_SHARED_HOME}/`) || spec.startsWith('link:/opt/dsh-public/'))) {
+      delete dependencies[name];
+    }
+  }
+  for (const plugin of sharedPlugins) dependencies[plugin.name] = `link:${plugin.dir}`;
+  const dsh = manifest.dsh && typeof manifest.dsh === 'object' && !Array.isArray(manifest.dsh)
+    ? manifest.dsh : {};
+  const profile = dsh.profile && typeof dsh.profile === 'object' && !Array.isArray(dsh.profile)
+    ? dsh.profile : {};
+  const existingBundles = Array.isArray(profile.bundles) ? profile.bundles : [...WEB_PROFILE_BUNDLES];
+  const baseBundles = WEB_PROFILE_BUNDLES.filter((name) => existingBundles.includes(name));
+  const tenantBundles = existingBundles.filter((name) => !WEB_PROFILE_BUNDLES.includes(name)
+    && !previousNames.includes(name) && !currentNames.includes(name));
+  const bundles = [...baseBundles, ...currentNames, ...tenantBundles];
+  manifest = { ...manifest, dependencies, dsh: { ...dsh, profile: { ...profile, bundles } } };
+  writeAtomic(profileManifest, `${JSON.stringify(manifest, null, 2)}\n`, 0o644);
 
+  if (!fs.existsSync(profilePatch)) fs.writeFileSync(profilePatch, '[]\n', { mode: 0o644 });
   if (!fs.existsSync(profileWorkspace)) {
     writeAtomic(profileWorkspace, [
       'packages:',
@@ -165,23 +436,26 @@ function ensureBetterSidebarProfile(home, osUser) {
     ].join('\n'), 0o644);
   }
 
-  execFileSync('chown', ['-hR', `${osUser}:${osUser}`, home]);
-  const pluginCommand = (action, spec) => execFileSync('runuser', ['-u', osUser, '--', 'env',
-    `DSH_HOME=${home}`,
-    `HOME=${home}`,
-    'SHELL=/bin/bash',
-    `PATH=${process.env.PATH || '/usr/local/bin:/usr/bin:/bin'}`,
-    'NPM_CONFIG_UPDATE_NOTIFIER=false',
-    NODE_BIN, DSH_BIN, 'plugin', '--profile', 'web', action, spec,
-  ], { stdio: 'inherit' });
-
-  // Remove local installs and links from older deployment revisions through
-  // DSH before registering the image-owned shared package.
-  if (dependency) pluginCommand('remove', BETTER_SIDEBAR_PACKAGE);
-  pluginCommand('add', BETTER_SIDEBAR_SPEC);
+  for (const name of previousNames) {
+    if (currentNames.includes(name)) continue;
+    const link = path.join(profileDir, 'node_modules', name);
+    try {
+      const stat = fs.lstatSync(link);
+      if (stat.isSymbolicLink()) fs.unlinkSync(link);
+    } catch (error) {
+      if (error.code !== 'ENOENT') throw error;
+    }
+  }
+  for (const plugin of sharedPlugins) {
+    if (!fs.existsSync(path.join(plugin.dir, 'package.json'))) {
+      throw new Error(`shared plugin package is missing: ${plugin.dir}`);
+    }
+    ensureDirectoryLink(path.join(profileDir, 'node_modules', plugin.name), plugin.dir);
+  }
+  writeAtomic(trackingFile, `${JSON.stringify({ version: 1, plugins: currentNames }, null, 2)}\n`, 0o644);
 
   // Remove the sibling fallback link created by the first shared-package
-  // revision; the current link is owned by pnpm inside web/node_modules.
+  // revision; the current profile-local link lives inside web/node_modules.
   const legacyLink = path.join(home, 'profiles', 'node_modules', BETTER_SIDEBAR_PACKAGE);
   try {
     const stat = fs.lstatSync(legacyLink);
@@ -285,7 +559,7 @@ function provisionTenant(tenant, port, uid, existing) {
   if (!fs.existsSync(searchPatch)) {
     fs.writeFileSync(searchPatch, searchPatchContent(), { mode: 0o644 });
   }
-  ensureBetterSidebarProfile(home, osUser);
+  ensureSharedWebPluginsProfile(home);
   if (tenant.provider) {
     // Custom provider: default the web client to it and skip the /setup gate
     // (the API key is written afterwards by the external key endpoint).
@@ -331,7 +605,7 @@ function ensurePreservedRecord(name, record, uid) {
   if (!fs.existsSync(searchPatch)) {
     fs.writeFileSync(searchPatch, searchPatchContent(), { mode: 0o644 });
   }
-  ensureBetterSidebarProfile(record.home, osUser);
+  ensureSharedWebPluginsProfile(record.home);
   execFileSync('chown', ['-hR', `${osUser}:${osUser}`, record.home]);
   fs.chmodSync(record.home, 0o700);
   return { ...record, osUser, home: record.home, port: record.port };
@@ -458,13 +732,19 @@ async function waitForInstanceReady(port, timeoutMs = 60000) {
 function tenantArgs(record) {
   const env = [
     `DSH_HOME=${record.home}`,
-    `HOME=${record.home}`,
+    // Visible home for the tenant process: point at the workspace so the SPA
+    // directory picker / homedir() / shell default all land in the user's
+    // work directory instead of the home root (which holds DSH internals:
+    // profiles/, storages/, settings.yaml, ...). DSH state itself stays under
+    // DSH_HOME, so credentials and profiles are unaffected.
+    `HOME=${record.home}/workspace`,
     'SHELL=/bin/bash',
     `PATH=${process.env.PATH || '/usr/local/bin:/usr/bin:/bin'}`,
     `DEEPSEEK_BASE_URL=${process.env.DEEPSEEK_BASE_URL || 'https://api.deepseek.com'}`,
   ];
   return ['-u', record.osUser, '--', 'env', ...env, NODE_BIN, DSH_BIN,
-    '--profile', 'web', '--host', '127.0.0.1', '--port', String(record.port)];
+    '--profile', 'web', '--patch', DEPLOYMENT_PATCH,
+    '--host', '127.0.0.1', '--port', String(record.port)];
 }
 
 function gatewayArgs() {
@@ -477,6 +757,8 @@ function gatewayArgs() {
     `USERS_DIR=${USERS_DIR}`,
     `COOKIE_SECURE=${process.env.COOKIE_SECURE || '0'}`,
     `DEEPSEEK_BASE_URL=${process.env.DEEPSEEK_BASE_URL || 'https://api.deepseek.com'}`,
+    `DSH_BROWSER_PRESENCE_TTL_MS=${process.env.DSH_BROWSER_PRESENCE_TTL_MS || '120000'}`,
+    `DSH_BROWSER_STOP_GRACE_MS=${process.env.DSH_BROWSER_STOP_GRACE_MS || '5000'}`,
     'UPLOAD_HELPER=/usr/local/libexec/dsh/dsh-file-put',
     'FILE_STAT_HELPER=/usr/local/libexec/dsh/dsh-file-stat',
     'FILE_READ_HELPER=/usr/local/libexec/dsh/dsh-file-read',
@@ -543,6 +825,72 @@ function stopTenant(name, timeoutMs = 8000) {
   });
 }
 
+function killAllProcessesForOsUser(osUser) {
+  let uid;
+  try { uid = Number(execFileSync('id', ['-u', osUser], { encoding: 'utf8' }).trim()); } catch (e) { return 0; }
+  if (!Number.isInteger(uid) || uid < 1) return 0;
+  let killed = 0;
+  for (const entry of fs.readdirSync('/proc')) {
+    if (!/^\d+$/.test(entry)) continue;
+    const pid = Number(entry);
+    try {
+      const status = fs.readFileSync(`/proc/${entry}/status`, 'utf8');
+      const match = /^Uid:\s+(\d+)/m.exec(status);
+      if (!match || Number(match[1]) !== uid) continue;
+      process.kill(pid, 'SIGKILL');
+      killed += 1;
+    } catch (e) {}
+  }
+  return killed;
+}
+
+async function ensureTenantStarted(name, record) {
+  if (state.tenantStarts.has(name)) return state.tenantStarts.get(name);
+  if (state.tenants.has(name)) return { name, port: record.port, started: false };
+  const startup = (async () => {
+    startTenant(name, record);
+    try {
+      await waitForPort(record.port, 90000);
+      const ready = await waitForInstanceReady(record.port, 30000);
+      if (!ready) throw new Error(`tenant ${name} did not finish initialization within 30 seconds`);
+      console.log(`tenant ${name} started on demand at 127.0.0.1:${record.port}`);
+      return { name, port: record.port, started: true };
+    } catch (error) {
+      await stopTenant(name);
+      throw error;
+    }
+  })();
+  state.tenantStarts.set(name, startup);
+  try {
+    return await startup;
+  } finally {
+    state.tenantStarts.delete(name);
+  }
+}
+
+function syncSharedPluginsToAllUsers() {
+  let count = 0;
+  for (const record of Object.values(state.db.users)) {
+    if (!record || record.admin === true) continue;
+    ensureSharedWebPluginsProfile(record.home);
+    execFileSync('chown', ['-hR', `${record.osUser}:${record.osUser}`, path.join(record.home, 'profiles', 'web')]);
+    count += 1;
+  }
+  return count;
+}
+
+async function restartAllTenantProcesses() {
+  const tenants = [...state.tenants.entries()].map(([name, entry]) => ({ name, record: entry.record }));
+  await Promise.all(tenants.map(({ name }) => stopTenant(name)));
+  for (const { name, record } of tenants) startTenant(name, record);
+  await Promise.all(tenants.map(({ record }) => waitForPort(record.port, 120000)));
+  const ready = await Promise.all(tenants.map(({ record }) => waitForInstanceReady(record.port, 60000)));
+  ready.forEach((isReady, index) => {
+    if (!isReady) console.error(`WARNING: tenant ${tenants[index].name} did not finish plugin composition within 60 seconds`);
+  });
+  return tenants.length;
+}
+
 // ---------- control socket (dsh-users CLI <-> supervisor) ----------
 
 function validName(name) {
@@ -565,6 +913,7 @@ function requirePassword(password) {
 }
 
 function controlAdd(payload) {
+  const startedAt = Date.now();
   const { name, password } = payload;
   if (!validName(name)) throw new Error('invalid username (letters, digits, underscore, hyphen only)');
   if (name.toLowerCase() === ADMIN_NAME.toLowerCase()) throw new Error(`reserved username: ${ADMIN_NAME}`);
@@ -578,13 +927,22 @@ function controlAdd(payload) {
   const uid = identities[name.toLowerCase()].uid;
   const port = nextFreePort(usedPorts(state.db));
   const record = provisionTenant({ name, password, provider }, port, uid, undefined);
+  const provisionedAt = Date.now();
   state.db.users[name] = record;
   saveUsersDb(state.db);
-  startTenant(name, record);
+  const persistedAt = Date.now();
+  if (!LAZY_TENANTS) startTenant(name, record);
+  const spawnedAt = Date.now();
   applyLoopbackGuard();
-  waitForPort(port, 60000).catch((error) => {
-    console.error(`WARNING: tenant ${name} did not become ready on ${port}: ${error.message}`);
-  });
+  const guardedAt = Date.now();
+  console.log(`tenant add ${name}: provision=${provisionedAt - startedAt}ms `
+    + `persist=${persistedAt - provisionedAt}ms spawn=${spawnedAt - persistedAt}ms `
+    + `firewall=${guardedAt - spawnedAt}ms total=${guardedAt - startedAt}ms`);
+  if (!LAZY_TENANTS) {
+    waitForPort(port, 60000).catch((error) => {
+      console.error(`WARNING: tenant ${name} did not become ready on ${port}: ${error.message}`);
+    });
+  }
   return {
     ok: true,
     result: {
@@ -593,8 +951,42 @@ function controlAdd(payload) {
       osUser: record.osUser,
       keyConfigured: record.keyConfigured,
       provider: record.provider || undefined,
+      started: !LAZY_TENANTS,
     },
   };
+}
+
+async function controlWake(payload) {
+  const { name } = payload;
+  const record = state.db.users[name];
+  if (!record) throw new Error(`user not found: ${name}`);
+  if (record.admin === true) throw new Error('admin has no instance');
+  const result = await ensureTenantStarted(name, record);
+  return { ok: true, result };
+}
+
+async function controlSleep(payload) {
+  const { name } = payload;
+  const record = state.db.users[name];
+  if (!record) throw new Error(`user not found: ${name}`);
+  if (record.admin === true) throw new Error('admin has no instance');
+  const startup = state.tenantStarts.get(name);
+  if (startup) {
+    try { await startup; } catch (e) {}
+  }
+  const wasRunning = state.tenants.has(name);
+  await stopTenant(name);
+  // The DSH launcher is a detached process-group leader, so stopTenant kills
+  // the whole normal tree. Kill by the tenant's unique OS uid as a final sweep
+  // for any tool that deliberately escaped that process group. Files remain
+  // untouched in the user's persistent HOME.
+  const swept = killAllProcessesForOsUser(record.osUser);
+  if (payload.revokeSessions === true) {
+    record.pwdVer = (typeof record.pwdVer === 'number' ? record.pwdVer : 0) + 1;
+    saveUsersDb(state.db);
+  }
+  console.log(`tenant ${name} stopped on ${payload.reason || 'logout'} (wasRunning=${wasRunning}, swept=${swept})`);
+  return { ok: true, result: { name, stopped: wasRunning, swept } };
 }
 
 function controlPasswd(payload) {
@@ -660,49 +1052,117 @@ function controlKeyStatus(payload) {
   return { ok: true, result: { name, configured: !!record.keyConfigured } };
 }
 
+function controlSharedPluginList() {
+  return { ok: true, result: state.sharedWebPlugins.map(sharedPluginDetails) };
+}
+
+async function controlSharedPluginAdd(payload, onProgress) {
+  if (state.sharedPluginBusy) throw new Error('another shared plugin operation is still running');
+  const config = validateSharedPluginConfig(payload, 'shared plugin');
+  state.sharedPluginBusy = true;
+  try {
+    onProgress(`Installing shared plugin ${config.spec} into ${RUNTIME_SHARED_HOME}\n`);
+    state.sharedWebPlugins = await ensureRuntimeSharedPlugins([config], onProgress);
+    onProgress('Synchronizing shared plugin links to all users...\n');
+    const users = syncSharedPluginsToAllUsers();
+    onProgress(`Restarting ${state.tenants.size} tenant DSH process(es)...\n`);
+    const restarted = await restartAllTenantProcesses();
+    const plugin = state.sharedWebPlugins.find((item) => item.name === config.name);
+    if (!plugin) throw new Error(`installed plugin was not discovered: ${config.name}`);
+    return { ok: true, result: { ...sharedPluginDetails(plugin), users, restarted } };
+  } finally {
+    state.sharedPluginBusy = false;
+  }
+}
+
+async function controlSharedPluginRemove(payload, onProgress) {
+  if (state.sharedPluginBusy) throw new Error('another shared plugin operation is still running');
+  const { name } = payload;
+  if (!validPackageName(name)) throw new Error('invalid shared plugin package name');
+  if (name === BETTER_SIDEBAR_PACKAGE) throw new Error(`${name} is built into the image and cannot be removed at runtime`);
+  if (!state.sharedWebPlugins.some((plugin) => plugin.name === name)) {
+    throw new Error(`shared plugin is not installed: ${name}`);
+  }
+  state.sharedPluginBusy = true;
+  try {
+    onProgress(`Removing shared plugin ${name} from ${RUNTIME_SHARED_HOME}\n`);
+    await runRuntimeSharedPluginCommand('remove', name, onProgress);
+    const manifestFile = path.join(RUNTIME_SHARED_PROFILE, 'package.json');
+    const manifest = readManifest(manifestFile, 'runtime shared profile');
+    if (manifest.dependencies && typeof manifest.dependencies === 'object') delete manifest.dependencies[name];
+    if (manifest.dsh && manifest.dsh.profile && Array.isArray(manifest.dsh.profile.bundles)) {
+      manifest.dsh.profile.bundles = manifest.dsh.profile.bundles.filter((bundle) => bundle !== name);
+    }
+    writeAtomic(manifestFile, `${JSON.stringify(manifest, null, 2)}\n`, 0o644);
+    const receipts = readJson(RUNTIME_SHARED_RECEIPTS, { version: 1, specs: {} });
+    if (receipts.specs && typeof receipts.specs === 'object') delete receipts.specs[name];
+    writeAtomic(RUNTIME_SHARED_RECEIPTS, `${JSON.stringify(receipts, null, 2)}\n`, 0o600);
+    healRuntimeSharedFallback();
+    execFileSync('chown', ['-hR', 'root:root', RUNTIME_SHARED_HOME]);
+    execFileSync('chmod', ['-R', 'a+rX', RUNTIME_SHARED_HOME]);
+    execFileSync('chmod', ['-R', 'go-w', RUNTIME_SHARED_HOME]);
+    state.sharedWebPlugins = [
+      { name: BETTER_SIDEBAR_PACKAGE, dir: BETTER_SIDEBAR_DIR },
+      ...discoverRuntimeSharedPlugins(),
+    ];
+    onProgress('Synchronizing shared plugin links to all users...\n');
+    const users = syncSharedPluginsToAllUsers();
+    onProgress(`Restarting ${state.tenants.size} tenant DSH process(es)...\n`);
+    const restarted = await restartAllTenantProcesses();
+    return { ok: true, result: { name, users, restarted } };
+  } finally {
+    state.sharedPluginBusy = false;
+  }
+}
+
 // Register (or replace) a custom provider for an EXISTING user: write their
-// settings.yaml (llm-pi-ai profile + agent-default-model), update the user
-// record, then restart the tenant so the running instance loads the new
-// config. The API key itself is written later by the gateway through the
-// loopback credentials RPC.
+// settings.yaml, owner-only credential and user record. Restart only an
+// already-active tenant; a dormant account stays dormant until login.
 async function controlSetProvider(payload) {
   const { name } = payload;
   const record = state.db.users[name];
   if (!record) throw new Error(`user not found: ${name}`);
   if (record.admin === true) throw new Error('admin has no instance');
   const provider = validateProvider(payload.provider);
+  const key = payload.key;
+  if (typeof key !== 'string' || key.length === 0) throw new Error('provider API key required');
   const settingsFile = path.join(record.home, 'settings.yaml');
   fs.writeFileSync(settingsFile, providerSettingsYaml(provider), { mode: 0o644 });
-  try { execFileSync('chown', [record.osUser + ':' + record.osUser, settingsFile]); } catch (e) {}
+  const ref = providerApiKeyEnv(provider.name);
+  setCredential(USERS_DIR, name, ref, key);
+  try { execFileSync('chown', ['-hR', record.osUser + ':' + record.osUser, record.home]); } catch (e) {}
   record.provider = {
     name: provider.name,
     baseURL: provider.baseURL,
     model: provider.model,
     models: provider.models,
     api: provider.api,
-    apiKeyEnv: providerApiKeyEnv(provider.name),
+    apiKeyEnv: ref,
   };
   record.keyConfigured = true; // provider users skip the /setup gate
   saveUsersDb(state.db);
-  await stopTenant(name);
-  startTenant(name, record);
-  await waitForPort(record.port, 60000);
-  // Wait for the credentials service to actually be mounted, not just the TCP
-  // port: the gateway writes the API key right after this reply, and a
-  // half-booted instance answers "credentials service is absent".
-  await waitForInstanceReady(record.port, 60000);
-  return { ok: true, result: { name, provider: record.provider } };
+  const wasRunning = state.tenants.has(name);
+  if (wasRunning) {
+    await stopTenant(name);
+    await ensureTenantStarted(name, record);
+  }
+  return { ok: true, result: { name, provider: record.provider, started: wasRunning } };
 }
 
-async function handleControl(payload) {
+async function handleControl(payload, onProgress = () => {}) {
   switch (payload && payload.cmd) {
     case 'add': return controlAdd(payload);
+    case 'wake': return controlWake(payload);
+    case 'sleep': return controlSleep(payload);
     case 'passwd': return controlPasswd(payload);
     case 'del': return controlDel(payload);
     case 'list': return controlList();
     case 'set-key': return controlSetKey(payload);
     case 'key-status': return controlKeyStatus(payload);
     case 'set-provider': return controlSetProvider(payload);
+    case 'shared-plugin-list': return controlSharedPluginList();
+    case 'shared-plugin-add': return controlSharedPluginAdd(payload, onProgress);
+    case 'shared-plugin-remove': return controlSharedPluginRemove(payload, onProgress);
     default: return { ok: false, error: `unknown command: ${payload && payload.cmd}` };
   }
 }
@@ -720,8 +1180,11 @@ function startControlServer() {
       buf = buf.slice(idx + 1);
       let payload = {};
       try { payload = JSON.parse(line); } catch (e) {}
+      const onProgress = (message) => {
+        if (!socket.destroyed) socket.write(JSON.stringify({ progress: String(message) }) + '\n');
+      };
       Promise.resolve()
-        .then(() => handleControl(payload))
+        .then(() => handleControl(payload, onProgress))
         .then((reply) => socket.end(JSON.stringify(reply) + '\n'))
         .catch((error) => socket.end(JSON.stringify({ ok: false, error: error.message }) + '\n'));
     });
@@ -766,6 +1229,9 @@ async function main() {
   fs.mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 });
   execFileSync('chown', ['dsh-gateway:dsh-gateway', STATE_DIR]);
   fs.chmodSync(STATE_DIR, 0o700);
+
+  state.sharedWebPlugins = await ensureRuntimeSharedPlugins(parseSharedPluginConfigs());
+  console.log(`shared web plugins ready: ${state.sharedWebPlugins.map((plugin) => plugin.name).join(', ')}`);
 
   // Merge: DSH_TENANTS_JSON is a bootstrap seed; users that were added at
   // runtime (persisted in the volume-backed users.json) survive restarts and
@@ -815,16 +1281,19 @@ async function main() {
   applyLoopbackGuard();
   startControlServer();
 
-  for (const [name, record] of Object.entries(db.users)) {
-    if (record.admin === true) continue;
-    startTenant(name, record);
+  if (!LAZY_TENANTS) {
+    for (const [name, record] of Object.entries(db.users)) {
+      if (record.admin === true) continue;
+      startTenant(name, record);
+    }
+    await Promise.all(Object.values(db.users)
+      .filter((record) => record.admin !== true)
+      .map((record) => waitForPort(record.port)));
   }
-  await Promise.all(Object.values(db.users)
-    .filter((record) => record.admin !== true)
-    .map((record) => waitForPort(record.port)));
   spawnManaged('gateway', 'runuser', gatewayArgs());
   await waitForPort(GATEWAY_PORT, 30000);
-  console.log(`dsh multi-tenant gateway ready on 0.0.0.0:${GATEWAY_PORT} (${Object.keys(db.users).join(', ')})`);
+  console.log(`dsh multi-tenant gateway ready on 0.0.0.0:${GATEWAY_PORT} `
+    + `(${Object.keys(db.users).join(', ')}; tenants=${LAZY_TENANTS ? 'lazy' : 'eager'})`);
 }
 
 process.once('SIGTERM', () => shutdown(0));

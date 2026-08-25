@@ -8,6 +8,7 @@ const path = require('path');
 const stateDir = process.env.DSH_GATEWAY_STATE_DIR || '/var/lib/dsh-gateway';
 const usersFile = process.env.USERS_FILE || path.join(stateDir, 'users.json');
 const gatewayPort = Number(process.env.DSH_GATEWAY_PORT || '3100');
+const lazyTenants = process.env.DSH_LAZY_TENANTS !== '0';
 
 function checkTcp(port) {
   return new Promise((resolve, reject) => {
@@ -37,6 +38,10 @@ function checkGateway() {
 }
 
 (async () => {
+  if (lazyTenants) {
+    await checkGateway();
+    return;
+  }
   const db = JSON.parse(fs.readFileSync(usersFile, 'utf8'));
   // Admin records are management-only (no instance); skip them.
   const ports = Object.values(db.users || {})

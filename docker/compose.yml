@@ -12,13 +12,23 @@ services:
       # `docker compose -f docker/compose.yml ...`.
       context: ..
       dockerfile: docker/Dockerfile
-      no_cache: true
-      pull: true
+      args:
+        DSH_BASE_IMAGE: "${DSH_BASE_IMAGE:-dsh-server-base:local}"
     cap_add:
       - NET_ADMIN
     environment:
       COOKIE_SECURE: "0"
       DSH_SKIP_KEY_SETUP: "1"
+      # Register/provision accounts immediately, but start each tenant's DSH
+      # process only after that user successfully logs in.
+      DSH_LAZY_TENANTS: "1"
+      # Stop a tenant after its last browser tab closes. pagehide normally
+      # stops it after 5s; a 120s heartbeat timeout covers crashes/disconnects.
+      DSH_BROWSER_STOP_GRACE_MS: "5000"
+      DSH_BROWSER_PRESENCE_TTL_MS: "120000"
+      # Disable the public self-service registration page/link. Administrators
+      # can still provision accounts with dsh-users or the authenticated API.
+      DSH_ENABLE_REGISTER: "0"
       # Admin account (management only, no DSH instance). Created/updated at
       # boot from this env var (scrypt-hashed into users.json). Unset it and
       # remove users.json's admin record to disable. Login as admin lands on
@@ -39,6 +49,10 @@ services:
       # /var/lib/dsh/gateway - one volume = one backup/cleanup unit.
       DSH_USERS_DIR: /var/lib/dsh/users
       DSH_GATEWAY_STATE_DIR: /var/lib/dsh/gateway
+      # Runtime-installed shared bundles live in the persistent /var/lib/dsh
+      # tree. Set the host variable to a JSON array of {name,spec}.
+      DSH_SHARED_PLUGINS_HOME: /var/lib/dsh/shared-plugins
+      DSH_SHARED_WEB_PLUGINS_JSON: "${DSH_SHARED_WEB_PLUGINS_JSON:-[]}"
       # DSH_TENANTS_JSON is a BOOTSTRAP SEED only: these users are created (or
       # updated) when the container starts. To add / remove / change users at
       # runtime without editing this file or recreating the container, use the

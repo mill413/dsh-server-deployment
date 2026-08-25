@@ -4,13 +4,14 @@
 // EXISTING user (Docker deployment).
 //
 // Usage: dsh-provider <username> <control-socket> '<provider-json>'
+//                     (API key on stdin)
 //
 // Runs as root via sudo from the gateway (pinned in the dsh-gateway sudoers
 // allowlist). It forwards {cmd:'set-provider'} to the entrypoint supervisor,
 // which writes the user's settings.yaml (llm-pi-ai provider profile +
-// agent-default-model) and restarts their instance so the config goes live.
-// The API key itself is written afterwards by the gateway through the loopback
-// credentials RPC (no extra privilege needed).
+// agent-default-model) and stores the API key owner-only. A dormant tenant
+// remains dormant; an already-running tenant is restarted so the change is
+// applied immediately.
 //
 // The socket path is passed explicitly as the second argument because sudo
 // strips custom environment variables (env_reset).
@@ -36,11 +37,14 @@ try {
   fail('invalid provider json', 2);
 }
 if (!provider || typeof provider !== 'object' || Array.isArray(provider)) fail('provider is required', 2);
+let key = '';
+try { key = fs.readFileSync(0, 'utf8').replace(/\r?\n$/, ''); } catch (e) { fail('cannot read API key', 2); }
+if (!key) fail('API key is required', 2);
 
-const payload = JSON.stringify({ cmd: 'set-provider', name: name, provider: provider }) + '\n';
+const payload = JSON.stringify({ cmd: 'set-provider', name: name, provider: provider, key: key }) + '\n';
 const sock = net.connect(SOCKET);
 let buf = '';
-const timer = setTimeout(() => { sock.destroy(); fail('control socket timeout', 1); }, 90000);
+const timer = setTimeout(() => { sock.destroy(); fail('control socket timeout', 1); }, 150000);
 sock.setEncoding('utf8');
 sock.on('connect', () => sock.write(payload));
 sock.on('data', (c) => { buf += c; });

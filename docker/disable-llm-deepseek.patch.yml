@@ -1,0 +1,6 @@
+# Deployment policy: custom providers remain available through llm-pi-ai, but
+# the built-in DeepSeek provider must not mount for any tenant.
+- id: llm-deepseek
+  disabled: true
+- id: web-search-deepseek
+  disabled: true

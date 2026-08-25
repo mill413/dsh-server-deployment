@@ -8,8 +8,13 @@ const { hashPassword } = require('./auth.js');
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'dshgw-'));
 const USERS_DIR = path.join(TMP, 'users');
 const USERS_FILE = path.join(TMP, 'users.json');
+const TENANT_HELPER = path.join(TMP, 'dsh-register-test-helper');
 fs.mkdirSync(path.join(USERS_DIR, 'tester'), { recursive: true });
 fs.mkdirSync(path.join(USERS_DIR, 'nokey'), { recursive: true });
+// The production gateway reaches the root supervisor through dsh-register for
+// lazy wake/sleep. This standalone smoke test already owns a mock upstream, so
+// use a tiny successful control helper instead of invoking host sudo.
+fs.writeFileSync(TENANT_HELPER, '#!/bin/sh\nprintf \'%s\\n\' \'{"ok":true,"result":{"started":true}}\'\n', { mode: 0o755 });
 
 const users = {
   version: 1,
@@ -27,6 +32,8 @@ process.env.SECRET_FILE = path.join(TMP, 'secret');
 process.env.USERS_DIR = USERS_DIR;
 process.env.COOKIE_SECURE = '0';
 process.env.DSH_LOGIN_API_KEY = 'login-test-token';
+process.env.DSH_REGISTER_HELPER = TENANT_HELPER;
+process.env.DSH_HELPER_DIRECT = '1';
 process.env.DEEPSEEK_BASE_URL = 'http://127.0.0.1:3999';
 
 const upstream = http.createServer((req, res) => {
@@ -160,7 +167,7 @@ function check(name, cond) {
   r = await req('POST', '/logout', { headers: { Cookie: 'dsh_session=' + sess + '; dsh_csrf=' + csrf2 }, body: 'csrf=' + csrf2 });
   check('logout POST -> 302 /login', r.status === 302 && r.headers.location === '/login');
   r = await req('POST', '/logout', { headers: { Cookie: 'dsh_session=' + sess }, body: 'csrf=' + csrf2 });
-  check('logout POST w/o csrf cookie -> 403', r.status === 403);
+  check('revoked logout session stays logged out', r.status === 302 && r.headers.location === '/login');
   r = await req('GET', '/logout');
   check('logout GET -> 302 /', r.status === 302 && r.headers.location === '/');
 

@@ -4,12 +4,15 @@
 //
 // Usage: dsh-register <username> [control-socket] [provider-json]
 //                    (password on stdin)
+//        dsh-register --wake <username> [control-socket]
+//        dsh-register --sleep <username> [control-socket] [reason]
 //
 // Runs as root via sudo from the gateway (pinned in the dsh-gateway sudoers
 // allowlist). Like the dsh-file-* helpers, it only forwards a validated
 // request: it connects to the entrypoint supervisor's control socket and asks
-// it to provision the user (OS account, port, instance, firewall, users.json,
-// optional custom-provider config). The supervisor performs all real
+// it to provision the user (OS account, port, firewall, users.json, optional
+// custom-provider config), or to wake an existing user's lazy DSH process.
+// The supervisor performs all real
 // validation and provisioning, so this helper never needs to know the password
 // beyond forwarding it once.
 //
@@ -24,25 +27,39 @@ const net = require('net');
 const path = require('path');
 
 const STATE_DIR = process.env.DSH_GATEWAY_STATE_DIR || '/var/lib/dsh-gateway';
-const SOCKET = process.argv[3] || process.env.DSH_CONTROL_SOCKET || path.join(STATE_DIR, 'control.sock');
+const mode = process.argv[2] === '--wake' ? 'wake' : (process.argv[2] === '--sleep' ? 'sleep' : 'add');
+const helperMode = mode !== 'add';
+const name = helperMode ? process.argv[3] : process.argv[2];
+const SOCKET = (helperMode ? process.argv[4] : process.argv[3])
+  || process.env.DSH_CONTROL_SOCKET || path.join(STATE_DIR, 'control.sock');
+// Provisioning may initialize a profile, register shared plugins and refresh
+// firewall rules before the supervisor can reply. Keep this longer than the
+// former 10-second budget so a successful slow registration is not reported
+// as a control-socket failure.
+const CONTROL_TIMEOUT_MS = 150000;
 
 function fail(msg, code) {
   process.stderr.write(msg + '\n');
   process.exit(code);
 }
 
-const name = process.argv[2];
 if (!name || !/^[A-Za-z0-9_-]{1,64}$/.test(name)) fail('invalid username', 2);
 let password = '';
-try {
-  password = fs.readFileSync(0, 'utf8').replace(/\r?\n$/, '');
-} catch (e) {
-  fail('cannot read password', 2);
+if (!helperMode) {
+  try {
+    password = fs.readFileSync(0, 'utf8').replace(/\r?\n$/, '');
+  } catch (e) {
+    fail('cannot read password', 2);
+  }
+  if (password.length < 8) fail('password must contain at least 8 characters', 2);
 }
-if (password.length < 8) fail('password must contain at least 8 characters', 2);
 
-const payload = { cmd: 'add', name: name, password: password };
-const providerRaw = process.argv[4];
+const payload = mode === 'wake'
+  ? { cmd: 'wake', name: name }
+  : (mode === 'sleep'
+    ? { cmd: 'sleep', name: name, reason: String(process.argv[5] || 'logout').slice(0, 64), revokeSessions: true }
+    : { cmd: 'add', name: name, password: password });
+const providerRaw = helperMode ? null : process.argv[4];
 if (providerRaw) {
   try {
     payload.provider = JSON.parse(providerRaw);
@@ -52,7 +69,7 @@ if (providerRaw) {
 }
 const sock = net.connect(SOCKET);
 let buf = '';
-const timer = setTimeout(() => { sock.destroy(); fail('control socket timeout', 1); }, 10000);
+const timer = setTimeout(() => { sock.destroy(); fail('control socket timeout', 1); }, CONTROL_TIMEOUT_MS);
 sock.setEncoding('utf8');
 sock.on('connect', () => sock.write(JSON.stringify(payload) + '\n'));
 sock.on('data', (c) => { buf += c; });
