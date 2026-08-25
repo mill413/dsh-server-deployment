@@ -33,6 +33,7 @@
 set -euo pipefail
 
 CHAIN=DSH_LOOPBACK_GUARD
+DENY_CHAIN=DSH_LOOPBACK_DENY
 comment="dsh-loopback-guard"
 GW_PORT="${GW_PORT:-3100}"
 
@@ -61,7 +62,7 @@ hook_output() {
 }
 
 apply_rules() {
-  local specs=("$@") spec user port
+  local specs=("$@") spec user port csv count
   # Validate the complete desired state before touching the active chain. A
   # malformed entry must not flush the rules that currently isolate tenants.
   for spec in "${specs[@]}"; do
@@ -69,8 +70,33 @@ apply_rules() {
     port="${spec##*:}"
     valid_spec "$spec" "$user" "$port" || exit 2
   done
+  ipt -N "$DENY_CHAIN" 2>/dev/null || true
   ipt -N "$CHAIN" 2>/dev/null || true
   ipt -F "$CHAIN"
+  ipt -F "$DENY_CHAIN"
+
+  # One shared destination set, chunked for xt_multiport's 15-port limit.
+  # Every tenant jumps here only after its own port has been accepted below.
+  csv=""
+  count=0
+  for spec in "${specs[@]}"; do
+    port="${spec##*:}"
+    csv="${csv:+$csv,}$port"
+    count=$((count + 1))
+    if [ "$count" -eq 15 ]; then
+      ipt -A "$DENY_CHAIN" -p tcp -m multiport --dports "$csv" -m comment --comment "$comment" -j REJECT --reject-with tcp-reset
+      csv=""
+      count=0
+    fi
+  done
+  if [ -n "$csv" ]; then
+    ipt -A "$DENY_CHAIN" -p tcp -m multiport --dports "$csv" -m comment --comment "$comment" -j REJECT --reject-with tcp-reset
+  fi
+  ipt -A "$DENY_CHAIN" -p tcp --dport "$GW_PORT" -m comment --comment "$comment" -j REJECT --reject-with tcp-reset
+  ipt -A "$DENY_CHAIN" -m comment --comment "$comment" -j RETURN
+
+  # Per tenant: accept its own instance, then send every other destination to
+  # the shared deny chain. This is O(N), replacing the former O(N^2) matrix.
   for spec in "${specs[@]}"; do
     user="${spec%%:*}"
     port="${spec##*:}"
@@ -79,20 +105,7 @@ apply_rules() {
     # here because replies come from sport; the REJECT rules below are the
     # only destination-scoped denials)
     ipt -A "$CHAIN" -o lo -p tcp -m owner --uid-owner "$user" --dport "$port" -m comment --comment "$comment" -j ACCEPT
-  done
-  for spec in "${specs[@]}"; do
-    user="${spec%%:*}"
-    port="${spec##*:}"
-    # every OTHER tenant's instance port: rejected by destination
-    for other in "${specs[@]}"; do
-      oport="${other##*:}"
-      if [ "$oport" != "$port" ]; then
-        ipt -A "$CHAIN" -o lo -p tcp -m owner --uid-owner "$user" --dport "$oport" -m comment --comment "$comment" -j REJECT --reject-with tcp-reset
-      fi
-    done
-    # the gateway itself: a tenant reaching it loopback could spoof another
-    # user's session through the auth front door
-    ipt -A "$CHAIN" -o lo -p tcp -m owner --uid-owner "$user" --dport "$GW_PORT" -m comment --comment "$comment" -j REJECT --reject-with tcp-reset
+    ipt -A "$CHAIN" -o lo -p tcp -m owner --uid-owner "$user" -m comment --comment "$comment" -j "$DENY_CHAIN"
   done
   ipt -A "$CHAIN" -m comment --comment "$comment" -j RETURN
   hook_output
@@ -106,11 +119,15 @@ case "${1:-}" in
     echo "loopback guard applied to $*"
     ;;
   --check)
-    ipt -L "$CHAIN" >/dev/null 2>&1 && ipt -C OUTPUT -o lo -p tcp -j "$CHAIN" 2>/dev/null
+    ipt -L "$CHAIN" >/dev/null 2>&1 \
+      && ipt -L "$DENY_CHAIN" >/dev/null 2>&1 \
+      && ipt -C OUTPUT -o lo -p tcp -j "$CHAIN" 2>/dev/null
     ;;
   --remove)
     ipt -D OUTPUT -o lo -p tcp -j "$CHAIN" 2>/dev/null || true
     ipt -F "$CHAIN" 2>/dev/null || true
+    ipt -F "$DENY_CHAIN" 2>/dev/null || true
+    ipt -X "$DENY_CHAIN" 2>/dev/null || true
     ipt -X "$CHAIN" 2>/dev/null || true
     echo "loopback guard removed"
     ;;
