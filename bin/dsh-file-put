@@ -18,7 +18,9 @@ set -euo pipefail
 home="$1"
 dir="$2"
 name="$3"
-MAX_BYTES=110000000
+# Keep in sync with the gateway's UPLOAD_MAX_MB when raised; pass it through
+# sudoers with: Defaults!<this-path> env_keep += "DSH_UPLOAD_MAX_BYTES"
+MAX_BYTES="${DSH_UPLOAD_MAX_BYTES:-110000000}"
 case "$name" in
   ''|'.'|'..'|*/*|*\\*|*$'\n'*|*$'\r'*) exit 2 ;;
 esac

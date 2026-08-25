@@ -75,15 +75,18 @@ iptables OUTPUT 链 DSH_LOOPBACK_GUARD：
 
 要点：
 - REJECT 必须按**目标端口**逐条下规则。按 uid 全量 REJECT 会把内核代表该用户实例发出的回包（sport=自己端口）一并掐断，表现为所有租户连接静默超时。
+- 规则刷新经 `iptables-restore --noflush` 一次性提交（声明链即在单次 commit 内清空并重建），刷新期间不存在「旧规则已清、新规则未上」的防护空窗。
+- 网关端口解析顺序：`GW_PORT` 环境变量 > 网关启动时写入的 `gateway/state-port.json` > 默认 3100。`PORT` 被覆盖时无需手动同步 `GW_PORT`（前提：网关至少已成功启动过一次）。
 - root、网关服务账号与普通用户不受影响。
 - 验证：`runuser -u dsh-admin -- curl http://127.0.0.1:3102/` 应被拒（tcp-reset），连 3101 正常。
 
 ## 5. 凭据与密钥
 
 - 口令以 scrypt 哈希存储（兼容旧版 APR1），写入 `users.json`（原子写：临时文件 + rename）。
-- 改密时 `pwdVer` 递增，已签发的会话令牌（内嵌 pwdVer）立即全部失效。
+- **会话令牌为无状态 HMAC 签名，无服务端撤销名单**：`/logout` 只清除浏览器 cookie，已签发的令牌在 TTL（默认 12 小时）内仍然有效。令牌一旦泄露，唯一的全量失效手段是改密（`pwdVer` 递增使该用户所有旧令牌立即失效）。对安全敏感的部署建议缩短 `SESSION_TTL` 或对敏感操作引入二次确认。
+- `users.json` 的并发写入（网关写 `keyConfigured` 与 userctl 增删用户）经 `gateway/store.js` 的 mtime 复检 + 重放控制，不再可能互相覆盖。
 - API Key 仅存在于该用户私有目录的 `.credentials.yaml`（0600），网关不落库、不代理。
-- 所有运行状态与密钥文件（`secret`、`users.json`、`state-cwd.json`、`.credentials.yaml`、`.local-run/`）均在 `.gitignore` 中，**严禁提交**。
+- 所有运行状态与密钥文件（`secret`、`users.json`、`state-cwd.json`、`state-port.json`、`.credentials.yaml`、`.local-run/`）均在 `.gitignore` 中，**严禁提交**。
 
 ## 6. 验证清单
 
@@ -120,7 +123,8 @@ runuser -u dsh-<user> -- curl -s --connect-timeout 3 -o /dev/null -w "%{http_cod
 - `gateway/` 目录 `root:dsh-gateway 0770`（网关做 tmp+rename 原子写），目录内代码文件归 root:root 0644；`users.json`（0640）/`secret`（0600）属主为 `dsh-gateway`。
 - 网关 systemd 单元不可设置 `NoNewPrivileges=yes`（会阻断 sudo 调 root 文件助手）。
 - 不要给用户目录添加任何 ACL 读取授权--DSH 的 `assertOwnerOnly` 检查会拒绝实例启动（曾因此触发）。
-- 自定义安装前缀时，必须同步修改 sudoers 白名单与网关的 `UPLOAD_HELPER` / `FILE_STAT_HELPER` / `FILE_READ_HELPER` / `FILE_LIST_HELPER` 四个环境变量；回环防护的网关端口经 `GW_PORT` 覆盖。
+- 自定义安装前缀时，必须同步修改 sudoers 白名单与网关的 `UPLOAD_HELPER` / `FILE_STAT_HELPER` / `FILE_READ_HELPER` / `FILE_LIST_HELPER` 四个环境变量；回环防护的网关端口自动取自网关写入的 `state-port.json`（显式覆盖仍用 `GW_PORT`）。
+- 上传大小有**两道**上限：网关 `UPLOAD_MAX_MB`（默认 100MB）与 root 助手 `DSH_UPLOAD_MAX_BYTES`（默认 110000000 字节 ≈ 105MB，经 sudoers `env_keep` 传入）。调大上限时两处都要改。
 - 回环防护规则由 `dsh-loopback-guard.service` 开机应用，userctl 增删用户即时刷新；服务器上存在 docker/1Panel 等 nftables 使用方，规则以 iptables-nft 混合模式共存，勿手动 flush `filter` 表。
 - 反向代理必须用 `proxy_set_header X-Forwarded-For $remote_addr;` **覆盖**客户端可能伪造的 XFF，否则网关 IP 限流可被绕过。
 - 升级 DSH 后如需客户端行为修补（如 settings 持久化作用域），请自行评估，本仓库不修改 npm 包。

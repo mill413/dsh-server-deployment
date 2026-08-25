@@ -7,4 +7,5 @@ if [ "$(id -u)" -ne 0 ]; then exec sudo "$0" "$@"; fi
 base="$(cd "$(dirname "$0")/.." && pwd)"
 node_bin="$base/runtime/bin/node"
 [ -x "$node_bin" ] || node_bin="$(command -v node)"
+[ -n "$node_bin" ] || { echo "error: node not found - install Node.js (or provide $base/runtime/bin/node)" >&2; exit 1; }
 exec "$node_bin" "$base/gateway/userctl.js" "$@"

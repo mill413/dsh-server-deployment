@@ -17,6 +17,7 @@ function hashPassword(password) {
 }
 
 // legacy APR1 (Apache htpasswd) verification via the system openssl tool
+let apr1ToolMissing = false;
 function verifyApr1(password, stored) {
   const parts = String(stored).split('$');
   if (parts.length < 4 || parts[1] !== 'apr1') return false;
@@ -26,6 +27,12 @@ function verifyApr1(password, stored) {
     const r = spawnSync('openssl', ['passwd', '-apr1', '-salt', salt], {
       input: password + '\n', encoding: 'utf8', timeout: 5000,
     });
+    if (r.error && r.error.code === 'ENOENT' && !apr1ToolMissing) {
+      // Fail closed silently otherwise; without this line every legacy login
+      // just "fails" with no hint why.
+      apr1ToolMissing = true;
+      console.error('verifyApr1: openssl binary not found - legacy APR1 passwords cannot be verified until it is installed');
+    }
     computed = (r.stdout || '').trim();
   } catch (e) { return false; }
   return computed.length > 0 && timingSafeStr(computed, stored);

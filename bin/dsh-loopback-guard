@@ -61,38 +61,47 @@ hook_output() {
 }
 
 apply_rules() {
-  local specs=("$@") spec user port
-  ipt -N "$CHAIN" 2>/dev/null || true
-  ipt -F "$CHAIN"
-  for spec in "${specs[@]}"; do
-    user="${spec%%:*}"
-    port="${spec##*:}"
-    valid_spec "$spec" "$user" "$port" || exit 2
-    # own instance port: allow (both directions of the flow match by dport
-    # here because replies come from sport; the REJECT rules below are the
-    # only destination-scoped denials)
-    ipt -A "$CHAIN" -o lo -p tcp -m owner --uid-owner "$user" --dport "$port" -m comment --comment "$comment" -j ACCEPT
-  done
+  local specs=("$@") spec user port other oport
   for spec in "${specs[@]}"; do
     user="${spec%%:*}"
     port="${spec##*:}"
     valid_spec "$spec" "$user" "$port" || exit 2
   done
-  for spec in "${specs[@]}"; do
-    user="${spec%%:*}"
-    port="${spec##*:}"
-    # every OTHER tenant's instance port: rejected by destination
-    for other in "${specs[@]}"; do
-      oport="${other##*:}"
-      if [ "$oport" != "$port" ]; then
-        ipt -A "$CHAIN" -o lo -p tcp -m owner --uid-owner "$user" --dport "$oport" -m comment --comment "$comment" -j REJECT --reject-with tcp-reset
-      fi
+  # Build the whole ruleset and load it with iptables-restore --noflush:
+  # a chain declared in the restore stream is flushed and refilled in ONE
+  # commit, so there is no gap between "flush old rules" and "add new
+  # rules" where tenant isolation would be down (the old per-rule -F/-A
+  # sequence had exactly that window on every userctl refresh).
+  {
+    echo '*filter'
+    echo ":$CHAIN - [0:0]"
+    for spec in "${specs[@]}"; do
+      user="${spec%%:*}"
+      port="${spec##*:}"
+      # own instance port: allow (both directions of the flow match by dport
+      # here because replies come from sport; the REJECT rules below are the
+      # only destination-scoped denials)
+      echo "-A $CHAIN -o lo -p tcp -m owner --uid-owner $user --dport $port -m comment --comment $comment -j ACCEPT"
     done
-    # the gateway itself: a tenant reaching it loopback could spoof another
-    # user's session through the auth front door
-    ipt -A "$CHAIN" -o lo -p tcp -m owner --uid-owner "$user" --dport "$GW_PORT" -m comment --comment "$comment" -j REJECT --reject-with tcp-reset
-  done
-  ipt -A "$CHAIN" -m comment --comment "$comment" -j RETURN
+    for spec in "${specs[@]}"; do
+      user="${spec%%:*}"
+      port="${spec##*:}"
+      # every OTHER tenant's instance port: rejected by destination
+      # (rule count is O(n^2); fine for dozens of tenants - switch to an
+      # ipset dport set if this ever becomes a problem)
+      for other in "${specs[@]}"; do
+        oport="${other##*:}"
+        if [ "$oport" != "$port" ]; then
+          echo "-A $CHAIN -o lo -p tcp -m owner --uid-owner $user --dport $oport -m comment --comment $comment -j REJECT --reject-with tcp-reset"
+        fi
+      done
+      # the gateway itself: a tenant reaching it loopback could spoof another
+      # user's session through the auth front door
+      echo "-A $CHAIN -o lo -p tcp -m owner --uid-owner $user --dport $GW_PORT -m comment --comment $comment -j REJECT --reject-with tcp-reset"
+    done
+    echo "-A $CHAIN -m comment --comment $comment -j RETURN"
+    echo 'COMMIT'
+  } | iptables-restore --noflush
   hook_output
 }
 

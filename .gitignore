@@ -4,6 +4,7 @@ node_modules/
 secret
 users.json
 state-cwd.json
+state-port.json
 .credentials.yaml
 .htpasswd*
 *.bak
