@@ -1,0 +1,31 @@
+diff --git a/packages/client/connection/src/client/index.ts b/packages/client/connection/src/client/index.ts
+--- a/packages/client/connection/src/client/index.ts
++++ b/packages/client/connection/src/client/index.ts
+@@ -77,2 +77,8 @@ interface ClientTransportGlobal {
+   __DSH_TRANSPORT__?: ClientTransportHooks
++  /**
++   * The authenticated deployment gateway proxies privileged Host RPCs to a
++   * loopback-bound tenant. This flag removes only the browser-side loopback
++   * UX gate; Host/Origin/session enforcement remains server-owned.
++   */
++  __DSH_TRUSTED_GATEWAY__?: boolean
+ }
+@@ -109,6 +115,7 @@ export function apply(ctx: Context): void {
+   const pageLocation = typeof location === 'undefined' ? undefined : location
+   const fixture = pageLocation !== undefined && new URLSearchParams(pageLocation.search).has('fixture')
+   const fixtureClient = fixture ? new FixtureApiClient() : undefined
+-  const transport = (globalThis as ClientTransportGlobal).__DSH_TRANSPORT__
++  const transportGlobal = globalThis as ClientTransportGlobal
++  const transport = transportGlobal.__DSH_TRANSPORT__
+   const api: IApiClient = fixtureClient ?? transport?.createApiClient() ?? new WebApiClient()
+   const rpc = fixtureClient?.rpc ?? createWebConnectionRpc(transport?.fetch)
+@@ -129,7 +136,8 @@ export function apply(ctx: Context): void {
+   }
+   const handle: ConnectionHandle = {
+     api,
+-    isLoopback: pageLocation === undefined || isLoopbackHostname(pageLocation.hostname),
++    isLoopback: pageLocation === undefined || isLoopbackHostname(pageLocation.hostname)
++      || transportGlobal.__DSH_TRUSTED_GATEWAY__ === true,
+     hostDescription: {
+       getSnapshot: () => description,
+       subscribe: (listener) => {

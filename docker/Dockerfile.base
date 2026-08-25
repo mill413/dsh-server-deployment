@@ -1,0 +1,60 @@
+FROM node:24-bookworm AS harness-build
+
+ARG DSH_REPOSITORY=https://github.com/deepseek-ai/deepseek-harness.git
+ARG DSH_REF=master
+
+RUN corepack enable \
+    && corepack prepare pnpm@11.7.0 --activate \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends git python3 make g++ \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build/deepseek-harness
+RUN git init . \
+    && git remote add origin "$DSH_REPOSITORY" \
+    && git fetch --depth 1 origin "$DSH_REF" \
+    && git checkout --detach FETCH_HEAD \
+    && git rev-parse HEAD > .dsh-source-commit
+COPY docker/patches/deepseek-harness-trusted-gateway.patch /build/deepseek-harness-trusted-gateway.patch
+RUN git apply --check /build/deepseek-harness-trusted-gateway.patch \
+    && git apply /build/deepseek-harness-trusted-gateway.patch
+RUN pnpm install --frozen-lockfile \
+    && pnpm run build
+
+# Install the public plugin once through DSH's native plugin manager. The
+# workspace allowlist permits node-pty's native build while keeping every
+# other dependency lifecycle script blocked by default.
+RUN mkdir -p /build/dsh-public/profiles/web \
+    && printf '%s\n' \
+      'packages:' \
+      '  - .' \
+      '' \
+      'nodeLinker: hoisted' \
+      'autoInstallPeers: false' \
+      'allowBuilds:' \
+      '  node-pty: true' > /build/dsh-public/profiles/web/pnpm-workspace.yaml
+RUN DSH_HOME=/build/dsh-public \
+    node /build/deepseek-harness/apps/cli/lib/bin.js \
+      plugin --profile web add dsh-better-sidebar
+
+FROM node:24-bookworm-slim AS runtime-base
+
+# Runtime tools include the native build chain because administrators may use
+# `dsh plugin` to install additional plugins after deployment.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+      ca-certificates curl g++ git iptables make openssl python3 sudo tini util-linux \
+    && rm -rf /var/lib/apt/lists/* \
+    && corepack disable \
+    && npm install --global pnpm@11.7.0
+
+COPY --from=harness-build /build/deepseek-harness /opt/deepseek-harness
+COPY --from=harness-build /build/dsh-public /opt/dsh-public
+
+RUN node --input-type=module -e \
+      'const m = await import("/opt/deepseek-harness/packages/boot/app-boot/lib/index.js"); m.healProfilesModuleFallback("/opt/deepseek-harness/apps/cli/package.json", "/opt/dsh-public")' \
+    && chown -R root:root /opt/dsh-public \
+    && chmod -R go-w /opt/dsh-public
+
+ENV DSH_APP_DIR=/opt/deepseek-harness
+
