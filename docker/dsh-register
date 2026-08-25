@@ -7,6 +7,9 @@
 //        dsh-register --wake <username> [control-socket]
 //        dsh-register --sleep <username> [control-socket] [reason]
 //        dsh-register --stats [control-socket]
+//        dsh-register --plugin-list [control-socket]
+//        dsh-register --plugin-add <name> <spec> [control-socket]
+//        dsh-register --plugin-remove <name> [control-socket]
 //
 // Runs as root via sudo from the gateway (pinned in the dsh-gateway sudoers
 // allowlist). Like the dsh-file-* helpers, it only forwards a validated
@@ -28,24 +31,43 @@ const net = require('net');
 const path = require('path');
 
 const STATE_DIR = process.env.DSH_GATEWAY_STATE_DIR || '/var/lib/dsh-gateway';
-const mode = process.argv[2] === '--wake' ? 'wake'
-  : (process.argv[2] === '--sleep' ? 'sleep' : (process.argv[2] === '--stats' ? 'stats' : 'add'));
+const option = process.argv[2];
+const mode = option === '--wake' ? 'wake'
+  : (option === '--sleep' ? 'sleep'
+    : (option === '--stats' ? 'stats'
+      : (option === '--plugin-list' ? 'plugin-list'
+        : (option === '--plugin-add' ? 'plugin-add'
+          : (option === '--plugin-remove' ? 'plugin-remove' : 'add')))));
 const helperMode = mode !== 'add';
-const name = mode === 'stats' ? null : (helperMode ? process.argv[3] : process.argv[2]);
-const SOCKET = (mode === 'stats' ? process.argv[3] : (helperMode ? process.argv[4] : process.argv[3]))
+const noNameMode = mode === 'stats' || mode === 'plugin-list';
+const name = noNameMode ? null : (helperMode ? process.argv[3] : process.argv[2]);
+const spec = mode === 'plugin-add' ? process.argv[4] : null;
+const socketArg = noNameMode ? process.argv[3]
+  : (mode === 'plugin-add' ? process.argv[5] : (helperMode ? process.argv[4] : process.argv[3]));
+const SOCKET = socketArg
   || process.env.DSH_CONTROL_SOCKET || path.join(STATE_DIR, 'control.sock');
 // Provisioning may initialize a profile, register shared plugins and refresh
 // firewall rules before the supervisor can reply. Keep this longer than the
 // former 10-second budget so a successful slow registration is not reported
 // as a control-socket failure.
-const CONTROL_TIMEOUT_MS = 150000;
+const CONTROL_TIMEOUT_MS = mode.startsWith('plugin-') ? 1800000 : 150000;
 
 function fail(msg, code) {
   process.stderr.write(msg + '\n');
   process.exit(code);
 }
 
-if (mode !== 'stats' && (!name || !/^[A-Za-z0-9_-]{1,64}$/.test(name))) fail('invalid username', 2);
+function validPackageName(value) {
+  return typeof value === 'string' && /^(?:@[A-Za-z0-9._-]+\/)?[A-Za-z0-9._-]+$/.test(value);
+}
+
+if (!noNameMode) {
+  const valid = mode.startsWith('plugin-') ? validPackageName(name) : /^[A-Za-z0-9_-]{1,64}$/.test(name || '');
+  if (!valid) fail(mode.startsWith('plugin-') ? 'invalid package name' : 'invalid username', 2);
+}
+if (mode === 'plugin-add'
+    && (typeof spec !== 'string' || spec.length === 0 || spec.length > 512
+      || spec.startsWith('-') || /[\r\n\0]/.test(spec))) fail('invalid plugin spec', 2);
 let password = '';
 if (!helperMode) {
   try {
@@ -56,11 +78,20 @@ if (!helperMode) {
   if (password.length < 8) fail('password must contain at least 8 characters', 2);
 }
 
-const payload = mode === 'stats' ? { cmd: 'stats' }
-  : (mode === 'wake' ? { cmd: 'wake', name: name }
-    : (mode === 'sleep'
-      ? { cmd: 'sleep', name: name, reason: String(process.argv[5] || 'logout').slice(0, 64), revokeSessions: true }
-      : { cmd: 'add', name: name, password: password }));
+let payload;
+if (mode === 'stats') payload = { cmd: 'stats' };
+else if (mode === 'plugin-list') payload = { cmd: 'shared-plugin-list' };
+else if (mode === 'plugin-add') payload = { cmd: 'shared-plugin-add', name: name, spec: spec };
+else if (mode === 'plugin-remove') payload = { cmd: 'shared-plugin-remove', name: name };
+else if (mode === 'wake') payload = { cmd: 'wake', name: name };
+else if (mode === 'sleep') {
+  payload = {
+    cmd: 'sleep',
+    name: name,
+    reason: String(process.argv[5] || 'logout').slice(0, 64),
+    revokeSessions: true,
+  };
+} else payload = { cmd: 'add', name: name, password: password };
 const providerRaw = helperMode ? null : process.argv[4];
 if (providerRaw) {
   try {
@@ -71,15 +102,30 @@ if (providerRaw) {
 }
 const sock = net.connect(SOCKET);
 let buf = '';
+let finalReply = null;
 const timer = setTimeout(() => { sock.destroy(); fail('control socket timeout', 1); }, CONTROL_TIMEOUT_MS);
 sock.setEncoding('utf8');
 sock.on('connect', () => sock.write(JSON.stringify(payload) + '\n'));
-sock.on('data', (c) => { buf += c; });
+sock.on('data', (c) => {
+  buf += c;
+  while (true) {
+    const newline = buf.indexOf('\n');
+    if (newline < 0) break;
+    const line = buf.slice(0, newline);
+    buf = buf.slice(newline + 1);
+    let message;
+    try { message = JSON.parse(line); } catch (e) { fail('invalid supervisor reply', 1); }
+    if (message && Object.prototype.hasOwnProperty.call(message, 'progress')) {
+      process.stderr.write(String(message.progress));
+    } else {
+      finalReply = message;
+    }
+  }
+});
 sock.on('end', () => {
   clearTimeout(timer);
-  let reply;
-  try { reply = JSON.parse(buf); } catch (e) { fail('invalid supervisor reply', 1); }
-  process.stdout.write(JSON.stringify(reply) + '\n');
-  process.exit(reply && reply.ok === true ? 0 : 1);
+  if (!finalReply) fail('invalid supervisor reply', 1);
+  process.stdout.write(JSON.stringify(finalReply) + '\n');
+  process.exit(finalReply.ok === true ? 0 : 1);
 });
 sock.on('error', (e) => { clearTimeout(timer); fail('cannot reach supervisor: ' + e.message, 1); });
