@@ -6,13 +6,14 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 const url = require('url');
-const { spawn } = require('child_process');
+const { spawn, execFileSync } = require('child_process');
 const zlib = require('zlib');
 const { verifyPassword, timingSafeStr } = require('./auth.js');
 
 const HOST = process.env.HOST || '127.0.0.1';
 const PORT = parseInt(process.env.PORT || '3081', 10);
 const USERS_FILE = process.env.USERS_FILE || '/opt/deepseek-harness/gateway/users.json';
+const CONTROL_SOCKET = process.env.DSH_CONTROL_SOCKET || '/run/dsh/control.sock';
 const SECRET_FILE = process.env.SECRET_FILE || '/opt/deepseek-harness/gateway/secret';
 const USERS_DIR = process.env.USERS_DIR || '/opt/deepseek-harness/users';
 const SESSION_TTL = parseInt(process.env.SESSION_TTL || '43200', 10);
@@ -108,7 +109,7 @@ async function fetchProviderModels(baseURL, apiKey) {
     if (!j || !Array.isArray(j.data)) throw new Error('provider response has no data array');
     const ids = j.data.map((m) => (m && typeof m.id === 'string') ? m.id.trim() : '').filter(Boolean);
     if (ids.length === 0) throw new Error('provider returned no models');
-    return ids.slice(0, 100);
+    return [...new Set(ids)].slice(0, 100);
   } finally {
     clearTimeout(timer);
   }
@@ -607,27 +608,40 @@ function registerPage(csrf, error) {
   return impeccableShell('注册', body);
 }
 
-// Admin panel data: every user with online status. "online" means a valid
-// session was seen within ACTIVE_WINDOW_MS (sessions are stateless cookies, so
-// this is last-activity, not a live presence).
-function adminUsersPayload(processStats, statsError) {
+// Admin panel data. "online" is LIVE browser presence: at least one tab whose
+// presence heartbeat is fresh (within PRESENCE_TTL_MS). Closing the tab sends
+// a presence-close that removes it, so the panel flips to offline immediately
+// instead of lingering on the coarse ACTIVE_WINDOW_MS last-request window.
+// `lastActiveAt` keeps the last authenticated-request time for the offline
+// display; users with no entry at all have never logged in.
+function adminUsersPayload(processStats, statsError, realKeys, diskUsage) {
   const db = loadUsers();
   const now = Date.now();
   const users = Object.keys(db.users || {}).sort().map((name) => {
     const u = db.users[name];
     const act = activeUsers.get(name);
     const process = processStats[name] || {};
+    const tabs = tenantTabs.get(name);
+    let liveTab = false;
+    if (tabs) {
+      for (const value of tabs.values()) {
+        if (value && now - value.at <= PRESENCE_TTL_MS) { liveTab = true; break; }
+      }
+    }
     return {
       name: name,
       admin: u.admin === true,
-      online: !!act && (now - act.at <= ACTIVE_WINDOW_MS),
+      online: liveTab,
       lastActiveAt: act ? act.at : null,
-      ip: act ? act.ip : null,
-      keyConfigured: !!u.keyConfigured,
+      port: u.port || null,
+      // Real on-disk key status from the supervisor when available; the stored
+      // flag is only a render fallback (e.g. control socket temporarily down).
+      keyConfigured: realKeys && realKeys[name] !== undefined ? realKeys[name] : !!u.keyConfigured,
       created: u.created || null,
       dshRunning: process.running === true,
       processCount: Number(process.processCount || 0),
       rssBytes: Number(process.rssBytes || 0),
+      diskBytes: diskUsage && diskUsage[name] !== undefined ? diskUsage[name] : null,
     };
   });
   return {
@@ -644,40 +658,57 @@ function adminUsersPayload(processStats, statsError) {
 function adminPage(csrf) {
   const body = [
     '<div class="card" style="max-width:1120px"><div class="brand"><div class="logo">A</div><div><h1>管理控制台</h1><div class="sub">DeepSeek Harness · 用户与资源</div></div></div>',
-    '<p class="lead" id="stat">加载中…</p>',
-    '<table id="tbl"><thead><tr><th>用户</th><th>登录状态</th><th>DSH</th><th>内存（RSS）</th><th>进程</th><th>IP</th><th>最近活跃</th><th>API Key</th><th>创建时间</th></tr></thead><tbody></tbody></table>',
+    '<section class="users"><div class="section-head"><div><h2>用户列表</h2><p class="last-updated" id="last-updated">上次更新：—</p></div><div class="section-actions"><button type="button" class="ghost" id="refresh">刷新用户</button><button type="button" class="ghost" id="toggle-users">折叠用户</button></div></div>',
+    '<p class="lead" id="stat">尚未查询，请点击“刷新用户”。</p>',
+    // Live DSH/process/RSS/disk columns are intentionally disabled: collecting
+    // them used the login-critical control socket and synchronous `du` scans.
+    // '<table id="tbl"><thead><tr><th>用户</th><th>登录状态</th><th>DSH</th><th>内存（RSS）</th><th>进程</th><th>存储</th><th>端口</th><th>最近活跃</th><th>API Key</th><th>创建时间</th><th>操作</th></tr></thead><tbody></tbody></table></section>',
+    '<table id="tbl"><thead><tr><th>用户</th><th>登录状态</th><th>端口</th><th>最近活跃</th><th>API Key</th><th>创建时间</th><th>操作</th></tr></thead><tbody></tbody></table></section>',
     '<div class="rule"></div>',
-    '<section class="plugins"><div class="section-head"><div><h2>共享插件</h2><p>安装一次并同步到所有现有及后续新增用户。</p></div><button type="button" class="ghost" id="plugin-refresh">刷新插件</button></div>',
+    '<section class="plugins"><div class="section-head"><div><h2>共享插件</h2><p>安装一次并同步到所有现有及后续新增用户。</p></div><div class="section-actions"><button type="button" class="ghost" id="plugin-refresh">刷新插件</button><button type="button" class="ghost" id="toggle-plugins">折叠插件</button></div></div>',
     '<div class="plugin-form"><input id="plugin-spec" placeholder="插件 spec，例如 package@1.2.3"><input id="plugin-name" placeholder="package name（Git/file spec 时填写）"><button type="button" id="plugin-add">安装 / 升级</button></div>',
     '<div class="plugin-msg" id="plugin-msg"></div>',
     '<table id="plugin-table"><thead><tr><th>插件</th><th>版本</th><th>来源</th><th>路径</th><th>操作</th></tr></thead><tbody></tbody></table>',
     '<pre id="plugin-log" hidden></pre></section>',
     '<div class="rule"></div>',
     '<a href="/" class="ghost" style="display:inline-block;text-decoration:none;margin-left:0">返回工作区</a>',
-    '<form method="post" action="/logout" style="display:inline"><input type="hidden" name="csrf" value="' + csrf + '"><button type="submit" class="ghost">退出登录</button></form>',
-    '<button type="button" class="ghost" id="refresh" style="margin-left:10px">刷新</button>',
+    '<form method="post" action="/logout" style="display:inline;margin-left:10px"><input type="hidden" name="csrf" value="' + csrf + '"><button type="submit" class="ghost">退出登录</button></form>',
     '</div>',
     '<script>',
     'function esc(s){return String(s==null?"":s).replace(/[&<>"]/g,function(c){return{"&":"&amp;","<":"&lt;",">":"&gt;",\'"\':"&quot;"}[c];});}',
     'function fmt(ts){if(!ts)return "-";try{return new Date(ts).toLocaleString();}catch(e){return "-";}}',
     'function mem(n){n=Number(n||0);if(n<=0)return "—";if(n<1048576)return Math.round(n/1024)+" KB";if(n<1073741824)return (n/1048576).toFixed(1)+" MB";return (n/1073741824).toFixed(2)+" GB";}',
-    'function load(){fetch("/__gw/admin/users",{credentials:"same-origin"}).then(function(r){return r.json();}).then(function(j){',
-    'if(!j.ok){document.getElementById("stat").textContent="加载失败";return;}',
-    'document.getElementById("stat").textContent="在线用户："+j.onlineCount+" · 运行实例："+j.runningCount+" · 总内存："+mem(j.totalRssBytes)+" · 用户总数："+j.users.length+(j.statsError?" · 内存统计失败":"");',
+    'var USERS_CACHE_KEY="dsh-admin-users-v1",usersLoading=false;',
+    'function markUsersStale(){var e=document.getElementById("last-updated");if(e&&e.textContent.indexOf("数据可能已变化")<0)e.textContent+=" · 数据可能已变化，请手动刷新";}',
+    'function renderUsers(j,updatedAt,cached){',
+    // Former live-resource summary (kept for easy restoration once metrics
+    // move off the supervisor control socket):
+    // 'document.getElementById("stat").textContent="在线用户："+j.onlineCount+" · 运行实例："+j.runningCount+" · 总内存："+mem(j.totalRssBytes)+" · 用户总数："+j.users.length+(j.statsError?" · 内存统计失败":"");',
+    'document.getElementById("stat").textContent="在线用户："+j.onlineCount+" · 用户总数："+j.users.length;',
+    'document.getElementById("last-updated").textContent="上次更新："+fmt(updatedAt)+(cached?"（本地缓存）":"");',
     'var tb=document.querySelector("#tbl tbody");tb.innerHTML="";',
     'j.users.forEach(function(u){var tr=document.createElement("tr");',
     'var st=u.online?"<span class=on>● 在线</span>":(u.lastActiveAt?"<span class=off>○ 离线</span>":"<span class=off>○ 从未活跃</span>");',
-    'tr.innerHTML="<td>"+esc(u.name)+(u.admin?" <span class=adm>管理员</span>":"")+"</td>"+"<td>"+st+"</td>"+"<td>"+(u.dshRunning?"<span class=on>运行中</span>":"<span class=off>休眠</span>")+"</td>"+"<td>"+mem(u.rssBytes)+"</td>"+"<td>"+u.processCount+"</td>"+"<td>"+esc(u.ip)+"</td>"+"<td>"+fmt(u.lastActiveAt)+"</td>"+"<td>"+(u.keyConfigured?"已配置":"—")+"</td>"+"<td>"+fmt(u.created)+"</td>";',
-    'tb.appendChild(tr);});}).catch(function(){document.getElementById("stat").textContent="加载失败";});}',
+    // Former row with live resource fields:
+    // 'tr.innerHTML="<td>"+esc(u.name)+(u.admin?" <span class=adm>管理员</span>":"")+"</td>"+"<td>"+st+"</td>"+"<td>"+(u.dshRunning?"<span class=on>运行中</span>":"<span class=off>休眠</span>")+"</td>"+"<td>"+mem(u.rssBytes)+"</td>"+"<td>"+u.processCount+"</td>"+"<td>"+mem(u.diskBytes)+"</td>"+"<td>"+(u.port!=null?u.port:"—")+"</td>"+"<td>"+fmt(u.lastActiveAt)+"</td>"+"<td>"+(u.keyConfigured?"已配置":"—")+"</td>"+"<td>"+fmt(u.created)+"</td>"+"<td><button type=\'button\' class=\'small danger\' data-kick=\'"+esc(u.name)+"\'>强制退出</button></td>";',
+    'tr.innerHTML="<td>"+esc(u.name)+(u.admin?" <span class=adm>管理员</span>":"")+"</td>"+"<td>"+st+"</td>"+"<td>"+(u.port!=null?u.port:"—")+"</td>"+"<td>"+fmt(u.lastActiveAt)+"</td>"+"<td>"+(u.keyConfigured?"已配置":"—")+"</td>"+"<td>"+fmt(u.created)+"</td>"+"<td><button type=\'button\' class=\'small danger\' data-kick=\'"+esc(u.name)+"\'>强制退出</button></td>";',
+    'tb.appendChild(tr);var kb=tr.querySelector("[data-kick]");if(kb)kb.addEventListener("click",function(){var n=this.getAttribute("data-kick");if(!window.confirm("强制退出用户 "+n+"？将杀掉该用户全部进程并使其会话立即失效。"))return;fetch("/__gw/admin/kick",{method:"POST",credentials:"same-origin",headers:{"Content-Type":"application/json","X-DSH-Gateway-Action":"admin-kick"},body:JSON.stringify({name:n})}).then(function(r){return r.json().then(function(j){if(!r.ok||!j.ok)throw new Error(j.error||("HTTP "+r.status));});}).then(markUsersStale).catch(function(e){window.alert("强制退出失败："+e.message);});});});}',
+    'function saveUsersCache(j,updatedAt){try{localStorage.setItem(USERS_CACHE_KEY,JSON.stringify({updatedAt:updatedAt,data:j}));}catch(e){}}',
+    'function restoreUsersCache(){try{var raw=localStorage.getItem(USERS_CACHE_KEY);if(!raw)return;var cached=JSON.parse(raw);if(!cached||!cached.data||cached.data.ok!==true||!Array.isArray(cached.data.users))return;renderUsers(cached.data,Number(cached.updatedAt)||cached.data.now,true);}catch(e){}}',
+    'function load(){if(usersLoading)return;usersLoading=true;var b=document.getElementById("refresh");b.disabled=true;b.textContent="查询中…";fetch("/__gw/admin/users",{credentials:"same-origin"}).then(function(r){return r.json().then(function(j){if(!r.ok||!j.ok)throw new Error(j.error||("HTTP "+r.status));return j;});}).then(function(j){var updatedAt=Number(j.now)||Date.now();renderUsers(j,updatedAt,false);saveUsersCache(j,updatedAt);}).catch(function(){document.getElementById("stat").textContent="查询失败，已保留上次加载的数据";}).then(function(){usersLoading=false;b.disabled=false;b.textContent="刷新用户";});}',
     'document.getElementById("refresh").addEventListener("click",load);',
+    'document.getElementById("toggle-users").addEventListener("click",function(){var tb=document.getElementById("tbl"),hidden=tb.style.display==="none";tb.style.display=hidden?"":"none";this.textContent=hidden?"折叠用户":"展开用户";});',
     'var watchedJob=null,jobTimer=null;',
     'function pluginMessage(text,bad){var m=document.getElementById("plugin-msg");m.textContent=text||"";m.className="plugin-msg"+(bad?" bad":"");}',
-    'function watchJob(id){watchedJob=id;if(jobTimer)clearTimeout(jobTimer);fetch("/__gw/admin/plugin-job?id="+encodeURIComponent(id),{credentials:"same-origin"}).then(function(r){return r.json();}).then(function(j){if(!j.ok)throw new Error(j.error||"任务不存在");var job=j.job,log=document.getElementById("plugin-log");log.hidden=false;log.textContent=job.log||"等待输出…";log.scrollTop=log.scrollHeight;pluginMessage(job.status==="running"?"插件操作进行中…":(job.status==="success"?"操作完成":"操作失败："+(job.error||"未知错误")),job.status==="error");if(job.status==="running")jobTimer=setTimeout(function(){watchJob(id);},1000);else{watchedJob=null;pluginLoad();load();}}).catch(function(e){pluginMessage("任务查询失败："+e.message,true);});}',
+    'function showCancelButton(){var c=document.getElementById("plugin-cancel");if(!c){c=document.createElement("button");c.type="button";c.id="plugin-cancel";c.className="small danger";c.textContent="取消操作";c.style.marginLeft="8px";var m=document.getElementById("plugin-msg");m.parentNode.insertBefore(c,m.nextSibling);c.addEventListener("click",function(){if(c.disabled)return;c.disabled=true;c.textContent="正在取消…";fetch("/__gw/admin/plugins/cancel",{method:"POST",credentials:"same-origin",headers:{"Content-Type":"application/json","X-DSH-Gateway-Action":"admin-plugin"},body:"{}"}).then(function(r){return r.json().then(function(j){if(!r.ok||!j.ok)throw new Error(j.error||("HTTP "+r.status));});}).catch(function(e){c.disabled=false;c.textContent="取消操作";pluginMessage("取消失败："+e.message,true);});});}c.hidden=false;}',
+    'function hideCancelButton(){var c=document.getElementById("plugin-cancel");if(c)c.hidden=true;}',
+    'function watchJob(id){watchedJob=id;if(jobTimer)clearTimeout(jobTimer);fetch("/__gw/admin/plugin-job?id="+encodeURIComponent(id),{credentials:"same-origin"}).then(function(r){return r.json();}).then(function(j){if(!j.ok)throw new Error(j.error||"任务不存在");var job=j.job,log=document.getElementById("plugin-log");log.hidden=false;log.textContent=job.log||"等待输出…";log.scrollTop=log.scrollHeight;pluginMessage(job.status==="running"?"插件操作进行中…":(job.status==="success"?"操作完成":"操作失败："+(job.error||"未知错误")),job.status==="error");if(job.status==="running"){showCancelButton();jobTimer=setTimeout(function(){watchJob(id);},1000);}else{hideCancelButton();watchedJob=null;pluginLoad();markUsersStale();}}).catch(function(e){pluginMessage("任务查询失败："+e.message,true);});}',
     'function pluginRun(path,body){pluginMessage("正在提交操作…",false);fetch(path,{method:"POST",credentials:"same-origin",headers:{"Content-Type":"application/json","X-DSH-Gateway-Action":"admin-plugin"},body:JSON.stringify(body)}).then(function(r){return r.json().then(function(j){if(!r.ok||!j.ok)throw new Error(j.error||("HTTP "+r.status));return j;});}).then(function(j){watchJob(j.job.id);}).catch(function(e){pluginMessage(e.message,true);});}',
     'function pluginLoad(){fetch("/__gw/admin/plugins",{credentials:"same-origin"}).then(function(r){return r.json();}).then(function(j){if(!j.ok)throw new Error(j.error||"加载失败");var tb=document.querySelector("#plugin-table tbody");tb.innerHTML="";j.plugins.forEach(function(p){var tr=document.createElement("tr"),name=document.createElement("td"),ver=document.createElement("td"),src=document.createElement("td"),dir=document.createElement("td"),act=document.createElement("td");name.textContent=p.name;ver.textContent=p.version||"—";src.textContent=p.source==="image"?"镜像内置":"运行时共享";dir.textContent=p.dir||"—";dir.title=p.dir||"";if(p.source==="image"){act.textContent="不可移除";}else{var b=document.createElement("button");b.type="button";b.className="small danger";b.textContent="移除";b.addEventListener("click",function(){if(window.confirm("从所有用户移除插件 "+p.name+"？"))pluginRun("/__gw/admin/plugins/remove",{name:p.name});});act.appendChild(b);}tr.append(name,ver,src,dir,act);tb.appendChild(tr);});if(j.activeJob&&j.activeJob.status==="running"&&!watchedJob)watchJob(j.activeJob.id);}).catch(function(e){pluginMessage("插件列表加载失败："+e.message,true);});}',
     'document.getElementById("plugin-add").addEventListener("click",function(){var spec=document.getElementById("plugin-spec").value.trim(),name=document.getElementById("plugin-name").value.trim();if(!spec){pluginMessage("请输入插件 spec",true);return;}pluginRun("/__gw/admin/plugins/add",{spec:spec,name:name});});',
     'document.getElementById("plugin-refresh").addEventListener("click",pluginLoad);',
-    'load();setInterval(load,10000);',
+    'document.getElementById("toggle-plugins").addEventListener("click",function(){var tb=document.getElementById("plugin-table"),hidden=tb.style.display==="none";tb.style.display=hidden?"":"none";this.textContent=hidden?"折叠插件":"展开插件";});',
+    'restoreUsersCache();',
     'pluginLoad();',
     '</scr' + 'ipt>',
     '<style>',
@@ -688,8 +719,9 @@ function adminPage(csrf) {
     '.adm{color:var(--gold);font-size:11px;border:1px solid var(--hairline);padding:1px 6px;border-radius:6px;margin-left:6px}',
     '.ghost{background:transparent;border:1px solid var(--hairline);border-radius:9px;color:var(--gold);padding:9px 18px;font-size:13px;font-weight:600;cursor:pointer;width:auto;margin-top:0}',
     '.ghost:hover{background:rgba(226,185,97,.08)}',
-    '.plugins h2{font-size:16px;margin:0;color:var(--ink)}.plugins p{font-size:12.5px;color:var(--faint);margin:4px 0 0}',
+    '.users h2,.plugins h2{font-size:16px;margin:0;color:var(--ink)}.plugins p,.last-updated{font-size:12.5px;color:var(--faint);margin:4px 0 0}',
     '.section-head{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:12px}',
+    '.section-actions{display:flex;align-items:center;gap:10px}',
     '.plugin-form{display:grid;grid-template-columns:minmax(260px,2fr) minmax(200px,1fr) auto;gap:8px;align-items:center}',
     '.plugin-form input{margin:0;padding:9px 11px;font-size:13px}.plugin-form button{width:auto;margin:0;padding:9px 16px}',
     '.plugin-msg{min-height:20px;margin:8px 0;color:var(--ok);font-size:12.5px}.plugin-msg.bad{color:var(--err)}',
@@ -752,6 +784,7 @@ function runHelper(args, opts) {
         stdio: o.input !== undefined ? ['pipe', 'pipe', 'pipe'] : ['ignore', 'pipe', 'pipe'],
       });
     } catch (e) { return resolve({ code: null, stdout: '', stderr: String(e && e.message || e) }); }
+    if (typeof o.onSpawn === 'function') o.onSpawn(child);
     let out = [];
     let outLen = 0;
     let err = [];
@@ -784,8 +817,7 @@ function runHelper(args, opts) {
 }
 
 async function fetchTenantProcessStats() {
-  const controlSocket = path.join(path.dirname(USERS_FILE), 'control.sock');
-  const r = await runHelper([REGISTER_HELPER, '--stats', controlSocket], {
+  const r = await runHelper([REGISTER_HELPER, '--stats', CONTROL_SOCKET], {
     timeoutMs: 15000,
     maxStdout: 1024 * 1024,
   });
@@ -795,6 +827,40 @@ async function fetchTenantProcessStats() {
     throw new Error((reply && reply.error) || String(r.stderr || '').trim() || 'process stats failed');
   }
   return reply.result;
+}
+
+// Real per-user API-key status straight from the supervisor's on-disk check
+// (the gateway service account has no access into the 0700 user homes). The
+// supervisor reads each user's .credentials.yaml for a non-empty *_API_KEY
+// entry, so the panel never trusts the possibly SKIP_KEY_SETUP-stamped
+// users.json flag. Returns null when the control socket is unavailable, in
+// which case the caller falls back to the stored flag.
+async function fetchRealKeyStatus() {
+  try {
+    const r = await runHelper([REGISTER_HELPER, '--key-status-all', CONTROL_SOCKET], {
+      timeoutMs: 20000,
+      maxStdout: 256 * 1024,
+    });
+    let reply = null;
+    try { reply = JSON.parse(r.stdout); } catch (e) {}
+    if (r.code !== 0 || !reply || reply.ok !== true || !reply.result) return null;
+    return reply.result;
+  } catch (e) { return null; }
+}
+
+// Per-user home disk usage from the supervisor's cached `du` scan (the gateway
+// service account cannot read the 0700 user homes). Null when unavailable.
+async function fetchDiskUsage() {
+  try {
+    const r = await runHelper([REGISTER_HELPER, '--du', CONTROL_SOCKET], {
+      timeoutMs: 30000,
+      maxStdout: 256 * 1024,
+    });
+    let reply = null;
+    try { reply = JSON.parse(r.stdout); } catch (e) {}
+    if (r.code !== 0 || !reply || reply.ok !== true || !reply.result) return null;
+    return reply.result;
+  } catch (e) { return null; }
 }
 
 function validPluginPackageName(value) {
@@ -816,8 +882,7 @@ function inferPluginPackageName(spec) {
 }
 
 async function fetchSharedPluginList() {
-  const controlSocket = path.join(path.dirname(USERS_FILE), 'control.sock');
-  const r = await runHelper([REGISTER_HELPER, '--plugin-list', controlSocket], {
+  const r = await runHelper([REGISTER_HELPER, '--plugin-list', CONTROL_SOCKET], {
     timeoutMs: 15000,
     maxStdout: 1024 * 1024,
   });
@@ -852,20 +917,21 @@ function startPluginJob(action, name, spec) {
     log: '',
     result: null,
     error: null,
+    _child: null, // runHelper child, kept so the admin cancel can kill it
   };
   pluginJobs.set(id, job);
   activePluginJobId = id;
   while (pluginJobs.size > 20) pluginJobs.delete(pluginJobs.keys().next().value);
-  const controlSocket = path.join(path.dirname(USERS_FILE), 'control.sock');
   const args = action === 'add'
-    ? [REGISTER_HELPER, '--plugin-add', name, spec, controlSocket]
-    : [REGISTER_HELPER, '--plugin-remove', name, controlSocket];
+    ? [REGISTER_HELPER, '--plugin-add', name, spec, CONTROL_SOCKET]
+    : [REGISTER_HELPER, '--plugin-remove', name, CONTROL_SOCKET];
   appendPluginJobLog(job, `${action === 'add' ? '安装' : '移除'} ${spec || name}\n`);
   runHelper(args, {
     timeoutMs: 1800000,
     maxStdout: 1024 * 1024,
     maxStderr: 1024 * 1024,
     onStderr: (chunk) => { appendPluginJobLog(job, chunk); },
+    onSpawn: (child) => { job._child = child; },
   }).then((r) => {
     let reply = null;
     try { reply = JSON.parse(r.stdout); } catch (e) {}
@@ -915,8 +981,7 @@ function ensureTenantInstance(name) {
   if (readyTenants.get(name) === marker) return Promise.resolve();
   if (wakingTenants.has(name)) return wakingTenants.get(name);
   const wake = (async () => {
-    const controlSocket = path.join(path.dirname(USERS_FILE), 'control.sock');
-    const r = await runHelper([REGISTER_HELPER, '--wake', name, controlSocket], {
+    const r = await runHelper([REGISTER_HELPER, '--wake', name, CONTROL_SOCKET], {
       timeoutMs: 130000,
       maxStdout: 64 * 1024,
     });
@@ -931,11 +996,25 @@ function ensureTenantInstance(name) {
   return wake.finally(() => wakingTenants.delete(name));
 }
 
-function stopTenantInstance(name, reason) {
-  if (stoppingTenants.has(name)) return stoppingTenants.get(name);
-  const stop = (async () => {
-    const controlSocket = path.join(path.dirname(USERS_FILE), 'control.sock');
-    const r = await runHelper([REGISTER_HELPER, '--sleep', name, controlSocket, reason || 'logout'], {
+function stopTenantInstance(name, reason, revokeSessions = false) {
+  const existing = stoppingTenants.get(name);
+  if (existing) {
+    // A manual logout/admin action must be allowed to strengthen an already
+    // running automatic sleep into a session-revoking stop.
+    if (revokeSessions && !existing.revokeSessions) {
+      return existing.promise.then(() => stopTenantInstance(name, reason, true));
+    }
+    return existing.promise;
+  }
+  const operation = (async () => {
+    const r = await runHelper([
+      REGISTER_HELPER,
+      '--sleep',
+      name,
+      CONTROL_SOCKET,
+      reason || 'browser-idle',
+      revokeSessions ? '1' : '0',
+    ], {
       timeoutMs: 150000,
       maxStdout: 64 * 1024,
     });
@@ -948,8 +1027,12 @@ function stopTenantInstance(name, reason) {
     usersCacheAt = 0;
     return reply.result;
   })();
-  stoppingTenants.set(name, stop);
-  return stop.finally(() => stoppingTenants.delete(name));
+  const entry = { revokeSessions, promise: null };
+  entry.promise = operation.finally(() => {
+    if (stoppingTenants.get(name) === entry) stoppingTenants.delete(name);
+  });
+  stoppingTenants.set(name, entry);
+  return entry.promise;
 }
 
 // Browser presence drives automatic process recycling. pagehide/sendBeacon
@@ -984,11 +1067,17 @@ function schedulePresenceStop(user, reason) {
     pendingPresenceStops.delete(user);
     const tabs = tenantTabs.get(user);
     if (tabs && tabs.size > 0) return;
-    revokePresenceSessions(user);
     tenantTabs.delete(user);
-    activeUsers.delete(user);
+    // Keep the activity entry: the session cookie may still be valid, and the
+    // entry decays to "offline" on its own after ACTIVE_WINDOW_MS. Deleting it
+    // would mislabel a previously active user as "从未活跃".
     try {
-      await stopTenantInstance(user, reason || 'browser-close');
+      // Browser presence owns only tenant process lifetime. It must not own
+      // authentication lifetime: background timer throttling, suspend/resume,
+      // reloads and temporary network loss can all make a healthy tab miss
+      // heartbeats. Preserve the signed session so the next request can wake
+      // the tenant again without forcing the user through login.
+      await stopTenantInstance(user, reason || 'browser-close', false);
       console.log(`tenant-presence stopped ${user} (${reason || 'browser-close'})`);
     } catch (error) {
       console.error(`tenant-presence stop failed ${user}: ${error.message}`);
@@ -1333,7 +1422,10 @@ function proxyRequest(req, res, port, user) {
     const wantJsonGzip = /\bgzip\b/.test(String(req.headers['accept-encoding'] || '')) && !upstreamRes.headers['content-encoding'] && ct.indexOf('application/json') === 0;
     const needBuffer = canInject || sniffListRes || sniffHistoryRes;
     if (!needBuffer) {
-      upstreamRes.on('error', () => { try { res.destroy(); } catch (e) {} });
+      upstreamRes.on('error', () => {
+        if (user) readyTenants.delete(user);
+        try { res.destroy(); } catch (e) {}
+      });
       if (wantJsonGzip) {
         const gz = zlib.createGzip({ level: 4 });
         gz.on('error', () => { try { res.destroy(); } catch (e) {} });
@@ -1412,12 +1504,14 @@ function proxyRequest(req, res, port, user) {
       res.end(body);
     });
     upstreamRes.on('error', () => {
+      if (user) readyTenants.delete(user);
       if (!settled) { settled = true; if (!res.headersSent) { try { res.writeHead(502, { 'Content-Type': 'text/plain; charset=utf-8' }); } catch (e) {} } }
       try { res.destroy(); } catch (e) {}
     });
     upstreamRes.on('aborted', () => { try { res.destroy(); } catch (e) {} });
   });
   upstreamReq.on('error', (e) => {
+    if (user) readyTenants.delete(user);
     console.error('proxy error ->', port, e.message);
     if (!res.headersSent) res.writeHead(502, { 'Content-Type': 'text/plain; charset=utf-8' });
     res.end('Bad Gateway: 后端服务不可用');
@@ -1439,7 +1533,7 @@ function proxyRequest(req, res, port, user) {
   }
   req.pipe(upstreamReq);
 }
-function proxyUpgrade(req, socket, head, port) {
+function proxyUpgrade(req, socket, head, port, user) {
   const headers = backendHeaders(req, port);
   const lines = [req.method + ' ' + req.url + ' HTTP/1.1'];
   for (const k in headers) {
@@ -1457,7 +1551,10 @@ function proxyUpgrade(req, socket, head, port) {
     socket.pipe(upstream);
     upstream.pipe(socket);
   });
-  upstream.on('error', () => socket.destroy());
+  upstream.on('error', () => {
+    if (user) readyTenants.delete(user);
+    socket.destroy();
+  });
   socket.on('error', () => upstream.destroy());
   socket.on('close', () => upstream.destroy());
   upstream.on('close', () => socket.destroy());
@@ -1502,17 +1599,31 @@ const server = http.createServer(async (req, res) => {
   // ---------- admin panel (admin account only) ----------
   if (pathname === '/__gw/admin' || pathname === '/__gw/admin/users'
       || pathname === '/__gw/admin/plugins' || pathname === '/__gw/admin/plugin-job'
-      || pathname === '/__gw/admin/plugins/add' || pathname === '/__gw/admin/plugins/remove') {
+      || pathname === '/__gw/admin/plugins/add' || pathname === '/__gw/admin/plugins/remove'
+      || pathname === '/__gw/admin/plugins/cancel'
+      || pathname === '/__gw/admin/kick') {
     const au = session && getUser(session.u);
     if (!session || !au || au.admin !== true) {
       if (req.method === 'GET') return redirect(res, '/login');
       return json(res, 403, { ok: false, error: '需要管理员权限' });
     }
     if (pathname === '/__gw/admin/users') {
-      let stats = {};
-      let statsError = null;
-      try { stats = await fetchTenantProcessStats(); } catch (error) { statsError = error.message; }
-      return json(res, 200, adminUsersPayload(stats, statsError));
+      // Live user metrics are disabled because all three helpers share the
+      // supervisor socket with login wake/sleep. In particular, synchronous
+      // per-home `du` can prevent the supervisor from accepting connections
+      // long enough for login to fail with connect EAGAIN/socket timeout.
+      //
+      // Kept for future restoration after metrics move to an async collector:
+      // let stats = {};
+      // let statsError = null;
+      // try { stats = await fetchTenantProcessStats(); } catch (error) { statsError = error.message; }
+      // const realKeys = await fetchRealKeyStatus();
+      // const diskUsage = await fetchDiskUsage();
+      const stats = {};
+      const statsError = null;
+      const realKeys = null; // adminUsersPayload falls back to users.json.keyConfigured
+      const diskUsage = null;
+      return json(res, 200, adminUsersPayload(stats, statsError, realKeys, diskUsage));
     }
     if (pathname === '/__gw/admin/plugins' && req.method === 'GET') {
       try {
@@ -1558,6 +1669,70 @@ const server = http.createServer(async (req, res) => {
         return json(res, 202, { ok: true, job: publicPluginJob(job) });
       } catch (error) {
         return json(res, 409, { ok: false, error: error.message });
+      }
+    }
+    if (pathname === '/__gw/admin/plugins/cancel' && req.method === 'POST') {
+      if (req.headers['x-dsh-gateway-action'] !== 'admin-plugin') {
+        return json(res, 403, { ok: false, error: 'CSRF 校验失败' });
+      }
+      try {
+        // Tell the supervisor to kill the running shared-plugin command (its
+        // pnpm tree), then force-kill this gateway's own helper child as a
+        // fallback when the supervisor is unreachable. The job settles as an
+        // error ("plugin operation canceled") on the next watchJob poll.
+        const r = await runHelper([REGISTER_HELPER, '--plugin-cancel', CONTROL_SOCKET], {
+          timeoutMs: 20000,
+          maxStdout: 64 * 1024,
+        });
+        let reply = null;
+        try { reply = JSON.parse(r.stdout); } catch (e) {}
+        if (r.code !== 0 || !reply || reply.ok !== true) {
+          throw new Error((reply && reply.error) || String(r.stderr || '').trim() || 'plugin cancel failed');
+        }
+        const job = activePluginJobId && pluginJobs.get(activePluginJobId);
+        if (job && job.status === 'running' && job._child) {
+          try { job._child.kill('SIGKILL'); } catch (e) {}
+        }
+        logLine(req, 200, 'admin-plugin-cancel');
+        return json(res, 200, { ok: true, canceled: !!(reply.result && reply.result.canceled) });
+      } catch (error) {
+        logLine(req, 500, 'admin-plugin-cancel-fail ' + String(error.message).slice(0, 160));
+        return json(res, 500, { ok: false, error: error.message });
+      }
+    }
+    if (pathname === '/__gw/admin/kick' && req.method === 'POST') {
+      if (req.headers['x-dsh-gateway-action'] !== 'admin-kick') {
+        return json(res, 403, { ok: false, error: 'CSRF 校验失败' });
+      }
+      let body;
+      try { body = await readJsonBody(req, 4096); } catch (e) { return json(res, 400, { ok: false, error: 'invalid JSON' }); }
+      const name = String(body.name || '').trim();
+      if (!getUser(name)) return json(res, 404, { ok: false, error: '用户不存在' });
+      try {
+        // The supervisor's sleep command stops the tenant, sweeps every process
+        // of the user's OS account (killAllProcessesForOsUser) and bumps pwdVer
+        // (revokeSessions), which invalidates all of the user's session tokens
+        // - a hard logout plus process kill in one call.
+        const r = await runHelper([REGISTER_HELPER, '--sleep', name, CONTROL_SOCKET, 'admin-force'], {
+          timeoutMs: 150000,
+          maxStdout: 64 * 1024,
+        });
+        let reply = null;
+        try { reply = JSON.parse(r.stdout); } catch (e) {}
+        if (r.code !== 0 || !reply || reply.ok !== true) {
+          throw new Error((reply && reply.error) || String(r.stderr || '').trim() || 'tenant stop failed');
+        }
+        // Clear gateway-side presence state so the kicked user reads offline
+        // immediately; the pwdVer bump already kills their sessions server-side.
+        cancelPresenceStop(name);
+        tenantTabs.delete(name);
+        presenceNonces.delete(name);
+        readyTenants.delete(name);
+        logLine(req, 200, 'admin-kick ' + name);
+        return json(res, 200, { ok: true });
+      } catch (error) {
+        logLine(req, 500, 'admin-kick-fail ' + name + ' ' + String(error.message).slice(0, 160));
+        return json(res, 500, { ok: false, error: error.message });
       }
     }
     const csrf = crypto.randomBytes(16).toString('hex');
@@ -1684,10 +1859,9 @@ const server = http.createServer(async (req, res) => {
       if (password.length < 8) return renderErr('密码至少 8 位');
       if (password !== confirm) return renderErr('两次输入的密码不一致');
       // Pass the control socket path explicitly: the helper runs under sudo,
-      // which strips custom env vars (env_reset), so it cannot rely on
-      // DSH_GATEWAY_STATE_DIR. The socket lives next to users.json.
-      const regSocket = path.join(path.dirname(USERS_FILE), 'control.sock');
-      const r = await runHelper([REGISTER_HELPER, username, regSocket], { input: password, timeoutMs: 130000, maxStdout: 64 * 1024 });
+      // which strips custom env vars (env_reset), so it cannot rely on the
+      // gateway process environment.
+      const r = await runHelper([REGISTER_HELPER, username, CONTROL_SOCKET], { input: password, timeoutMs: 130000, maxStdout: 64 * 1024 });
       let reply = null;
       try { reply = JSON.parse(r.stdout); } catch (e) {}
       if (r.code !== 0 || !reply || reply.ok !== true) {
@@ -1769,8 +1943,7 @@ const server = http.createServer(async (req, res) => {
     const password = String(body.password || '');
     if (!/^[A-Za-z0-9_-]{1,64}$/.test(username)) return json(res, 400, { ok: false, error: 'invalid username' });
     if (password.length < 8) return json(res, 400, { ok: false, error: 'password must be at least 8 characters' });
-    const regSocket = path.join(path.dirname(USERS_FILE), 'control.sock');
-    const r = await runHelper([REGISTER_HELPER, username, regSocket], { input: password, timeoutMs: 130000, maxStdout: 64 * 1024 });
+    const r = await runHelper([REGISTER_HELPER, username, CONTROL_SOCKET], { input: password, timeoutMs: 130000, maxStdout: 64 * 1024 });
     let reply = null;
     try { reply = JSON.parse(r.stdout); } catch (e) {}
     if (r.code !== 0 || !reply || reply.ok !== true) {
@@ -1805,6 +1978,24 @@ const server = http.createServer(async (req, res) => {
     }
     const key = String(body.apiKey !== undefined ? body.apiKey : body.key || '').trim();
     if (!key) return json(res, 400, { ok: false, error: 'apiKey is required' });
+    // Explicit image-capability allowlist. Standard OpenAI-compatible
+    // /models replies normally expose only ids, so capability inference from
+    // that endpoint is not portable. Accept the canonical top-level field and
+    // provider.image_models as a compatibility alias.
+    const imageModelsRaw = body.image_models !== undefined ? body.image_models : p.image_models;
+    if (imageModelsRaw !== undefined && !Array.isArray(imageModelsRaw)) {
+      return json(res, 400, { ok: false, error: 'image_models must be an array of model ids' });
+    }
+    const imageModels = [];
+    const imageModelSet = new Set();
+    for (const value of imageModelsRaw || []) {
+      if (typeof value !== 'string' || !value.trim() || value.trim().length > 128) {
+        return json(res, 400, { ok: false, error: 'image_models must contain non-empty model ids up to 128 characters' });
+      }
+      const id = value.trim();
+      if (!imageModelSet.has(id)) imageModels.push(id);
+      imageModelSet.add(id);
+    }
     // Models: an explicit `model` (or `models` array) is used as-is; otherwise
     // the gateway asks the provider for its model list (GET <baseURL>/models
     // with the API key) so the caller does not have to know them.
@@ -1827,11 +2018,15 @@ const server = http.createServer(async (req, res) => {
         });
       }
     }
+    models = [...new Set(models)];
+    const configuredModels = models.map((id) => ({
+      id,
+      input: imageModelSet.has(id) ? ['text', 'image'] : ['text'],
+    }));
     const u = getUser(name);
     if (!u || !u.port) return json(res, 404, { ok: false, error: 'user not found' });
-    const regSocket = path.join(path.dirname(USERS_FILE), 'control.sock');
     const r = await runHelper(
-      [PROVIDER_HELPER, name, regSocket, JSON.stringify({ name: pname, baseURL, api: papi, models })],
+      [PROVIDER_HELPER, name, CONTROL_SOCKET, JSON.stringify({ name: pname, baseURL, api: papi, models: configuredModels })],
       { input: key, timeoutMs: 160000, maxStdout: 64 * 1024 },
     );
     let reply = null;
@@ -1844,7 +2039,14 @@ const server = http.createServer(async (req, res) => {
     const ref = reply.result.provider.apiKeyEnv;
     usersCacheAt = 0;
     logLine(req, 200, 'api-provider ' + name + ' ref=' + ref + ' models=' + models.length);
-    return json(res, 200, { ok: true, user: name, provider: reply.result.provider, ref: ref, models: models });
+    return json(res, 200, {
+      ok: true,
+      user: name,
+      provider: reply.result.provider,
+      ref: ref,
+      models: models,
+      image_models: imageModels,
+    });
   }
 
   if (pathname === '/__gw/presence') {
@@ -1884,7 +2086,7 @@ const server = http.createServer(async (req, res) => {
       const logoutUser = getUser(session.u);
       if (logoutUser && logoutUser.port) {
         try {
-          await stopTenantInstance(session.u, 'manual-logout');
+          await stopTenantInstance(session.u, 'manual-logout', true);
         } catch (error) {
           logLine(req, 503, 'tenant-stop-fail ' + session.u + ' ' + String(error.message).slice(0, 160));
           return json(res, 503, { ok: false, error: '退出失败，用户进程未能停止：' + error.message });
@@ -1895,7 +2097,11 @@ const server = http.createServer(async (req, res) => {
         if (!nonces) { nonces = new Set(); presenceNonces.set(session.u, nonces); }
         nonces.add(String(session.n || ''));
         revokePresenceSessions(session.u);
-        activeUsers.delete(session.u);
+        // Mark logged-out instead of dropping the entry: the panel keeps the
+        // last-active timestamp and shows "离线" (not "从未活跃"), and the
+        // loggedOut flag forces online=false immediately. A later login's
+        // markActive overwrites the entry and clears the flag.
+        activeUsers.set(session.u, { at: Date.now(), ip: clientIp(req), loggedOut: true });
         logLine(req, 302, 'logout-stop ' + session.u);
       }
     }
@@ -2340,7 +2546,7 @@ server.on('upgrade', async (req, socket, head) => {
     socket.destroy();
     return;
   }
-  proxyUpgrade(req, socket, head, u.port);
+  proxyUpgrade(req, socket, head, u.port, session.u);
 });
 
 server.listen(PORT, HOST, () => {

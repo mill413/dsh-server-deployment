@@ -9,6 +9,8 @@ const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'dshgw-'));
 const USERS_DIR = path.join(TMP, 'users');
 const USERS_FILE = path.join(TMP, 'users.json');
 const TENANT_HELPER = path.join(TMP, 'dsh-register-test-helper');
+const TENANT_HELPER_LOG = path.join(TMP, 'dsh-register-test-helper.log');
+const CONTROL_SOCKET = path.join(TMP, 'run', 'control.sock');
 fs.mkdirSync(path.join(USERS_DIR, 'tester'), { recursive: true });
 fs.mkdirSync(path.join(USERS_DIR, 'nokey'), { recursive: true });
 fs.mkdirSync(path.join(USERS_DIR, 'admin'), { recursive: true });
@@ -17,6 +19,19 @@ fs.mkdirSync(path.join(USERS_DIR, 'admin'), { recursive: true });
 // use a tiny successful control helper instead of invoking host sudo.
 fs.writeFileSync(TENANT_HELPER, [
   '#!/bin/sh',
+  'EXPECTED_SOCKET=' + JSON.stringify(CONTROL_SOCKET),
+  'printf \'%s\\n\' "$*" >> ' + JSON.stringify(TENANT_HELPER_LOG),
+  'case "$1" in',
+  '  --wake|--sleep) ACTUAL_SOCKET="$3" ;;',
+  '  --plugin-add) ACTUAL_SOCKET="$4" ;;',
+  '  --plugin-remove) ACTUAL_SOCKET="$3" ;;',
+  '  *) ACTUAL_SOCKET="$2" ;;',
+  'esac',
+  '[ "$ACTUAL_SOCKET" = "$EXPECTED_SOCKET" ] || { echo "unexpected control socket: $ACTUAL_SOCKET" >&2; exit 9; }',
+  'if [ "$1" = "tester" ] && [ -n "${3:-}" ]; then',
+  '  printf \'%s\\n\' \'{"ok":true,"result":{"provider":{"apiKeyEnv":"VISION_GATEWAY_API_KEY"}}}\'',
+  '  exit 0',
+  'fi',
   'case "$1" in',
   '  --stats) printf \'%s\\n\' \'{"ok":true,"result":{"tester":{"running":true,"processCount":2,"rssBytes":104857600},"admin":{"running":true,"processCount":1,"rssBytes":52428800}}}\' ;;',
   '  --plugin-list) printf \'%s\\n\' \'{"ok":true,"result":[{"name":"dsh-better-sidebar","version":"0.15.2","source":"image","dir":"/opt/shared"}]}\' ;;',
@@ -40,12 +55,16 @@ fs.writeFileSync(USERS_FILE, JSON.stringify(users));
 process.env.HOST = '127.0.0.1';
 process.env.PORT = '3998';
 process.env.USERS_FILE = USERS_FILE;
+process.env.DSH_CONTROL_SOCKET = CONTROL_SOCKET;
 process.env.SECRET_FILE = path.join(TMP, 'secret');
 process.env.USERS_DIR = USERS_DIR;
 process.env.COOKIE_SECURE = '0';
 process.env.DSH_LOGIN_API_KEY = 'login-test-token';
+process.env.DSH_REGISTER_API_KEY = 'register-test-token';
 process.env.DSH_REGISTER_HELPER = TENANT_HELPER;
+process.env.DSH_PROVIDER_HELPER = TENANT_HELPER;
 process.env.DSH_HELPER_DIRECT = '1';
+process.env.DSH_BROWSER_STOP_GRACE_MS = '1000';
 process.env.DEEPSEEK_BASE_URL = 'http://127.0.0.1:3999';
 
 const upstream = http.createServer((req, res) => {
@@ -60,7 +79,11 @@ const upstream = http.createServer((req, res) => {
     });
     return;
   }
-  if (req.url === '/models') { res.writeHead(200, { 'Content-Type': 'application/json' }); res.end('{"ok":true}'); return; }
+  if (req.url === '/models') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end('{"data":[{"id":"text-model"},{"id":"vision-model"}]}');
+    return;
+  }
   res.writeHead(200, { 'Content-Type': 'text/html' });
   res.end('UPSTREAM-OK ' + req.url);
 });
@@ -109,6 +132,46 @@ function check(name, cond) {
 
   r = await req('GET', '/__gw/health');
   check('health 200', r.status === 200 && r.body.indexOf('"ok":true') >= 0);
+
+  const providerHeaders = { Authorization: 'Bearer register-test-token', 'Content-Type': 'application/json' };
+  r = await req('POST', '/api/users/tester/provider', {
+    headers: providerHeaders,
+    body: JSON.stringify({
+      provider: { name: 'vision-gateway', baseURL: 'http://127.0.0.1:3999' },
+      apiKey: 'sk-provider-test',
+      image_models: ['vision-model'],
+    }),
+  });
+  const providerReply = JSON.parse(r.body);
+  const providerLog = fs.readFileSync(TENANT_HELPER_LOG, 'utf8');
+  check('provider image_models registration succeeds', r.status === 200
+    && providerReply.image_models[0] === 'vision-model');
+  check('provider helper receives text-only model input', providerLog.indexOf('"id":"text-model","input":["text"]') >= 0);
+  check('provider helper receives image model input', providerLog.indexOf('"id":"vision-model","input":["text","image"]') >= 0);
+
+  r = await req('POST', '/api/users/tester/provider', {
+    headers: providerHeaders,
+    body: JSON.stringify({
+      provider: { name: 'vision-gateway', baseURL: 'http://127.0.0.1:3999', image_models: ['missing-model'] },
+      apiKey: 'sk-provider-test',
+    }),
+  });
+  const unknownImageReply = JSON.parse(r.body);
+  check('provider treats image_models as an unchecked allowlist', r.status === 200
+    && unknownImageReply.image_models[0] === 'missing-model');
+
+  r = await req('POST', '/api/users/tester/provider', {
+    headers: providerHeaders,
+    body: JSON.stringify({
+      provider: { name: 'vision-gateway', baseURL: 'http://127.0.0.1:3999', models: ['vision-model'] },
+      apiKey: 'sk-provider-test',
+    }),
+  });
+  const defaultImageReply = JSON.parse(r.body);
+  const defaultImageLog = fs.readFileSync(TENANT_HELPER_LOG, 'utf8').trim().split('\n').pop();
+  check('provider defaults image_models to an empty allowlist', r.status === 200
+    && Array.isArray(defaultImageReply.image_models) && defaultImageReply.image_models.length === 0
+    && defaultImageLog.indexOf('"id":"vision-model","input":["text"]') >= 0);
 
   r = await req('POST', '/api/login-ticket', {
     headers: { 'Content-Type': 'application/json' },
@@ -160,6 +223,26 @@ function check(name, cond) {
   r = await req('GET', '/some/path', { headers: { 'Cookie': 'dsh_session=' + sess } });
   check('proxy upstream', r.status === 200 && r.body.indexOf('UPSTREAM-OK /some/path') >= 0);
 
+  // Closing the last tab may recycle the tenant process, but it is not a
+  // logout. Browser timer throttling and reloads must not invalidate the
+  // signed session cookie.
+  const sessionPayload = JSON.parse(Buffer.from(sess.split('.')[0], 'base64url').toString('utf8'));
+  r = await req('POST', '/__gw/presence', {
+    headers: { Cookie: 'dsh_session=' + sess },
+    body: 'tab=smoke-tab-1234&event=open',
+  });
+  check('presence opens tenant lease', r.status === 204);
+  r = await req('POST', '/__gw/presence', {
+    headers: { Cookie: 'dsh_session=' + sess },
+    body: 'tab=smoke-tab-1234&event=close',
+  });
+  check('presence closes tenant lease', r.status === 204 && !!sessionPayload.n);
+  await new Promise((resolve) => setTimeout(resolve, 1200));
+  const autoSleepLog = fs.readFileSync(TENANT_HELPER_LOG, 'utf8');
+  check('automatic tenant sleep preserves sessions', autoSleepLog.indexOf('--sleep tester ' + CONTROL_SOCKET + ' browser-close 0') >= 0);
+  r = await req('GET', '/some/path', { headers: { Cookie: 'dsh_session=' + sess } });
+  check('session survives automatic tenant sleep', r.status === 200 && r.body.indexOf('UPSTREAM-OK /some/path') >= 0);
+
   const adminCsrf = cookies((await req('GET', '/login')).headers['set-cookie'])['dsh_csrf'];
   r = await req('POST', '/login', { headers: { 'Cookie': 'dsh_csrf=' + adminCsrf }, body: 'csrf=' + adminCsrf + '&username=admin&password=adminsecret' });
   check('admin login enters own DSH', r.status === 302 && r.headers.location === '/');
@@ -169,10 +252,21 @@ function check(name, cond) {
   r = await req('GET', '/__gw/admin', { headers: { Cookie: 'dsh_session=' + adminSess } });
   check('admin console remains available', r.status === 200 && r.body.indexOf('管理控制台') >= 0);
   check('admin console keeps browser presence lease', r.body.indexOf('__DSH_GATEWAY_LIFECYCLE__') >= 0);
+  check('admin user metrics refresh is manual only', r.body.indexOf('restoreUsersCache();') >= 0 && r.body.indexOf('load();setInterval(load') < 0);
+  check('admin user metrics keep a local cache', r.body.indexOf('dsh-admin-users-v1') >= 0 && r.body.indexOf('localStorage.setItem') >= 0);
+  check('admin user metrics show last update time', r.body.indexOf('id="last-updated"') >= 0 && r.body.indexOf('上次更新：') >= 0);
+  check('admin console omits live resource columns', r.body.indexOf('内存（RSS）') < 0 && r.body.indexOf('<th>存储</th>') < 0 && r.body.indexOf('<th>DSH</th>') < 0);
+  const inlineScripts = Array.from(r.body.matchAll(/<script>([\s\S]*?)<\/script>/g), (m) => m[1]);
+  let adminScriptsValid = inlineScripts.length > 0;
+  try { inlineScripts.forEach((script) => { new Function(script); }); } catch (e) { adminScriptsValid = false; }
+  check('admin console inline scripts parse', adminScriptsValid);
   r = await req('GET', '/__gw/admin/users', { headers: { Cookie: 'dsh_session=' + adminSess } });
   const adminUsers = JSON.parse(r.body);
   const testerStats = adminUsers.users.find((u) => u.name === 'tester');
-  check('admin console includes process memory', r.status === 200 && testerStats.rssBytes === 104857600 && testerStats.processCount === 2);
+  // The mock --stats helper reports non-zero values; zeros here prove the
+  // admin user route no longer invokes the control-socket metrics helper.
+  check('admin user list avoids live metrics helpers', r.status === 200 && testerStats.rssBytes === 0 && testerStats.processCount === 0 && testerStats.diskBytes === null);
+  check('admin user list keeps persisted fields', testerStats.port === 3999 && testerStats.keyConfigured === true);
   r = await req('GET', '/__gw/admin/plugins', { headers: { Cookie: 'dsh_session=' + adminSess } });
   const pluginList = JSON.parse(r.body);
   check('admin plugin list', r.status === 200 && pluginList.plugins[0].name === 'dsh-better-sidebar');
@@ -209,6 +303,8 @@ function check(name, cond) {
 
   r = await req('POST', '/logout', { headers: { Cookie: 'dsh_session=' + sess + '; dsh_csrf=' + csrf2 }, body: 'csrf=' + csrf2 });
   check('logout POST -> 302 /login', r.status === 302 && r.headers.location === '/login');
+  const manualSleepLog = fs.readFileSync(TENANT_HELPER_LOG, 'utf8');
+  check('manual logout revokes sessions', manualSleepLog.indexOf('--sleep tester ' + CONTROL_SOCKET + ' manual-logout 1') >= 0);
   r = await req('POST', '/logout', { headers: { Cookie: 'dsh_session=' + sess }, body: 'csrf=' + csrf2 });
   check('revoked logout session stays logged out', r.status === 302 && r.headers.location === '/login');
   r = await req('GET', '/logout');
