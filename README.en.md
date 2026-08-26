@@ -110,12 +110,12 @@ docker compose -f docker/compose.yml exec dsh-multitenant dsh-users del carol   
 
 Behavior notes:
 
-- Runtime users are written to `docker/data/gateway/users.json` (container path `/var/lib/dsh/gateway/users.json`) and **survive container rebuilds / restarts** (at boot the seed list is merged with existing users; ports, passwords and identities are kept). All data is persisted via a bind mount to `docker/data/` on the host (container `/var/lib/dsh`: `users/` for user homes, `gateway/` for state), directly visible and backup-able.
+- Runtime users are written to `docker/data/gateway/users.json` (container path `/var/lib/dsh/gateway/users.json`) and **survive container rebuilds / restarts** (at boot the seed list is merged with existing users; ports, passwords and identities are kept). All data is persisted via a bind mount to `docker/data/` on the host (container `/var/lib/dsh`: `users/` for user homes, `gateway/` for state), directly visible and backup-able. The supervisor IPC socket lives outside that volume at `/run/dsh/control.sock` (override with `DSH_CONTROL_SOCKET`); it is runtime-only, is excluded from backups, and must never be shared by multiple instances.
 - To remove a user use `dsh-users del` (also removes their data); removing a user from `DSH_TENANTS_JSON` does NOT delete an existing user.
 - `dsh-users` shares the same user store as the gateway: a new user can log in immediately (gateway cache refreshes within at most 2s).
 - Passwords must be at least 8 characters; `passwd` immediately invalidates all of the user's issued sessions.
 - `DSH_LAZY_TENANTS=1` is the default: provisioning creates the OS account, private HOME, port record, shared-plugin links and firewall rule without spawning DSH. The gateway starts and waits for that user's instance after the first successful login. It runs until logout/browser-presence recycling or container restart. Set `DSH_LAZY_TENANTS=0` to restore eager startup.
-- Proxied DSH pages place Logout directly above Settings in the left sidebar, cloning the Settings row's styling and state: icon plus label when expanded, icon only on the collapsed rail. Manual logout persistently revokes all issued sessions for that user, stops the tenant process group, then kills any escaped process owned by that tenant's unique OS UID; the user's HOME and files are untouched. Per-tab heartbeats track browser presence: closing the last tab triggers the same recycle after a 5-second reload grace, while one tab closing among several does not. Crashes/disconnects fall back to a 120-second heartbeat timeout. Tune these with `DSH_BROWSER_STOP_GRACE_MS` and `DSH_BROWSER_PRESENCE_TTL_MS`.
+- Proxied DSH pages place Logout directly above Settings in the left sidebar, cloning the Settings row's styling and state: icon plus label when expanded, icon only on the collapsed rail. Manual logout persistently revokes all issued sessions for that user, stops the tenant process group, then kills any escaped process owned by that tenant's unique OS UID; the user's HOME and files are untouched. Per-tab heartbeats track browser presence: closing the last tab recycles the tenant process after a 5-second reload grace, while one tab closing among several does not. Crashes/disconnects fall back to a 120-second heartbeat timeout. Automatic recycling manages only process lifetime and preserves the login cookie, so the next request can wake the tenant with the existing session. Only manual logout, an administrator kick, or a password change revokes sessions. Tune the recycle timers with `DSH_BROWSER_STOP_GRACE_MS` and `DSH_BROWSER_PRESENCE_TTL_MS`.
 
 ### Persistent shared Web plugins (no Dockerfile change)
 
@@ -149,7 +149,7 @@ The gateway supports self-service account creation through the login-page regist
 ### Admin console (admin account)
 
 - **admin account**: created/updated from `DSH_ADMIN_PASSWORD` (scrypt-hashed in `users.json`, flagged `admin: true`). It is now a full isolated tenant with its own `dsh-admin` OS account, HOME, port and lazy DSH; legacy management-only records are migrated at boot. Admin login enters its own DSH, whose sidebar includes an Admin Console action; the console links back to the workspace.
-- **Users and resources**: `/__gw/admin` lists online state, DSH running/sleeping state, summed RSS and process count for each tenant OS user, last activity and source IP, refreshing every 10s; `/__gw/admin/users` returns the same JSON. Summed RSS can double-count shared pages and is intended as a per-user usage indicator rather than unique container memory.
+- **User list**: `/__gw/admin` shows username, online state, port, last activity, the persisted API-key flag, and creation time. It refreshes only on an explicit admin click and caches the last result in the browser. Live DSH state, RSS, process count, disk usage, and on-disk key scans are temporarily disabled so management metrics cannot block the supervisor control socket shared with login.
 - **Shared plugin management**: the admin console lists plugin name, version, image/runtime source and path; it can install or upgrade npm/Git/file specs and remove runtime plugins. Mutations run as background jobs with live pnpm and tenant-sync logs, then refresh automatically. Image-bundled plugins are marked non-removable, and only one mutation runs at a time.
 - **Access control**: non-admin sessions are redirected away from `/__gw/admin`; the registration endpoint rejects the `admin` username (reserved).
 - **Password change**: edit `DSH_ADMIN_PASSWORD` and restart the container (sessions are invalidated). Do not use `dsh-users passwd admin` — the env var overwrites it on the next boot.
@@ -176,6 +176,15 @@ The external backend then redirects the user's browser to `https://dsh.example.c
 - Tickets live in gateway process memory, so the current deployment must use a single gateway replica; issuing and consuming a ticket must reach the same process.
 - `DSH_LOGIN_API_KEY` grants the ability to log in as any existing user. Keep it separate from `DSH_REGISTER_API_KEY` and inject it from a secret store such as a Kubernetes Secret.
 
+For concurrent browser login testing, use `bin/dsh-browser-login-load.sh`. It creates one isolated Chromium profile per user so same-origin `dsh_session` cookies do not overwrite each other. The defaults run five browsers concurrently and hold each for 60 seconds; increase concurrency gradually instead of launching 100 browser processes immediately:
+
+```bash
+docker compose -f docker/compose.yml exec -T dsh-multitenant dsh-users list \
+  | tail -n +2 | cut -f1 > /tmp/dsh-users.txt
+DSH_LOGIN_API_KEY='<token>' CONCURRENCY=10 HOLD_SECONDS=60 \
+  ./bin/dsh-browser-login-load.sh https://dsh.example.com /tmp/dsh-users.txt
+```
+
 ### External registration API & model registration (machine-to-machine)
 
 Setting `DSH_REGISTER_API_KEY` (compose env var, default `register-test-token`) enables two Bearer-token endpoints; leaving it unset disables them entirely.
@@ -199,13 +208,15 @@ curl -X POST http://<host>:20810/api/register \
 curl -X POST http://<host>:20810/api/users/alice2/provider \
   -H "Authorization: Bearer <DSH_REGISTER_API_KEY>" \
   -H "Content-Type: application/json" \
-  -d '{"provider":{"name":"my-gateway","baseURL":"https://gateway.example.com/v1","model":"gpt-4o-mini"},
-       "apiKey":"sk-xxxx"}'
+  -d '{"provider":{"name":"my-gateway","baseURL":"https://gateway.example.com/v1"},
+       "apiKey":"sk-xxxx",
+       "image_models":["gpt-4o","qwen-vl-max"]}'
 # → 200 {"ok":true,"user":"alice2","provider":{"name":"my-gateway","baseURL":"...","model":"gpt-4o-mini","apiKeyEnv":"MY_GATEWAY_API_KEY"},"ref":"MY_GATEWAY_API_KEY"}
 ```
 
 - **Strict validation**: `provider` is required (name limited to letters/digits/underscore/hyphen, baseURL must be an http(s) URL); `provider.api` is optional — `openai-completions` (default) / `openai-responses` / `anthropic-messages` — an invalid value makes the whole settings section rejected and the model unusable; `apiKey` is required; the target user must exist (admin included).
 - **Automatic model discovery**: when `provider.model` (or a `models` array) is omitted, the gateway calls `GET <baseURL>/models` with the API key and writes the fetched model list (capped at 100) into the user's config; a fetch failure returns 502 with a hint to pass `provider.model` explicitly. Passing `model`/`models` skips the fetch. The response's `models` array is the effective model list.
+- **Image-input allowlist**: the optional top-level `image_models` array (also accepted as `provider.image_models`) contains model ids. Discovered models in the allowlist are written with `input: [text, image]`; every other model gets `input: [text]`. It defaults to an empty array when omitted. The allowlist is not checked against the discovered catalog: unmatched entries remain in the response but do not create extra model configurations.
 - Effect: writes the user's `settings.yaml` (an `llm-pi-ai.providers.<name>` OpenAI-compatible profile plus `agent-default-model`) and owner-only `.credentials.yaml` (0600). A dormant user stays dormant; an already-running user's instance is restarted so the change applies immediately.
 - Re-calling the endpoint **replaces** the provider config and key (change baseURL/model/key anytime). The returned `ref` is the provider's credential name (`<NAME>_API_KEY`).
 - Once configured, the user skips `/setup` and the provider is the default on login.
@@ -219,7 +230,7 @@ docker compose -f docker/compose.yml exec dsh-multitenant runuser -u dsh-alice -
   curl -fsS --connect-timeout 2 http://127.0.0.1:3102/ -o /dev/null
 ```
 
-The second command must fail to connect. The image health check covers the gateway and every tenant backend port. This Compose topology is for single-host trusted-network acceptance; it does not provide public TLS, HA, dynamic scaling, or production secret management.
+The second command must fail to connect. In the default lazy mode, an active tenant exiting unexpectedly is isolated to that tenant and a later request can start it again without terminating the gateway, other tenants, or the entrypoint supervisor. A core gateway failure remains fatal so the Kubernetes/Docker restart policy can recover the container. With `DSH_LAZY_TENANTS=0`, the image health check still covers every tenant backend port. This Compose topology is for single-host trusted-network acceptance; it does not provide public TLS, HA, dynamic scaling, or production secret management.
 
 ## Quick deployment (overview)
 

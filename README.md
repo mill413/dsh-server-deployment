@@ -110,12 +110,12 @@ docker compose -f docker/compose.yml exec dsh-multitenant dsh-users del carol   
 
 行为要点：
 
-- 运行时新增的用户写入 `docker/data/gateway/users.json`（容器内 `/var/lib/dsh/gateway/users.json`），**容器重建/重启后依然存在**（重启时种子列表与存量用户合并，端口/口令/身份保持不变）。所有数据通过绑定挂载持久化在宿主机 `docker/data/`（容器内 `/var/lib/dsh`：`users/` 用户目录 + `gateway/` 状态），直接可见、可备份。
+- 运行时新增的用户写入 `docker/data/gateway/users.json`（容器内 `/var/lib/dsh/gateway/users.json`），**容器重建/重启后依然存在**（重启时种子列表与存量用户合并，端口/口令/身份保持不变）。所有数据通过绑定挂载持久化在宿主机 `docker/data/`（容器内 `/var/lib/dsh`：`users/` 用户目录 + `gateway/` 状态），直接可见、可备份。supervisor IPC socket 位于非持久化的 `/run/dsh/control.sock`（可用 `DSH_CONTROL_SOCKET` 覆盖），不会进入数据备份，也不能由多个实例共享。
 - 删除用户请用 `dsh-users del`（会一并删除该用户的数据）；把用户从 `DSH_TENANTS_JSON` 里删掉**不会**删除已存在的用户。
 - `dsh-users` 与网关共享同一份用户库：新用户立即可登录（网关侧缓存最长 2 秒刷新）。
 - 口令最少 8 位；`passwd` 会使该用户所有已签发会话立即失效。
 - 默认启用 `DSH_LAZY_TENANTS=1`：建号只创建 OS 账号、独立 HOME、端口记录、共享插件链接和防火墙规则，不启动 DSH。用户首次成功登录时网关调用监管进程启动该用户实例并等待就绪；实例运行到用户退出/浏览器离线回收或容器重启。设置 `DSH_LAZY_TENANTS=0` 可恢复启动容器/建号时立即拉起全部实例的旧行为。
-- 登录后的 DSH 页面在左侧栏“设置”正上方提供“退出登录”按钮，直接复用设置行的样式和宽/窄状态：侧栏展开时显示图标与文字，收起时只显示同尺寸图标。手动退出会撤销该用户全部已签发会话，先停止租户进程组，再按租户唯一 OS UID 强制清理任何脱离进程组的后台进程；不会删除或修改用户 HOME、工作区、会话文件、配置或凭据。浏览器页面通过标签页心跳登记在线状态，关闭最后一个标签页后默认宽限 5 秒再执行相同回收；多标签页只关闭其中一个不会停止。浏览器崩溃、断网或来不及发送关闭通知时，默认 120 秒心跳超时后兜底回收并注销。会话撤销写入持久化用户记录，容器重启后旧 Cookie 也不会恢复。可用 `DSH_BROWSER_STOP_GRACE_MS` 和 `DSH_BROWSER_PRESENCE_TTL_MS` 调整。
+- 登录后的 DSH 页面在左侧栏“设置”正上方提供“退出登录”按钮，直接复用设置行的样式和宽/窄状态：侧栏展开时显示图标与文字，收起时只显示同尺寸图标。手动退出会撤销该用户全部已签发会话，先停止租户进程组，再按租户唯一 OS UID 强制清理任何脱离进程组的后台进程；不会删除或修改用户 HOME、工作区、会话文件、配置或凭据。浏览器页面通过标签页心跳登记在线状态，关闭最后一个标签页后默认宽限 5 秒再回收租户进程；多标签页只关闭其中一个不会停止。浏览器崩溃、断网或来不及发送关闭通知时，默认 120 秒心跳超时后兜底回收。自动回收只管理进程生命周期，不撤销登录 Cookie；用户下次访问会使用原会话重新唤醒实例。只有手动退出、管理员强退或改密才撤销会话。可用 `DSH_BROWSER_STOP_GRACE_MS` 和 `DSH_BROWSER_PRESENCE_TTL_MS` 调整。
 
 ### 持久化共享 Web 插件（无需修改 Dockerfile）
 
@@ -174,7 +174,7 @@ env:
 ### 管理控制台（admin 账号）
 
 - **admin 账号**：由 `DSH_ADMIN_PASSWORD` 环境变量在启动时创建/更新（scrypt 存入 `users.json`，标记 `admin: true`）。它现在是完整隔离租户，拥有自己的 `dsh-admin` OS 账号、HOME、端口和按需启动的 DSH；旧版纯管理记录会在启动时自动补齐这些字段。管理员登录默认进入自己的 DSH，左侧栏额外显示“管理后台”按钮，管理台也提供“返回工作区”。
-- **在线用户与资源**：`/__gw/admin` 展示全部用户的在线状态、DSH 运行/休眠状态、该用户所有进程的 RSS 内存合计、进程数、最近活跃时间与来源 IP，每 10 秒自动刷新；`/__gw/admin/users` 返回同数据的 JSON。RSS 会包含共享页的重复计数，适合观察单用户当前占用趋势，不等同于容器唯一物理内存。
+- **用户列表**：`/__gw/admin` 展示用户名、在线状态、端口、最近活跃时间、持久化 API Key 标记和创建时间；仅在管理员手动点击时刷新，并在浏览器本地缓存上次结果。实时 DSH 状态、RSS、进程数、磁盘占用和磁盘 Key 扫描暂时停用，避免管理统计阻塞登录共用的 supervisor control socket。
 - **共享插件管理**：管理后台直接展示共享插件名称、版本、镜像内置/运行时来源及路径，可提交 npm/Git/file spec 安装或升级，并移除运行时插件。操作作为后台任务执行，页面实时显示 pnpm 与全用户同步日志，完成后自动刷新；镜像内置插件标记为不可移除。同一时间只允许一个插件变更任务。
 - **权限**：非 admin 账号访问 `/__gw/admin` 一律跳转登录页；注册接口拒绝使用 `admin` 用户名（保留名）。
 - **改密**：改 `DSH_ADMIN_PASSWORD` 环境变量后重启容器（会话自动失效）；不要用 `dsh-users passwd admin`（下次启动会被环境变量覆盖）。
@@ -201,6 +201,15 @@ curl -X POST https://dsh.example.com/api/login-ticket \
 - 票据保存在网关进程内存中，因此当前部署必须保持单副本网关；换票与浏览器消费票据需要命中同一进程。
 - `DSH_LOGIN_API_KEY` 拥有“以任意已有用户登录”的高权限，必须与 `DSH_REGISTER_API_KEY` 分开并通过 Kubernetes Secret 等机密存储注入。
 
+浏览器并发登录压测可使用 `bin/dsh-browser-login-load.sh`。脚本为每个用户创建独立 Chromium profile，避免同源 `dsh_session` Cookie 互相覆盖；默认同时打开 5 个并保持 60 秒，建议逐步增加并发而非直接启动 100 个浏览器进程：
+
+```bash
+docker compose -f docker/compose.yml exec -T dsh-multitenant dsh-users list \
+  | tail -n +2 | cut -f1 > /tmp/dsh-users.txt
+DSH_LOGIN_API_KEY='<token>' CONCURRENCY=10 HOLD_SECONDS=60 \
+  ./bin/dsh-browser-login-load.sh https://dsh.example.com /tmp/dsh-users.txt
+```
+
 ### 外部注册 API 与模型注册接口（机器对机器）
 
 配置 `DSH_REGISTER_API_KEY`（compose 环境变量，默认 `register-test-token`）后启用两个 Bearer Token 接口；不配置则完全关闭。
@@ -224,13 +233,15 @@ curl -X POST http://<主机>:20810/api/register \
 curl -X POST http://<主机>:20810/api/users/alice2/provider \
   -H "Authorization: Bearer <DSH_REGISTER_API_KEY>" \
   -H "Content-Type: application/json" \
-  -d '{"provider":{"name":"my-gateway","baseURL":"https://gateway.example.com/v1","model":"gpt-4o-mini"},
-       "apiKey":"sk-xxxx"}'
+  -d '{"provider":{"name":"my-gateway","baseURL":"https://gateway.example.com/v1"},
+       "apiKey":"sk-xxxx",
+       "image_models":["gpt-4o","qwen-vl-max"]}'
 # → 200 {"ok":true,"user":"alice2","provider":{"name":"my-gateway","baseURL":"...","model":"gpt-4o-mini","apiKeyEnv":"MY_GATEWAY_API_KEY"},"ref":"MY_GATEWAY_API_KEY"}
 ```
 
 - **严格校验**：`provider` 必填（name 限字母/数字/下划线/连字符、baseURL 必须是 http(s) URL）；`provider.api` 可选，取值 `openai-completions`（默认）/ `openai-responses` / `anthropic-messages`，必须合法否则整个设置段会被拒绝、模型不可用；`apiKey` 必填；目标用户必须存在（包括 admin）。
 - **模型自动获取**：不传 `provider.model`（或 `models` 数组）时，网关用 `apiKey` 调 `GET <baseURL>/models` 自动拉取模型列表（上限 100 个）全部写入配置；拉取失败返回 502 并提示可显式传 `model` 兜底。显式传 `model`/`models` 则跳过拉取。响应里的 `models` 即生效的模型列表。
+- **图片输入白名单**：可选的顶层 `image_models` 是模型 ID 数组（也兼容放在 `provider.image_models`）；命中的已获取模型写入 `input: [text, image]`，其余模型写入 `input: [text]`。未传时默认空数组。白名单本身不校验模型是否存在，不在本次模型列表中的条目会被保留在响应中但不会生成额外模型配置。
 - 效果：写入用户 `settings.yaml`（`llm-pi-ai.providers.<name>` OpenAI 兼容适配器 + `agent-default-model` 指向第一个模型）以及私有 `.credentials.yaml`（0600，属主仅本人）。未登录用户保持休眠，不会因为配置 provider 而启动；若实例已经运行，则只重启该用户实例使配置立即生效。
 - 重复调用 = **覆盖更新**（换 baseURL/模型/Key 都行）；返回的 `ref` 是该提供商的凭证名（`<NAME>_API_KEY`）。
 - 配置完成后用户跳过 `/setup`，登录即默认使用该提供商。
@@ -244,7 +255,7 @@ docker compose -f docker/compose.yml exec dsh-multitenant runuser -u dsh-alice -
   curl -fsS --connect-timeout 2 http://127.0.0.1:3102/ -o /dev/null
 ```
 
-第二条命令应连接失败。默认懒启动模式下镜像健康检查验证网关；活跃租户异常退出会使入口监管进程终止容器，由 Kubernetes/Docker 重启策略恢复。`DSH_LAZY_TENANTS=0` 时健康检查仍验证所有租户后端端口。该 Compose 面向单机可信网络验收，不包含公网 TLS、HA、动态扩缩容或生产密钥管理。
+第二条命令应连接失败。默认懒启动模式下镜像健康检查验证网关；活跃租户异常退出只隔离该租户并让后续请求重新触发启动，不会终止网关、其他租户或入口监管进程。核心 gateway 异常退出仍会使监管进程终止容器，由 Kubernetes/Docker 重启策略恢复。`DSH_LAZY_TENANTS=0` 时健康检查仍验证所有租户后端端口。该 Compose 面向单机可信网络验收，不包含公网 TLS、HA、动态扩缩容或生产密钥管理。
 
 ## 快速部署（概览）
 
