@@ -19,11 +19,9 @@
 
 const fs = require('fs');
 const net = require('net');
-const path = require('path');
 const readline = require('readline');
 
-const STATE_DIR = process.env.DSH_GATEWAY_STATE_DIR || '/var/lib/dsh-gateway';
-const SOCKET = process.env.DSH_CONTROL_SOCKET || path.join(STATE_DIR, 'control.sock');
+const SOCKET = process.env.DSH_CONTROL_SOCKET || '/run/dsh/control.sock';
 const CONTROL_TIMEOUT_MS = 120000;
 // Registry downloads and native dependency builds can be slow. The supervisor
 // keeps doing the installation if the client exits, so use a deliberately

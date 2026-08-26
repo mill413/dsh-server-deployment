@@ -13,15 +13,13 @@
 // remains dormant; an already-running tenant is restarted so the change is
 // applied immediately.
 //
-// The socket path is passed explicitly as the second argument because sudo
-// strips custom environment variables (env_reset).
+// The socket path is passed explicitly because sudo strips custom environment
+// variables (env_reset); every component defaults to /run/dsh/control.sock.
 
 const fs = require('fs');
 const net = require('net');
-const path = require('path');
 
-const STATE_DIR = process.env.DSH_GATEWAY_STATE_DIR || '/var/lib/dsh-gateway';
-const SOCKET = process.argv[3] || process.env.DSH_CONTROL_SOCKET || path.join(STATE_DIR, 'control.sock');
+const SOCKET = process.argv[3] || process.env.DSH_CONTROL_SOCKET || '/run/dsh/control.sock';
 
 function fail(msg, code) {
   process.stderr.write(msg + '\n');

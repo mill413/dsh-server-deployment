@@ -5,9 +5,12 @@
 // Usage: dsh-register <username> [control-socket] [provider-json]
 //                    (password on stdin)
 //        dsh-register --wake <username> [control-socket]
-//        dsh-register --sleep <username> [control-socket] [reason]
+//        dsh-register --sleep <username> [control-socket] [reason] [revoke-sessions]
 //        dsh-register --stats [control-socket]
+//        dsh-register --key-status-all [control-socket]
+//        dsh-register --du [control-socket]
 //        dsh-register --plugin-list [control-socket]
+//        dsh-register --plugin-cancel [control-socket]
 //        dsh-register --plugin-add <name> <spec> [control-socket]
 //        dsh-register --plugin-remove <name> [control-socket]
 //
@@ -20,32 +23,33 @@
 // validation and provisioning, so this helper never needs to know the password
 // beyond forwarding it once.
 //
-// The socket path is passed explicitly as the second argument because sudo
-// strips custom environment variables (env_reset); the gateway computes it
-// from its own USERS_FILE and hands it over as argv. The optional third
+// The socket path is passed explicitly because sudo strips custom environment
+// variables (env_reset); the gateway resolves DSH_CONTROL_SOCKET (defaulting
+// to /run/dsh/control.sock) and hands it over as argv. The optional third
 // argument is a JSON provider spec ({name,baseURL,model}) for the registration
 // API; the browser form omits it.
 
 const fs = require('fs');
 const net = require('net');
-const path = require('path');
 
-const STATE_DIR = process.env.DSH_GATEWAY_STATE_DIR || '/var/lib/dsh-gateway';
 const option = process.argv[2];
 const mode = option === '--wake' ? 'wake'
   : (option === '--sleep' ? 'sleep'
     : (option === '--stats' ? 'stats'
-      : (option === '--plugin-list' ? 'plugin-list'
-        : (option === '--plugin-add' ? 'plugin-add'
-          : (option === '--plugin-remove' ? 'plugin-remove' : 'add')))));
+      : (option === '--du' ? 'du'
+        : (option === '--key-status-all' ? 'key-status-all'
+          : (option === '--plugin-list' ? 'plugin-list'
+            : (option === '--plugin-cancel' ? 'plugin-cancel'
+              : (option === '--plugin-add' ? 'plugin-add'
+                : (option === '--plugin-remove' ? 'plugin-remove' : 'add'))))))));
 const helperMode = mode !== 'add';
-const noNameMode = mode === 'stats' || mode === 'plugin-list';
+const noNameMode = mode === 'stats' || mode === 'plugin-list' || mode === 'key-status-all' || mode === 'du' || mode === 'plugin-cancel';
 const name = noNameMode ? null : (helperMode ? process.argv[3] : process.argv[2]);
 const spec = mode === 'plugin-add' ? process.argv[4] : null;
 const socketArg = noNameMode ? process.argv[3]
   : (mode === 'plugin-add' ? process.argv[5] : (helperMode ? process.argv[4] : process.argv[3]));
 const SOCKET = socketArg
-  || process.env.DSH_CONTROL_SOCKET || path.join(STATE_DIR, 'control.sock');
+  || process.env.DSH_CONTROL_SOCKET || '/run/dsh/control.sock';
 // Provisioning may initialize a profile, register shared plugins and refresh
 // firewall rules before the supervisor can reply. Keep this longer than the
 // former 10-second budget so a successful slow registration is not reported
@@ -80,6 +84,9 @@ if (!helperMode) {
 
 let payload;
 if (mode === 'stats') payload = { cmd: 'stats' };
+else if (mode === 'du') payload = { cmd: 'du' };
+else if (mode === 'plugin-cancel') payload = { cmd: 'plugin-cancel' };
+else if (mode === 'key-status-all') payload = { cmd: 'key-status-all' };
 else if (mode === 'plugin-list') payload = { cmd: 'shared-plugin-list' };
 else if (mode === 'plugin-add') payload = { cmd: 'shared-plugin-add', name: name, spec: spec };
 else if (mode === 'plugin-remove') payload = { cmd: 'shared-plugin-remove', name: name };
@@ -89,7 +96,10 @@ else if (mode === 'sleep') {
     cmd: 'sleep',
     name: name,
     reason: String(process.argv[5] || 'logout').slice(0, 64),
-    revokeSessions: true,
+    // Keep the historical default for callers that omit the flag. Automatic
+    // browser-presence recycling passes 0 so stopping an idle tenant does not
+    // also invalidate an otherwise valid login cookie.
+    revokeSessions: String(process.argv[6] || '1') !== '0',
   };
 } else payload = { cmd: 'add', name: name, password: password };
 const providerRaw = helperMode ? null : process.argv[4];

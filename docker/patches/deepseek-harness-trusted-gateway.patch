@@ -29,3 +29,33 @@ diff --git a/packages/client/connection/src/client/index.ts b/packages/client/co
      hostDescription: {
        getSnapshot: () => description,
        subscribe: (listener) => {
+diff --git a/packages/attachment/attachment-local/src/store.ts b/packages/attachment/attachment-local/src/store.ts
+--- a/packages/attachment/attachment-local/src/store.ts
++++ b/packages/attachment/attachment-local/src/store.ts
+@@ -3,7 +3,7 @@
+ import { createHash, randomUUID } from 'node:crypto'
+ import { constants } from 'node:fs'
+ import { chmod, link, mkdir, open, readFile, unlink } from 'node:fs/promises'
+-import { dirname, join, parse, resolve } from 'node:path'
++import { dirname, join, resolve } from 'node:path'
+ import {
+   AttachmentError,
+   AttachmentId,
+@@ -164,12 +164,13 @@ async function ensureDurableDirectory(path: string, boundary: string): Promise<
+ /**
+- * Establish this process's proof that one DSH_HOME entry and every ancestor
+- * below the filesystem root are durable. Mere existence is insufficient: a
+- * concurrent process may have created the directory but not synced its parent.
++ * Establish this process's proof that the private DSH_HOME boundary exists.
++ * The deployment's root supervisor creates that boundary and fsyncs its 0711
++ * multi-tenant parent. A tenant may sync entries below its own 0700 home, but
++ * must never open/read the shared parent merely to fsync it.
+  */
+ async function ensureDurableHome(path: string): Promise<string> {
+   const home = resolve(path)
+   if (!durableHomes.has(home)) {
+-    await ensureDurableDirectory(home, parse(home).root)
++    await ensureDurableDirectory(home, home)
+     durableHomes.add(home)
+   }
+   return home

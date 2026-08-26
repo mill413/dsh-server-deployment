@@ -48,6 +48,8 @@ services:
       # /var/lib/dsh/gateway - one volume = one backup/cleanup unit.
       DSH_USERS_DIR: /var/lib/dsh/users
       DSH_GATEWAY_STATE_DIR: /var/lib/dsh/gateway
+      # Runtime IPC must stay outside the persistent /var/lib/dsh mount.
+      DSH_CONTROL_SOCKET: /run/dsh/control.sock
       # Runtime-installed shared bundles live in the persistent /var/lib/dsh
       # tree. Set the host variable to a JSON array of {name,spec}.
       DSH_SHARED_PLUGINS_HOME: /var/lib/dsh/shared-plugins

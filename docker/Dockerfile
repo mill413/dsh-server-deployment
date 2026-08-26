@@ -19,6 +19,7 @@ RUN useradd --system --no-create-home --shell /usr/sbin/nologin dsh-gateway \
 
 ENV DSH_USERS_DIR=/srv/dsh/users \
     DSH_GATEWAY_STATE_DIR=/var/lib/dsh-gateway \
+    DSH_CONTROL_SOCKET=/run/dsh/control.sock \
     DSH_GATEWAY_PORT=3100 \
     DSH_TENANT_PORT_BASE=3101 \
     DSH_ENABLE_REGISTER=0 \

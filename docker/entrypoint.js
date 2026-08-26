@@ -20,7 +20,7 @@ const net = require('net');
 const path = require('path');
 const { execFileSync, spawn } = require('child_process');
 const { hashPassword, verifyPassword } = require('../gateway/auth.js');
-const { hasApiKey, setApiKey, setCredential } = require('../gateway/credentials.js');
+const { hasApiKey, hasAnyApiKey, repairCredentials, setApiKey, setCredential } = require('../gateway/credentials.js');
 
 const APP_DIR = process.env.DSH_APP_DIR || '/opt/deepseek-harness';
 const USERS_DIR = process.env.DSH_USERS_DIR || '/srv/dsh/users';
@@ -29,7 +29,7 @@ const USERS_FILE = process.env.USERS_FILE || path.join(STATE_DIR, 'users.json');
 const IDENTITY_FILE = path.join(STATE_DIR, 'tenant-identities.json');
 const SECRET_FILE = process.env.SECRET_FILE || path.join(STATE_DIR, 'secret');
 const CWD_STATE_FILE = process.env.CWD_STATE_FILE || path.join(STATE_DIR, 'state-cwd.json');
-const CONTROL_SOCKET = process.env.DSH_CONTROL_SOCKET || path.join(STATE_DIR, 'control.sock');
+const CONTROL_SOCKET = process.env.DSH_CONTROL_SOCKET || '/run/dsh/control.sock';
 const DSH_BIN = process.env.DSH_DSH_BIN || path.join(APP_DIR, 'apps/cli/lib/bin.js');
 const DEPLOYMENT_PATCH = '/opt/dsh-server-deployment/docker/disable-llm-deepseek.patch.yml';
 const BETTER_SIDEBAR_PACKAGE = 'dsh-better-sidebar';
@@ -119,6 +119,14 @@ function writeAtomic(file, content, mode) {
   fs.writeFileSync(temporary, content, { mode });
   fs.renameSync(temporary, file);
   fs.chmodSync(file, mode);
+}
+
+// A tenant cannot open the shared 0711 USERS_DIR to fsync its own HOME entry.
+// The root provisioner owns that durability boundary, so sync it once when a
+// new HOME is created; attachment-local can then safely stop at DSH_HOME.
+function fsyncDirectory(directory) {
+  const fd = fs.openSync(directory, fs.constants.O_RDONLY);
+  try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
 }
 
 function searchPatchContent() {
@@ -238,11 +246,16 @@ function healRuntimeSharedFallback() {
   });
 }
 
+// The shared-plugin command currently executing (if any), so an admin cancel
+// can kill a hung pnpm install. `detached: true` makes the child a process-
+// group leader, so the kill below sweeps pnpm and its whole tree.
+let activeSharedPluginChild = null;
 function runRuntimeSharedPluginCommand(action, spec, onProgress) {
   const streamOutput = typeof onProgress === 'function';
   return new Promise((resolve, reject) => {
     const child = spawn(NODE_BIN, [DSH_BIN, 'plugin', '--profile', 'web', action, spec], {
       cwd: RUNTIME_SHARED_HOME,
+      detached: true,
       stdio: streamOutput ? ['ignore', 'pipe', 'pipe'] : 'inherit',
       env: {
         ...process.env,
@@ -252,6 +265,7 @@ function runRuntimeSharedPluginCommand(action, spec, onProgress) {
         NPM_CONFIG_UPDATE_NOTIFIER: 'false',
       },
     });
+    activeSharedPluginChild = child;
     if (streamOutput) {
       const forward = (target) => (chunk) => {
         target.write(chunk);
@@ -260,12 +274,24 @@ function runRuntimeSharedPluginCommand(action, spec, onProgress) {
       child.stdout.on('data', forward(process.stdout));
       child.stderr.on('data', forward(process.stderr));
     }
-    child.once('error', reject);
+    child.once('error', (error) => { if (activeSharedPluginChild === child) activeSharedPluginChild = null; reject(error); });
     child.once('close', (code, signal) => {
+      if (activeSharedPluginChild === child) activeSharedPluginChild = null;
       if (code === 0) resolve();
+      else if (signal === 'SIGKILL') reject(new Error('plugin operation canceled'));
       else reject(new Error(`dsh plugin ${action} failed (code=${code}, signal=${signal || 'none'})`));
     });
   });
+}
+
+function controlPluginCancel() {
+  const child = activeSharedPluginChild;
+  activeSharedPluginChild = null;
+  if (!child) return { ok: true, result: { canceled: false } };
+  try { process.kill(-child.pid, 'SIGKILL'); } catch (e) {
+    try { child.kill('SIGKILL'); } catch (e2) {}
+  }
+  return { ok: true, result: { canceled: true } };
 }
 
 function discoverRuntimeSharedPlugins() {
@@ -475,11 +501,28 @@ function providerApiKeyEnv(name) {
 // Validate an optional custom-provider spec from the registration API.
 // Returns null when absent; throws on malformed values. The API key itself is
 // NOT set here - the external caller writes it later via the key endpoint.
-// `models` is an array of model ids (a single `model` string is also accepted
+// `models` accepts legacy model-id strings and capability-aware
+// `{id,input:[text,image]}` entries (a single `model` string is also accepted
 // for convenience). `api` must be one of the pi-ai protocols (an invalid
 // protocol makes the whole llm-pi-ai settings section fail validation and the
 // route stays dormant); 'openai-completions' is the OpenAI-compatible default.
 const SUPPORTED_PROVIDER_APIS = ['openai-completions', 'openai-responses', 'anthropic-messages'];
+const SUPPORTED_MODEL_INPUTS = ['text', 'image'];
+function validateProviderModel(value, index) {
+  const source = typeof value === 'string' ? { id: value } : value;
+  if (!source || typeof source !== 'object' || Array.isArray(source)) {
+    throw new Error(`provider model ${index} must be a string or object`);
+  }
+  const id = typeof source.id === 'string' ? source.id.trim() : '';
+  if (!id || id.length > 128) throw new Error(`provider model ${index} has an invalid id`);
+  const rawInput = source.input === undefined ? ['text'] : source.input;
+  if (!Array.isArray(rawInput) || rawInput.length === 0
+      || rawInput.some((entry) => !SUPPORTED_MODEL_INPUTS.includes(entry))
+      || new Set(rawInput).size !== rawInput.length) {
+    throw new Error(`provider model ${id} input must contain unique text/image values`);
+  }
+  return { id, input: [...rawInput] };
+}
 function validateProvider(provider) {
   if (provider === undefined || provider === null) return null;
   if (typeof provider !== 'object' || Array.isArray(provider)) throw new Error('provider must be an object');
@@ -492,12 +535,11 @@ function validateProvider(provider) {
   }
   let models;
   if (Array.isArray(provider.models) && provider.models.length > 0) {
-    models = provider.models.map((m) => (typeof m === 'string' ? m.trim() : '')).filter((m) => m && m.length <= 128);
-    if (models.length === 0) throw new Error('provider models must be non-empty strings');
+    models = provider.models.map(validateProviderModel);
   } else if (typeof provider.model === 'string' && provider.model.trim() !== '') {
     const m = provider.model.trim();
     if (m.length > 128) throw new Error('provider model is too long');
-    models = [m];
+    models = [{ id: m, input: ['text'] }];
   } else {
     throw new Error('provider model(s) are required');
   }
@@ -507,7 +549,9 @@ function validateProvider(provider) {
   if (!SUPPORTED_PROVIDER_APIS.includes(api)) {
     throw new Error(`provider api must be one of: ${SUPPORTED_PROVIDER_APIS.join(', ')}`);
   }
-  return { name, baseURL, model: models[0], models, api };
+  const ids = models.map((entry) => entry.id);
+  if (new Set(ids).size !== ids.length) throw new Error('provider model ids must not contain duplicates');
+  return { name, baseURL, model: models[0].id, models, api };
 }
 
 // yq-safe YAML scalar quoting (double-quoted; JSON.stringify output is valid
@@ -517,12 +561,29 @@ function yq(v) { return JSON.stringify(String(v)); }
 // settings.yaml for a user whose account is bound to a custom provider: the
 // llm-pi-ai namespace defines the provider (OpenAI-compatible adapter), and
 // agent-default-model points at it so the web client uses it by default.
+// Suppress the web UI's first-run welcome notice for managed tenants.
+const WELCOME_NOTICE_VERSION = '2026-08-13.1';
+function ensureWelcomeNoticeAck(home, osUser) {
+  const file = path.join(home, 'settings.yaml');
+  let content = '';
+  try { content = fs.readFileSync(file, 'utf8'); } catch (e) {}
+  if (/^\s*welcomeNoticeVersion\s*:/m.test(content)) return;
+  const field = '  welcomeNoticeVersion: "' + WELCOME_NOTICE_VERSION + '"\n';
+  if (/^\s*ui-onboarding\s*:/m.test(content)) {
+    content = content.replace(/^(\s*ui-onboarding\s*:.*(?:\n|$))/m, (match, head) => head + field);
+  } else {
+    content = content.replace(/\s*$/, '\n') + 'ui-onboarding:\n' + field;
+  }
+  fs.writeFileSync(file, content, { mode: 0o644 });
+  try { execFileSync('chown', [osUser + ':' + osUser, file]); } catch (e) {}
+}
+
 function providerSettingsYaml(provider) {
   const ref = providerApiKeyEnv(provider.name);
   const lines = [
     'agent-default-model:',
     `  provider: ${provider.name}`,
-    `  model: ${yq(provider.models[0])}`,
+    `  model: ${yq(provider.models[0].id)}`,
     // No reasoningEffort: custom OpenAI-compatible models usually do not
     // declare reasoning capability, and a configured effort then fails every
     // call with UNSUPPORTED_REASONING_EFFORT. Omit it so the provider default
@@ -539,10 +600,11 @@ function providerSettingsYaml(provider) {
   ];
   for (const m of provider.models) {
     lines.push(
-      `        - id: ${yq(m)}`,
-      `          name: ${yq(m)}`,
+      `        - id: ${yq(m.id)}`,
+      `          name: ${yq(m.id)}`,
       '          contextWindow: 32768',
       '          maxTokens: 8192',
+      `          input: [${m.input.join(', ')}]`,
     );
   }
   lines.push('');
@@ -552,8 +614,10 @@ function providerSettingsYaml(provider) {
 function provisionTenant(tenant, port, uid, existing) {
   const home = path.join(USERS_DIR, tenant.name);
   const workspace = path.join(home, 'workspace');
+  const homeExisted = fs.existsSync(home);
   const osUser = ensureOsUser(tenant.name, home, uid);
   fs.mkdirSync(workspace, { recursive: true, mode: 0o700 });
+  if (!homeExisted) fsyncDirectory(USERS_DIR);
   const searchPatch = path.join(home, 'cordis.patch.yml');
   if (!fs.existsSync(searchPatch)) {
     fs.writeFileSync(searchPatch, searchPatchContent(), { mode: 0o644 });
@@ -564,9 +628,11 @@ function provisionTenant(tenant, port, uid, existing) {
     // (the API key is written afterwards by the external key endpoint).
     fs.writeFileSync(path.join(home, 'settings.yaml'), providerSettingsYaml(tenant.provider), { mode: 0o644 });
   }
+  ensureWelcomeNoticeAck(home, osUser);
   if (tenant.apiKey !== undefined) {
-    const escaped = tenant.apiKey.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
-    fs.writeFileSync(path.join(home, '.credentials.yaml'), `DEEPSEEK_API_KEY: "${escaped}"\n`, { mode: 0o600 });
+    setApiKey(USERS_DIR, tenant.name, tenant.apiKey);
+  } else {
+    if (repairCredentials(USERS_DIR, tenant.name)) console.log(`credentials repaired for tenant ${tenant.name}`);
   }
   execFileSync('chown', ['-hR', `${osUser}:${osUser}`, home]);
   fs.chmodSync(home, 0o700);
@@ -605,6 +671,8 @@ function ensurePreservedRecord(name, record, uid) {
     fs.writeFileSync(searchPatch, searchPatchContent(), { mode: 0o644 });
   }
   ensureSharedWebPluginsProfile(record.home);
+  ensureWelcomeNoticeAck(record.home, osUser);
+  if (repairCredentials(USERS_DIR, name)) console.log(`credentials repaired for tenant ${name}`);
   execFileSync('chown', ['-hR', `${osUser}:${osUser}`, record.home]);
   fs.chmodSync(record.home, 0o700);
   return { ...record, osUser, home: record.home, port: record.port };
@@ -659,15 +727,36 @@ function assignUids(tenants) {
   return identities.tenants;
 }
 
-function spawnManaged(label, command, args, options = {}) {
+function spawnManaged(label, command, args, options = {}, lifecycle = {}) {
   const child = spawn(command, args, { stdio: 'inherit', detached: true, ...options });
-  children.push({ label, child });
-  child.once('exit', (code, signal) => {
+  const managed = { label, child };
+  children.push(managed);
+  let settled = false;
+  let resolveTermination;
+  child.__dshTermination = new Promise((resolve) => { resolveTermination = resolve; });
+  const terminated = (code, signal, error) => {
+    if (settled) return;
+    settled = true;
+    const detail = { code, signal, error: error || null };
+    resolveTermination(detail);
+    const managedIndex = children.indexOf(managed);
+    if (managedIndex >= 0) children.splice(managedIndex, 1);
     if (state.stopping) return;
     if (child.__dshDeliberateStop) return;
-    console.error(`${label} exited unexpectedly (code=${code}, signal=${signal})`);
-    shutdown(1);
-  });
+    const suffix = error
+      ? `spawn failed (${error.message})`
+      : `exited unexpectedly (code=${code}, signal=${signal})`;
+    const disposition = lifecycle.fatal === false ? '; isolated without supervisor shutdown' : '';
+    console.error(`${label} ${suffix}${disposition}`);
+    if (typeof lifecycle.onUnexpectedExit === 'function') {
+      try { lifecycle.onUnexpectedExit(detail, child); } catch (hookError) {
+        console.error(`${label} exit handler failed: ${hookError.message}`);
+      }
+    }
+    if (lifecycle.fatal !== false) shutdown(1);
+  };
+  child.once('error', (error) => terminated(null, null, error));
+  child.once('exit', (code, signal) => terminated(code, signal, null));
   return child;
 }
 
@@ -743,6 +832,7 @@ function tenantArgs(record) {
   ];
   return ['-u', record.osUser, '--', 'env', ...env, NODE_BIN, DSH_BIN,
     '--profile', 'web', '--patch', DEPLOYMENT_PATCH,
+    '--no-open',
     '--host', '127.0.0.1', '--port', String(record.port)];
 }
 
@@ -753,6 +843,7 @@ function gatewayArgs() {
     `USERS_FILE=${USERS_FILE}`,
     `SECRET_FILE=${SECRET_FILE}`,
     `CWD_STATE_FILE=${CWD_STATE_FILE}`,
+    `DSH_CONTROL_SOCKET=${CONTROL_SOCKET}`,
     `USERS_DIR=${USERS_DIR}`,
     `COOKIE_SECURE=${process.env.COOKIE_SECURE || '0'}`,
     `DEEPSEEK_BASE_URL=${process.env.DEEPSEEK_BASE_URL || 'https://api.deepseek.com'}`,
@@ -803,9 +894,31 @@ function applyLoopbackGuard() {
 // ---------- tenant process lifecycle ----------
 
 function startTenant(name, record) {
-  if (state.tenants.has(name)) return;
-  const child = spawnManaged(`tenant:${name}`, 'runuser', tenantArgs(record));
-  state.tenants.set(name, { record, child });
+  const existing = state.tenants.get(name);
+  if (existing) return existing;
+  let child;
+  child = spawnManaged(`tenant:${name}`, 'runuser', tenantArgs(record), {}, {
+    fatal: false,
+    onUnexpectedExit: () => {
+      const active = state.tenants.get(name);
+      if (active && active.child === child) state.tenants.delete(name);
+    },
+  });
+  const entry = { record, child, termination: child.__dshTermination };
+  state.tenants.set(name, entry);
+  return entry;
+}
+
+function tenantTerminationError(name, detail) {
+  if (detail && detail.error) return new Error(`tenant ${name} failed to start: ${detail.error.message}`);
+  return new Error(`tenant ${name} exited during startup (code=${detail && detail.code}, signal=${detail && detail.signal})`);
+}
+
+function waitWhileTenantRunning(name, entry, operation) {
+  return Promise.race([
+    operation,
+    entry.termination.then((detail) => { throw tenantTerminationError(name, detail); }),
+  ]);
 }
 
 function stopTenant(name, timeoutMs = 8000) {
@@ -881,10 +994,10 @@ async function ensureTenantStarted(name, record) {
   if (state.tenantStarts.has(name)) return state.tenantStarts.get(name);
   if (state.tenants.has(name)) return { name, port: record.port, started: false };
   const startup = (async () => {
-    startTenant(name, record);
+    const entry = startTenant(name, record);
     try {
-      await waitForPort(record.port, 90000);
-      const ready = await waitForInstanceReady(record.port, 30000);
+      await waitWhileTenantRunning(name, entry, waitForPort(record.port, 90000));
+      const ready = await waitWhileTenantRunning(name, entry, waitForInstanceReady(record.port, 30000));
       if (!ready) throw new Error(`tenant ${name} did not finish initialization within 30 seconds`);
       console.log(`tenant ${name} started on demand at 127.0.0.1:${record.port}`);
       return { name, port: record.port, started: true };
@@ -1068,6 +1181,28 @@ function controlStats() {
   return { ok: true, result: tenantProcessStats() };
 }
 
+// Retained for explicit diagnostics; the admin user list no longer invokes it.
+let diskUsageCache = { at: 0, result: null };
+function controlDiskUsage() {
+  const now = Date.now();
+  if (diskUsageCache.result && now - diskUsageCache.at < 60000) {
+    return { ok: true, result: diskUsageCache.result };
+  }
+  const result = {};
+  for (const [name, record] of Object.entries(state.db.users)) {
+    if (!record || typeof record.home !== 'string' || !record.home) continue;
+    try {
+      const out = execFileSync('du', ['-s', '--block-size=1', record.home], { encoding: 'utf8' }).trim();
+      const bytes = Number(out.split(/\s+/)[0]);
+      result[name] = Number.isFinite(bytes) && bytes >= 0 ? bytes : null;
+    } catch (e) {
+      result[name] = null;
+    }
+  }
+  diskUsageCache = { at: now, result };
+  return { ok: true, result };
+}
+
 function controlSetKey(payload) {
   const { name, key } = payload;
   const record = state.db.users[name];
@@ -1084,7 +1219,15 @@ function controlKeyStatus(payload) {
   const { name } = payload;
   const record = state.db.users[name];
   if (!record) throw new Error(`user not found: ${name}`);
-  return { ok: true, result: { name, configured: !!record.keyConfigured } };
+  return { ok: true, result: { name, configured: hasAnyApiKey(USERS_DIR, name) } };
+}
+
+function controlKeyStatusAll() {
+  const result = {};
+  for (const name of Object.keys(state.db.users)) {
+    result[name] = hasAnyApiKey(USERS_DIR, name);
+  }
+  return { ok: true, result };
 }
 
 function controlSharedPluginList() {
@@ -1192,17 +1335,22 @@ async function handleControl(payload, onProgress = () => {}) {
     case 'del': return controlDel(payload);
     case 'list': return controlList();
     case 'stats': return controlStats();
+    case 'du': return controlDiskUsage();
     case 'set-key': return controlSetKey(payload);
     case 'key-status': return controlKeyStatus(payload);
+    case 'key-status-all': return controlKeyStatusAll();
     case 'set-provider': return controlSetProvider(payload);
     case 'shared-plugin-list': return controlSharedPluginList();
     case 'shared-plugin-add': return controlSharedPluginAdd(payload, onProgress);
     case 'shared-plugin-remove': return controlSharedPluginRemove(payload, onProgress);
+    case 'plugin-cancel': return controlPluginCancel();
     default: return { ok: false, error: `unknown command: ${payload && payload.cmd}` };
   }
 }
 
 function startControlServer() {
+  fs.mkdirSync(path.dirname(CONTROL_SOCKET), { recursive: true, mode: 0o700 });
+  fs.chmodSync(path.dirname(CONTROL_SOCKET), 0o700);
   if (fs.existsSync(CONTROL_SOCKET)) fs.unlinkSync(CONTROL_SOCKET);
   const server = net.createServer((socket) => {
     let buf = '';
@@ -1318,6 +1466,11 @@ async function main() {
   provisionAdmin(db, previousUsers, identities, used);
   state.db = db;
   saveUsersDb(db);
+  // Backfill the managed-container acknowledgement for every surviving user,
+  // including records created by an older image.
+  for (const record of Object.values(db.users)) {
+    if (record && record.home && record.osUser) ensureWelcomeNoticeAck(record.home, record.osUser);
+  }
 
   applyLoopbackGuard();
   startControlServer();
@@ -1335,9 +1488,13 @@ async function main() {
     + `(${Object.keys(db.users).join(', ')}; tenants=${LAZY_TENANTS ? 'lazy' : 'eager'})`);
 }
 
-process.once('SIGTERM', () => shutdown(0));
-process.once('SIGINT', () => shutdown(0));
-main().catch((error) => {
-  console.error(error.stack || error.message);
-  shutdown(1);
-});
+if (require.main === module) {
+  process.once('SIGTERM', () => shutdown(0));
+  process.once('SIGINT', () => shutdown(0));
+  main().catch((error) => {
+    console.error(error.stack || error.message);
+    shutdown(1);
+  });
+} else {
+  module.exports = { CONTROL_SOCKET, providerSettingsYaml, spawnManaged, validateProvider };
+}
