@@ -16,7 +16,14 @@ const USERS_FILE = process.env.USERS_FILE || '/opt/deepseek-harness/gateway/user
 const CONTROL_SOCKET = process.env.DSH_CONTROL_SOCKET || '/run/dsh/control.sock';
 const SECRET_FILE = process.env.SECRET_FILE || '/opt/deepseek-harness/gateway/secret';
 const USERS_DIR = process.env.USERS_DIR || '/opt/deepseek-harness/users';
-const SESSION_TTL = parseInt(process.env.SESSION_TTL || '43200', 10);
+const SESSION_TTL = Math.max(1, parseInt(process.env.SESSION_TTL || '43200', 10) || 43200);
+// Sliding renewal is opt-in. While a DSH page is alive its authenticated
+// presence heartbeat refreshes the cookie after this many seconds from the
+// previous issuance. Zero preserves fixed-expiry sessions.
+const SESSION_REFRESH_INTERVAL = Math.max(0, parseInt(process.env.SESSION_REFRESH_INTERVAL || '0', 10) || 0);
+if (SESSION_REFRESH_INTERVAL >= SESSION_TTL && SESSION_REFRESH_INTERVAL > 0) {
+  throw new Error('SESSION_REFRESH_INTERVAL must be less than SESSION_TTL');
+}
 const COOKIE_SECURE = (process.env.COOKIE_SECURE || '1') !== '0';
 const DEEPSEEK_BASE_URL = process.env.DEEPSEEK_BASE_URL || 'https://api.deepseek.com';
 const MAX_IP_ATTEMPTS = parseInt(process.env.MAX_IP_ATTEMPTS || '20', 10);
@@ -61,6 +68,10 @@ const registerFails = new Map();
 //   POST /api/users/<name>/provider   {provider:{name,baseURL,model},apiKey}
 //                                     -> register/replace the user's custom
 //                                        provider and write its API key
+//   POST /api/users/<name>/message    {message,sessionId?,mode?}
+//                                     -> send a prompt to the user's DSH
+//   GET  /api/users/<name>/messages   ?sessionId=... -> read message history
+//   POST /api/users/<name>/files      ?name=...&dir=... -> upload raw bytes
 // All calls require: Authorization: Bearer <DSH_REGISTER_API_KEY>.
 const REGISTER_API_TOKEN = process.env.DSH_REGISTER_API_KEY || '';
 const REGISTER_API_ENABLED = REGISTER_API_TOKEN.length > 0;
@@ -118,7 +129,13 @@ const UPLOAD_HELPER = process.env.UPLOAD_HELPER || '/opt/deepseek-harness/bin/ds
 const FILE_STAT_HELPER = process.env.FILE_STAT_HELPER || '/opt/deepseek-harness/bin/dsh-file-stat';
 const FILE_READ_HELPER = process.env.FILE_READ_HELPER || '/opt/deepseek-harness/bin/dsh-file-read';
 const FILE_LIST_HELPER = process.env.FILE_LIST_HELPER || '/opt/deepseek-harness/bin/dsh-file-list';
+const FILE_DELETE_HELPER = process.env.FILE_DELETE_HELPER || '/opt/deepseek-harness/bin/dsh-file-delete';
+const FILE_MKDIR_HELPER = process.env.FILE_MKDIR_HELPER || '/opt/deepseek-harness/bin/dsh-file-mkdir';
 const UPLOAD_MAX_MB = parseInt(process.env.UPLOAD_MAX_MB || '100', 10);
+const MESSAGE_STREAM_TIMEOUT_MS = Math.max(30000, parseInt(process.env.DSH_MESSAGE_STREAM_TIMEOUT_MS || '900000', 10) || 900000);
+const PLUGIN_TARBALL_DIR = process.env.DSH_PLUGIN_TARBALL_DIR
+  || path.join(path.dirname(USERS_FILE), 'plugin-tarballs');
+const PLUGIN_TARBALL_MAX_MB = Math.min(1024, Math.max(1, parseInt(process.env.PLUGIN_TARBALL_MAX_MB || '100', 10) || 100));
 
 // ---------- history page trimming + JSON gzip tuning ----------
 // Huge agent sessions accumulate tens of thousands of streaming chunk events
@@ -140,7 +157,10 @@ function loadSecret() {
   try {
     const s = fs.readFileSync(SECRET_FILE, 'utf8').trim();
     if (s.length >= 32) return s;
-  } catch (e) {}
+    console.error(`session secret is too short, replacing it: ${SECRET_FILE}`);
+  } catch (e) {
+    if (!e || e.code !== 'ENOENT') console.error(`cannot read session secret ${SECRET_FILE}: ${e.message}`);
+  }
   const s = crypto.randomBytes(32).toString('hex');
   try {
     fs.mkdirSync(path.dirname(SECRET_FILE), { recursive: true, mode: 0o700 });
@@ -149,6 +169,7 @@ function loadSecret() {
   return s;
 }
 const SECRET = loadSecret();
+const SECRET_ID = crypto.createHash('sha256').update(SECRET).digest('hex').slice(0, 12);
 
 function hmac(data) {
   return crypto.createHmac('sha256', SECRET).update(data).digest('base64url');
@@ -194,22 +215,28 @@ function hasKey(user) {
 // in-memory cache is refreshed immediately.
 function mutateUserStore(user, fn) {
   let db;
-  try { db = JSON.parse(fs.readFileSync(USERS_FILE, 'utf8')); }
-  catch (e) { db = { version: 1, users: {} }; }
-  if (db.users && db.users[user]) fn(db.users[user]);
+  try { db = JSON.parse(fs.readFileSync(USERS_FILE, 'utf8')); } catch (e) {
+    // Never turn a permission/read failure into an empty database write: that
+    // would erase every user while trying to update one keyConfigured flag.
+    if (!e || e.code !== 'ENOENT') console.error('users.json update read failed:', e.message);
+    return false;
+  }
+  if (!db.users || !db.users[user]) return false;
+  fn(db.users[user]);
   try {
     const tmp = USERS_FILE + '.tmp-' + process.pid + '-' + Date.now().toString(36);
     fs.writeFileSync(tmp, JSON.stringify(db, null, 2) + '\n', { mode: 0o640 });
     fs.renameSync(tmp, USERS_FILE);
-  } catch (e) { console.error('users.json write failed:', e.message); }
+  } catch (e) { console.error('users.json write failed:', e.message); return false; }
   usersCache = db;
   usersCacheAt = Date.now();
+  return true;
 }
 
 // Persist the flag and refresh the in-memory cache so the very next request
 // sees it (no 2s staleness on the /setup -> / redirect).
 function setUserKeyFlag(user, val) {
-  mutateUserStore(user, (rec) => { rec.keyConfigured = !!val; });
+  return mutateUserStore(user, (rec) => { rec.keyConfigured = !!val; });
 }
 
 // Ask the user's own DSH instance to persist the key. The instance's credentials
@@ -257,6 +284,182 @@ async function rpcCredentialSetRetry(port, ref, value, attempts = 3, delayMs = 2
 
 function rpcCredentialsSet(port, key) {
   return rpcCredentialSet(port, 'DEEPSEEK_API_KEY', key);
+}
+
+// Call one unary DSH Host RPC directly over the tenant's loopback port. This
+// is intentionally narrower than the browser reverse proxy: machine callers
+// can only reach the explicit methods used by gateway-owned API endpoints.
+function tenantRpcEnvelope(port, method, payload, timeoutMs = 30000) {
+  return new Promise((resolve, reject) => {
+    const rpcId = 'gw-api-' + Date.now().toString(36) + '-' + crypto.randomBytes(6).toString('hex');
+    const body = JSON.stringify({ type: 'client-request', rpcId, method, payload });
+    let settled = false;
+    const finish = (error, value) => {
+      if (settled) return;
+      settled = true;
+      if (error) reject(error); else resolve(value);
+    };
+    const request = http.request({
+      host: '127.0.0.1',
+      port,
+      method: 'POST',
+      path: '/api/' + method,
+      headers: {
+        'content-type': 'application/json',
+        'host': '127.0.0.1:' + port,
+        'content-length': Buffer.byteLength(body),
+      },
+    }, (response) => {
+      const chunks = [];
+      let bytes = 0;
+      response.on('data', (chunk) => {
+        bytes += chunk.length;
+        if (bytes <= 1024 * 1024) chunks.push(chunk);
+        else request.destroy(new Error('DSH RPC response is too large'));
+      });
+      response.on('end', () => {
+        const raw = Buffer.concat(chunks).toString('utf8');
+        if ((response.statusCode || 500) < 200 || (response.statusCode || 500) >= 300) {
+          return finish(new Error('DSH RPC HTTP ' + response.statusCode + ': ' + raw.slice(0, 200)));
+        }
+        let reply;
+        try { reply = JSON.parse(raw); } catch (error) {
+          return finish(new Error('invalid DSH RPC response'));
+        }
+        if (!reply || reply.rpcId !== rpcId || !reply.result || typeof reply.result.ok !== 'boolean') {
+          return finish(new Error('invalid DSH RPC envelope'));
+        }
+        finish(null, { rpcId, result: reply.result });
+      });
+      response.on('error', (error) => finish(error));
+    });
+    request.on('error', (error) => finish(error));
+    request.setTimeout(timeoutMs, () => request.destroy(new Error('DSH RPC timeout')));
+    request.end(body);
+  });
+}
+
+function tenantRpc(port, method, payload, timeoutMs = 30000) {
+  return tenantRpcEnvelope(port, method, payload, timeoutMs).then((reply) => reply.result);
+}
+
+function openTenantMux(port, onFrame) {
+  if (typeof WebSocket !== 'function') return Promise.reject(new Error('WebSocket client is unavailable in this Node runtime'));
+  return new Promise((resolve, reject) => {
+    const socket = new WebSocket('ws://127.0.0.1:' + port + '/api/events.mux');
+    let opened = false;
+    const timer = setTimeout(() => {
+      if (opened) return;
+      try { socket.close(); } catch (error) {}
+      reject(new Error('timed out opening DSH event stream'));
+    }, 10000);
+    const failOpen = (event) => {
+      if (!opened) {
+        clearTimeout(timer);
+        reject(new Error('failed to open DSH event stream' + (event && event.message ? ': ' + event.message : '')));
+      }
+    };
+    socket.addEventListener('message', (event) => {
+      try {
+        if (typeof event.data !== 'string') return;
+        const message = JSON.parse(event.data);
+        if (message && message.type === 'server-request' && message.payload) onFrame(message.payload);
+      } catch (error) {}
+    });
+    socket.addEventListener('open', () => { opened = true; clearTimeout(timer); resolve(socket); }, { once: true });
+    socket.addEventListener('error', failOpen);
+    socket.addEventListener('close', failOpen);
+  });
+}
+
+function sseWrite(res, event, value) {
+  if (res.destroyed || res.writableEnded) return false;
+  return res.write('event: ' + event + '\ndata: ' + JSON.stringify(value) + '\n\n');
+}
+
+function streamAcceptedMessage(req, res, socket, details, promptRpcId, bufferedFrames, activateConsumer) {
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream; charset=utf-8',
+    'Cache-Control': 'no-store',
+    'Connection': 'keep-alive',
+    'X-Accel-Buffering': 'no',
+  });
+  sseWrite(res, 'accepted', details);
+  return new Promise((resolve) => {
+    let finished = false;
+    let matchedPrompt = false;
+    let targetTurn = null;
+    let heartbeat = null;
+    let timeout = null;
+    const finish = (event, value) => {
+      if (finished) return;
+      finished = true;
+      if (heartbeat) clearInterval(heartbeat);
+      if (timeout) clearTimeout(timeout);
+      if (event) sseWrite(res, event, value);
+      try { socket.close(); } catch (error) {}
+      if (!res.writableEnded) res.end();
+      resolve();
+    };
+    const consume = (frame) => {
+      if (finished || !frame || frame.sessionId !== details.sessionId) return;
+      if (frame.type !== 'session/event') {
+        if (matchedPrompt && (frame.type === 'approval/requested' || frame.type === 'question/requested')) {
+          sseWrite(res, 'interaction', frame);
+        }
+        return;
+      }
+      const event = frame.event || {};
+      if (!matchedPrompt) {
+        const source = event.type === 'user/message' && event.data && event.data.source;
+        if (!source || source.rpcId !== promptRpcId) return;
+        matchedPrompt = true;
+      }
+      const eventTurn = event.data && Number.isInteger(event.data.turn) ? event.data.turn : null;
+      if (targetTurn === null && eventTurn !== null) targetTurn = eventTurn;
+      if (targetTurn !== null && eventTurn !== null && eventTurn !== targetTurn) return;
+      sseWrite(res, event.type === 'assistant/chunk' ? 'assistant.chunk'
+        : event.type === 'assistant/message' ? 'assistant.message' : 'session.event', frame);
+      if (event.type === 'turn/end') finish('done', { sessionId: details.sessionId, reason: event.data && event.data.reason, event });
+    };
+    activateConsumer(consume);
+    socket.addEventListener('error', () => finish('error', { code: 'stream-error', error: 'DSH event stream failed' }), { once: true });
+    socket.addEventListener('close', () => {
+      if (!finished) finish('error', { code: 'stream-closed', error: 'DSH event stream closed before the turn completed' });
+    }, { once: true });
+    heartbeat = setInterval(() => { if (!res.destroyed && !res.writableEnded) res.write(': keepalive\n\n'); }, 15000);
+    heartbeat.unref();
+    timeout = setTimeout(() => finish('error', { code: 'stream-timeout', error: 'timed out waiting for the DSH response' }), MESSAGE_STREAM_TIMEOUT_MS);
+    timeout.unref();
+    req.on('close', () => {
+      if (!req.complete || res.destroyed) finish(null, null);
+    });
+    res.on('close', () => { if (!res.writableEnded) finish(null, null); });
+    for (const frame of bufferedFrames) consume(frame);
+    if (details.command) finish('done', { sessionId: details.sessionId, command: details.command });
+  });
+}
+
+function messageViewsFromHistory(entries) {
+  const messages = [];
+  for (const entry of Array.isArray(entries) ? entries : []) {
+    const event = entry && entry.event;
+    if (!event || (event.type !== 'user/message' && event.type !== 'assistant/message')) continue;
+    if (event.surfaceOp !== undefined && event.surfaceOp !== 'append') continue;
+    const data = event.data || {};
+    const message = event.type === 'assistant/message' ? data.message : data;
+    messages.push({
+      seq: event.seq,
+      time: event.time,
+      role: event.type === 'assistant/message' ? 'assistant' : 'user',
+      message,
+      ...(Number.isInteger(data.turn) ? { turn: data.turn } : {}),
+      ...(Number.isInteger(data.step) ? { step: data.step } : {}),
+      ...(data.usage === undefined ? {} : { usage: data.usage }),
+      ...(data.interrupted === true ? { interrupted: true } : {}),
+    });
+  }
+  return messages;
 }
 
 // ---------- rate limiting ----------
@@ -311,21 +514,29 @@ function recordSuccess(req, username) {
 }
 
 // ---------- session ----------
-function makeToken(user) {
-  const payload = { u: user, v: pwdVersion(user), exp: Math.floor(Date.now() / 1000) + SESSION_TTL, n: crypto.randomBytes(8).toString('hex') };
+function makeToken(user, previous) {
+  const now = Math.floor(Date.now() / 1000);
+  const nonce = previous && typeof previous.n === 'string' && previous.n
+    ? previous.n
+    : crypto.randomBytes(8).toString('hex');
+  const payload = { u: user, v: pwdVersion(user), iat: now, exp: now + SESSION_TTL, n: nonce };
   const b = Buffer.from(JSON.stringify(payload)).toString('base64url');
   return b + '.' + hmac(b);
 }
-function verifyToken(tok) {
-  if (!tok || typeof tok !== 'string') return null;
+function verifyToken(tok, diagnostic) {
+  const fail = (reason) => { if (diagnostic) diagnostic.reason = reason; return null; };
+  if (!tok || typeof tok !== 'string') return fail('missing-cookie');
   const i = tok.lastIndexOf('.');
-  if (i <= 0) return null;
+  if (i <= 0) return fail('invalid-format');
   const b = tok.slice(0, i);
   const sig = tok.slice(i + 1);
-  if (!timingSafeStr(hmac(b), sig)) return null;
+  if (!timingSafeStr(hmac(b), sig)) return fail('invalid-signature');
   let p;
-  try { p = JSON.parse(Buffer.from(b, 'base64url').toString('utf8')); } catch (e) { return null; }
-  if (!p || typeof p.exp !== 'number' || Date.now() / 1000 > p.exp) return null;
+  try { p = JSON.parse(Buffer.from(b, 'base64url').toString('utf8')); } catch (e) { return fail('invalid-payload'); }
+  if (!p || typeof p.exp !== 'number') return fail('invalid-payload');
+  if (diagnostic && typeof p.u === 'string') diagnostic.user = p.u;
+  if (Date.now() / 1000 > p.exp) return fail('expired');
+  if (diagnostic) diagnostic.reason = 'verified';
   return p;
 }
 function parseCookies(req) {
@@ -342,18 +553,45 @@ function parseCookies(req) {
   return out;
 }
 function getSession(req) {
+  const diagnostic = { reason: 'missing-cookie', user: null };
+  req.__dshSessionDiagnostic = diagnostic;
   const c = parseCookies(req);
   const tok = c[COOKIE_NAME];
   if (!tok) return null;
-  const p = verifyToken(tok);
+  diagnostic.fingerprint = crypto.createHash('sha256').update(tok).digest('hex').slice(0, 12);
+  const p = verifyToken(tok, diagnostic);
   if (!p || !p.u) return null;
-  if (p.n && revokedSessionNonces.has(p.n)) return null;
-  if (!getUser(p.u)) return null;
+  if (p.n && revokedSessionNonces.has(p.n)) { diagnostic.reason = 'revoked-nonce'; return null; }
+  if (!getUser(p.u)) { diagnostic.reason = 'unknown-user'; return null; }
   // Reject tokens minted before the current password generation. Tokens
   // without a generation number are pre-migration relics: they must not
   // outlive a password reset either.
-  if ((p.v || 0) !== pwdVersion(p.u)) return null;
+  const currentVersion = pwdVersion(p.u);
+  if ((p.v || 0) !== currentVersion) {
+    diagnostic.reason = 'password-version';
+    diagnostic.tokenVersion = p.v || 0;
+    diagnostic.currentVersion = currentVersion;
+    return null;
+  }
+  diagnostic.reason = 'valid';
   return p;
+}
+
+const rejectedSessionLogs = new Map();
+function logRejectedSession(req) {
+  const diagnostic = req.__dshSessionDiagnostic;
+  if (!diagnostic || diagnostic.reason === 'missing-cookie' || diagnostic.reason === 'valid') return;
+  const now = Date.now();
+  const key = `${diagnostic.fingerprint || 'none'}:${diagnostic.reason}`;
+  if (now - (rejectedSessionLogs.get(key) || 0) < 60000) return;
+  rejectedSessionLogs.set(key, now);
+  if (rejectedSessionLogs.size > 5000) {
+    for (const [entry, at] of rejectedSessionLogs) if (now - at > 3600000) rejectedSessionLogs.delete(entry);
+  }
+  const versions = diagnostic.reason === 'password-version'
+    ? ` tokenVersion=${diagnostic.tokenVersion} currentVersion=${diagnostic.currentVersion}` : '';
+  console.warn(`${new Date().toISOString()} ${clientIp(req)} session-rejected reason=${diagnostic.reason}`
+    + ` user=${diagnostic.user || '-'} token=${diagnostic.fingerprint || '-'}${versions}`);
 }
 function cookieHeader(name, value, opts) {
   let s = name + '=' + value;
@@ -364,8 +602,15 @@ function cookieHeader(name, value, opts) {
   s += '; SameSite=' + (opts.sameSite || 'Lax');
   return s;
 }
-function setSession(res, user) {
-  res.setHeader('Set-Cookie', cookieHeader(COOKIE_NAME, makeToken(user), { maxAge: SESSION_TTL, path: '/' }));
+function sessionNeedsRefresh(session) {
+  if (SESSION_REFRESH_INTERVAL <= 0) return false;
+  // Tokens issued before sliding renewal carried no iat. Refresh a still-valid
+  // legacy token on its first successful presence heartbeat.
+  if (typeof session.iat !== 'number') return true;
+  return Math.floor(Date.now() / 1000) - session.iat >= SESSION_REFRESH_INTERVAL;
+}
+function setSession(res, user, previous) {
+  res.setHeader('Set-Cookie', cookieHeader(COOKIE_NAME, makeToken(user, previous), { maxAge: SESSION_TTL, path: '/' }));
 }
 function clearSession(res) {
   res.setHeader('Set-Cookie', cookieHeader(COOKIE_NAME, '', { maxAge: 0, path: '/' }));
@@ -667,6 +912,7 @@ function adminPage(csrf) {
     '<div class="rule"></div>',
     '<section class="plugins"><div class="section-head"><div><h2>共享插件</h2><p>安装一次并同步到所有现有及后续新增用户。</p></div><div class="section-actions"><button type="button" class="ghost" id="plugin-refresh">刷新插件</button><button type="button" class="ghost" id="toggle-plugins">折叠插件</button></div></div>',
     '<div class="plugin-form"><input id="plugin-spec" placeholder="插件 spec，例如 package@1.2.3"><input id="plugin-name" placeholder="package name（Git/file spec 时填写）"><button type="button" id="plugin-add">安装 / 升级</button></div>',
+    '<div class="plugin-upload"><input id="plugin-tarball" type="file" accept=".tgz,application/gzip,application/x-gzip"><button type="button" id="plugin-upload">上传离线包并安装</button><span>仅接受 npm pack / pnpm pack 生成的 .tgz，上限 ' + PLUGIN_TARBALL_MAX_MB + ' MB</span></div>',
     '<div class="plugin-msg" id="plugin-msg"></div>',
     '<table id="plugin-table"><thead><tr><th>插件</th><th>版本</th><th>来源</th><th>路径</th><th>操作</th></tr></thead><tbody></tbody></table>',
     '<pre id="plugin-log" hidden></pre></section>',
@@ -704,8 +950,10 @@ function adminPage(csrf) {
     'function hideCancelButton(){var c=document.getElementById("plugin-cancel");if(c)c.hidden=true;}',
     'function watchJob(id){watchedJob=id;if(jobTimer)clearTimeout(jobTimer);fetch("/__gw/admin/plugin-job?id="+encodeURIComponent(id),{credentials:"same-origin"}).then(function(r){return r.json();}).then(function(j){if(!j.ok)throw new Error(j.error||"任务不存在");var job=j.job,log=document.getElementById("plugin-log");log.hidden=false;log.textContent=job.log||"等待输出…";log.scrollTop=log.scrollHeight;pluginMessage(job.status==="running"?"插件操作进行中…":(job.status==="success"?"操作完成":"操作失败："+(job.error||"未知错误")),job.status==="error");if(job.status==="running"){showCancelButton();jobTimer=setTimeout(function(){watchJob(id);},1000);}else{hideCancelButton();watchedJob=null;pluginLoad();markUsersStale();}}).catch(function(e){pluginMessage("任务查询失败："+e.message,true);});}',
     'function pluginRun(path,body){pluginMessage("正在提交操作…",false);fetch(path,{method:"POST",credentials:"same-origin",headers:{"Content-Type":"application/json","X-DSH-Gateway-Action":"admin-plugin"},body:JSON.stringify(body)}).then(function(r){return r.json().then(function(j){if(!r.ok||!j.ok)throw new Error(j.error||("HTTP "+r.status));return j;});}).then(function(j){watchJob(j.job.id);}).catch(function(e){pluginMessage(e.message,true);});}',
+    'function pluginUpload(){var input=document.getElementById("plugin-tarball"),file=input.files&&input.files[0],button=document.getElementById("plugin-upload");if(!file){pluginMessage("请选择 .tgz 离线包",true);return;}button.disabled=true;button.textContent="上传中…";pluginMessage("正在上传 "+file.name+"…",false);fetch("/__gw/admin/plugins/upload",{method:"POST",credentials:"same-origin",headers:{"Content-Type":"application/octet-stream","X-DSH-Gateway-Action":"admin-plugin"},body:file}).then(function(r){return r.json().then(function(j){if(!r.ok||!j.ok)throw new Error(j.error||("HTTP "+r.status));return j;});}).then(function(j){document.getElementById("plugin-spec").value=j.tarball.spec;document.getElementById("plugin-name").value=j.tarball.name;pluginMessage("上传完成，正在安装 "+j.tarball.name+"…",false);pluginRun("/__gw/admin/plugins/add",{spec:j.tarball.spec,name:j.tarball.name});input.value="";}).catch(function(e){pluginMessage("离线包上传失败："+e.message,true);}).then(function(){button.disabled=false;button.textContent="上传离线包并安装";});}',
     'function pluginLoad(){fetch("/__gw/admin/plugins",{credentials:"same-origin"}).then(function(r){return r.json();}).then(function(j){if(!j.ok)throw new Error(j.error||"加载失败");var tb=document.querySelector("#plugin-table tbody");tb.innerHTML="";j.plugins.forEach(function(p){var tr=document.createElement("tr"),name=document.createElement("td"),ver=document.createElement("td"),src=document.createElement("td"),dir=document.createElement("td"),act=document.createElement("td");name.textContent=p.name;ver.textContent=p.version||"—";src.textContent=p.source==="image"?"镜像内置":"运行时共享";dir.textContent=p.dir||"—";dir.title=p.dir||"";if(p.source==="image"){act.textContent="不可移除";}else{var b=document.createElement("button");b.type="button";b.className="small danger";b.textContent="移除";b.addEventListener("click",function(){if(window.confirm("从所有用户移除插件 "+p.name+"？"))pluginRun("/__gw/admin/plugins/remove",{name:p.name});});act.appendChild(b);}tr.append(name,ver,src,dir,act);tb.appendChild(tr);});if(j.activeJob&&j.activeJob.status==="running"&&!watchedJob)watchJob(j.activeJob.id);}).catch(function(e){pluginMessage("插件列表加载失败："+e.message,true);});}',
     'document.getElementById("plugin-add").addEventListener("click",function(){var spec=document.getElementById("plugin-spec").value.trim(),name=document.getElementById("plugin-name").value.trim();if(!spec){pluginMessage("请输入插件 spec",true);return;}pluginRun("/__gw/admin/plugins/add",{spec:spec,name:name});});',
+    'document.getElementById("plugin-upload").addEventListener("click",pluginUpload);',
     'document.getElementById("plugin-refresh").addEventListener("click",pluginLoad);',
     'document.getElementById("toggle-plugins").addEventListener("click",function(){var tb=document.getElementById("plugin-table"),hidden=tb.style.display==="none";tb.style.display=hidden?"":"none";this.textContent=hidden?"折叠插件":"展开插件";});',
     'restoreUsersCache();',
@@ -724,6 +972,7 @@ function adminPage(csrf) {
     '.section-actions{display:flex;align-items:center;gap:10px}',
     '.plugin-form{display:grid;grid-template-columns:minmax(260px,2fr) minmax(200px,1fr) auto;gap:8px;align-items:center}',
     '.plugin-form input{margin:0;padding:9px 11px;font-size:13px}.plugin-form button{width:auto;margin:0;padding:9px 16px}',
+    '.plugin-upload{display:flex;align-items:center;gap:8px;margin-top:10px}.plugin-upload input{flex:1;margin:0;padding:8px 10px;font-size:12px}.plugin-upload button{width:auto;margin:0;padding:9px 16px}.plugin-upload span{color:var(--faint);font-size:11.5px}',
     '.plugin-msg{min-height:20px;margin:8px 0;color:var(--ok);font-size:12.5px}.plugin-msg.bad{color:var(--err)}',
     '#plugin-table td:nth-child(4){max-width:310px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
     '.small{width:auto;margin:0;padding:5px 11px;border-radius:8px;font-size:12px}.small.danger{background:transparent;color:var(--err);border:1px solid rgba(224,135,122,.4)}',
@@ -816,6 +1065,84 @@ function runHelper(args, opts) {
   });
 }
 
+function validUploadName(name) {
+  return !!name && name.length <= 200 && name.indexOf('\0') < 0
+    && !/[\/\\]/.test(name) && name !== '.' && name !== '..' && !name.startsWith('.')
+    && !/[\x00-\x1f\x7f]/.test(name);
+}
+
+// Stream one raw HTTP request body through the privilege-dropping upload
+// helper. Both browser and machine APIs use this exact path so size,
+// completeness and workspace-containment guarantees cannot drift apart.
+function saveUploadRequest(req, home, dirAbs, name) {
+  const limit = UPLOAD_MAX_MB * 1024 * 1024;
+  const contentLength = parseInt(req.headers['content-length'] || '', 10);
+  if (!Number.isFinite(contentLength) || contentLength < 0) {
+    return Promise.resolve({ ok: false, status: 411, detail: '缺少 Content-Length' });
+  }
+  if (contentLength > limit) {
+    return Promise.resolve({ ok: false, status: 413, detail: '文件过大（上限 ' + UPLOAD_MAX_MB + ' MB）' });
+  }
+  return new Promise((resolve) => {
+    let child;
+    try {
+      const direct = process.env.DSH_HELPER_DIRECT === '1';
+      child = spawn(direct ? UPLOAD_HELPER : 'sudo', direct ? [home, dirAbs, name] : ['-n', UPLOAD_HELPER, home, dirAbs, name], { stdio: ['pipe', 'ignore', 'pipe'] });
+    } catch (error) {
+      return resolve({ ok: false, status: 500, detail: '写入失败：' + String(error && error.message || error) });
+    }
+    let stderr = '';
+    let done = false;
+    let over = false;
+    let timedOut = false;
+    let aborted = false;
+    let reqEnded = false;
+    let paused = false;
+    let size = 0;
+    const finish = (code) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      try { child.stdin.destroy(); } catch (error) {}
+      if (over) return resolve({ ok: false, status: 413, detail: '文件过大（上限 ' + UPLOAD_MAX_MB + ' MB）' });
+      if (timedOut) return resolve({ ok: false, status: 504, detail: '上传超时' });
+      if (aborted) return resolve({ ok: false, status: 400, detail: '上传中断' });
+      if (code === 0) return resolve({ ok: true, status: 201, detail: '' });
+      if (code === 2) return resolve({ ok: false, status: 400, detail: '文件名不合法' });
+      if (code === 3) return resolve({ ok: false, status: 403, detail: '目标目录超出用户工作区' });
+      if (code === 4) return resolve({ ok: false, status: 404, detail: '目标目录不存在' });
+      if (code === 5) return resolve({ ok: false, status: 413, detail: '文件过大' });
+      if (code === 6) return resolve({ ok: false, status: 400, detail: '上传中断（数据不完整）' });
+      const firstError = stderr && stderr.split('\n')[0];
+      return resolve({ ok: false, status: 500, detail: '写入失败：' + (firstError || '未知错误') });
+    };
+    const timer = setTimeout(() => { timedOut = true; try { child.kill('SIGKILL'); } catch (error) {} }, 600000);
+    child.stderr.on('data', (chunk) => { stderr += chunk.toString('utf8'); });
+    child.on('error', () => finish(null));
+    child.on('close', (code) => finish(code));
+    child.stdin.on('error', () => {});
+    try { child.stdin.write('BYTES ' + contentLength + '\n'); } catch (error) {}
+    req.on('data', (chunk) => {
+      if (done || over) return;
+      size += chunk.length;
+      if (size > limit) {
+        over = true;
+        try { child.kill('SIGKILL'); } catch (error) {}
+        finish(null);
+        req.resume();
+        return;
+      }
+      let writable = true;
+      try { writable = child.stdin.write(chunk); } catch (error) { writable = false; }
+      if (!writable && !paused) { paused = true; req.pause(); }
+    });
+    child.stdin.on('drain', () => { if (paused && !done && !over) { paused = false; req.resume(); } });
+    req.on('end', () => { reqEnded = true; if (!done && !over) { try { child.stdin.end(); } catch (error) {} } });
+    req.on('error', () => { if (!done) { aborted = true; try { child.kill('SIGKILL'); } catch (error) {} finish(null); } });
+    req.on('close', () => { if (!done && !reqEnded) { aborted = true; try { child.kill('SIGKILL'); } catch (error) {} finish(null); } });
+  });
+}
+
 async function fetchTenantProcessStats() {
   const r = await runHelper([REGISTER_HELPER, '--stats', CONTROL_SOCKET], {
     timeoutMs: 15000,
@@ -879,6 +1206,82 @@ function inferPluginPackageName(spec) {
   const versionAt = spec.indexOf('@');
   const name = versionAt < 0 ? spec : spec.slice(0, versionAt);
   return validPluginPackageName(name) ? name : null;
+}
+
+function readPluginTarballManifest(file) {
+  return new Promise((resolve, reject) => {
+    const child = spawn('/usr/bin/tar', ['-xOzf', file, 'package/package.json'], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    const stdout = [];
+    const stderr = [];
+    let stdoutBytes = 0;
+    let stderrBytes = 0;
+    let settled = false;
+    const timer = setTimeout(() => { try { child.kill('SIGKILL'); } catch (e) {} }, 10000);
+    const finish = (error, value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (error) reject(error); else resolve(value);
+    };
+    child.stdout.on('data', (chunk) => {
+      stdoutBytes += chunk.length;
+      if (stdoutBytes <= 256 * 1024) stdout.push(chunk);
+      else { try { child.kill('SIGKILL'); } catch (e) {} }
+    });
+    child.stderr.on('data', (chunk) => {
+      stderrBytes += chunk.length;
+      if (stderrBytes <= 64 * 1024) stderr.push(chunk);
+    });
+    child.once('error', (error) => finish(error));
+    child.once('close', (code, signal) => {
+      if (stdoutBytes > 256 * 1024) return finish(new Error('plugin package.json is too large'));
+      if (code !== 0) {
+        const detail = Buffer.concat(stderr).toString('utf8').trim();
+        return finish(new Error(detail || `invalid plugin tarball (code=${code}, signal=${signal || 'none'})`));
+      }
+      let manifest;
+      try { manifest = JSON.parse(Buffer.concat(stdout).toString('utf8')); } catch (error) {
+        return finish(new Error('plugin tarball has an invalid package.json'));
+      }
+      const name = manifest && manifest.name;
+      if (!validPluginPackageName(name)) return finish(new Error('plugin tarball has an invalid package name'));
+      if (!manifest.dsh || !manifest.dsh.bundle || typeof manifest.dsh.bundle.patch !== 'string') {
+        return finish(new Error(`${name} does not declare dsh.bundle.patch`));
+      }
+      return finish(null, {
+        name,
+        version: typeof manifest.version === 'string' ? manifest.version : null,
+      });
+    });
+  });
+}
+
+async function storePluginTarball(buffer) {
+  if (!Buffer.isBuffer(buffer) || buffer.length < 2 || buffer[0] !== 0x1f || buffer[1] !== 0x8b) {
+    throw new Error('只接受 npm pack / pnpm pack 生成的 .tgz 文件');
+  }
+  await fs.promises.mkdir(PLUGIN_TARBALL_DIR, { recursive: true, mode: 0o700 });
+  await fs.promises.chmod(PLUGIN_TARBALL_DIR, 0o700);
+  const digest = crypto.createHash('sha256').update(buffer).digest('hex');
+  const finalFile = path.join(PLUGIN_TARBALL_DIR, `${digest}.tgz`);
+  const temporary = path.join(PLUGIN_TARBALL_DIR, `.upload-${process.pid}-${crypto.randomBytes(8).toString('hex')}`);
+  try {
+    await fs.promises.writeFile(temporary, buffer, { mode: 0o600, flag: 'wx' });
+    const manifest = await readPluginTarballManifest(temporary);
+    await fs.promises.rename(temporary, finalFile);
+    await fs.promises.chmod(finalFile, 0o600);
+    return {
+      ...manifest,
+      bytes: buffer.length,
+      sha256: digest,
+      spec: `file:${finalFile}`,
+    };
+  } catch (error) {
+    try { await fs.promises.unlink(temporary); } catch (cleanupError) {}
+    throw error;
+  }
 }
 
 async function fetchSharedPluginList() {
@@ -1040,7 +1443,7 @@ function stopTenantInstance(name, reason, revokeSessions = false) {
 // quits and lost networks. A short zero-tab grace avoids stopping/restarting
 // DSH during reloads. Multiple tabs and devices are coalesced per user.
 const PRESENCE_HEARTBEAT_MS = 10000;
-const PRESENCE_TTL_MS = Math.max(30000, Number(process.env.DSH_BROWSER_PRESENCE_TTL_MS || '120000'));
+const PRESENCE_TTL_MS = Math.max(30000, Number(process.env.DSH_BROWSER_PRESENCE_TTL_MS || '86400000'));
 const PRESENCE_STOP_GRACE_MS = Math.max(1000, Number(process.env.DSH_BROWSER_STOP_GRACE_MS || '5000'));
 const tenantTabs = new Map();       // user -> Map(tabId -> { at, nonce })
 const presenceNonces = new Map();   // user -> Set(session nonce)
@@ -1151,8 +1554,8 @@ function userHome(user) {
 }
 
 // In-page file-management widget injected into the SPA shell. Its trigger is
-// cloned from the native Settings row and placed above Logout + Settings, so
-// it follows the sidebar's expanded-label / collapsed-icon geometry exactly.
+// cloned from the composer permission selector and placed immediately to its
+// right, so it follows the native chip and narrow-composer behavior exactly.
 // The restrained white drawer embeds /__gw/files?embed=1 for browsing,
 // downloads and uploads; no page navigation, and ESC/backdrop/postMessage all
 // close it. No backdrop blur or gradient chrome.
@@ -1214,24 +1617,27 @@ const FILES_LINK_HTML = [
   'var x=ov.querySelector(".dshgw-x");x.addEventListener("click",shutAll);ov.addEventListener("click",function(e){if(e.target===ov)shutAll();});',
   'document.addEventListener("keydown",function(e){if(e.key==="Escape")shutAll();});',
   'window.addEventListener("message",function(e){if(e.data==="dshgw-close")shutAll();if(e.data==="dshgw-open-files")open();});',
+  'var folderIcon="<path d=\\"M1.75 4.25h4l1.25 1.5h7.25v6.5H1.75z\\" stroke=\\"currentColor\\" stroke-width=\\"1.3\\" stroke-linejoin=\\"round\\"/><path d=\\"M1.75 4.25V3h3.5l1 1.25\\" stroke=\\"currentColor\\" stroke-width=\\"1.3\\" stroke-linejoin=\\"round\\"/>";',
   'function cloneSidebarAction(settings,id,label,title,iconMarkup,onClick,popup){var button=settings.cloneNode(true);button.id=id;button.setAttribute("aria-label",label);button.setAttribute("title",title);button.removeAttribute("aria-expanded");if(popup)button.setAttribute("aria-haspopup","dialog");else button.removeAttribute("aria-haspopup");button.querySelectorAll("[data-slot]").forEach(function(node){node.removeAttribute("data-slot");});var icon=button.querySelector("svg");if(icon){while(icon.firstChild)icon.removeChild(icon.firstChild);icon.setAttribute("viewBox","0 0 16 16");icon.setAttribute("fill","none");icon.setAttribute("aria-hidden","true");icon.innerHTML=iconMarkup;}var labels=button.querySelectorAll("span");if(labels.length)labels[labels.length-1].textContent=label;button.addEventListener("click",function(){onClick(button);});return button;}',
   'function syncSidebarActions(){',
   'var slot=document.querySelector("[data-slot=\\"sidebar.settings\\"]"),settings=slot&&slot.querySelector("button"),area=slot&&slot.parentElement,foot=area&&area.parentElement;if(!settings||!area||!foot)return;',
   'var wide=!!settings.querySelector("span"),signature=String(settings.className)+"|"+(wide?"wide":"rail"),adminRequired=window.__DSH_GATEWAY_ADMIN__===true;',
-  'var admin=document.getElementById("dshgw-sidebar-admin"),files=document.getElementById("dshgw-sidebar-files"),logout=document.getElementById("dshgw-sidebar-logout");',
-  'var ordered=files&&logout&&files.parentElement===foot&&files.nextElementSibling===logout&&logout.nextElementSibling===area;',
-  'if(adminRequired)ordered=ordered&&admin&&admin.parentElement===foot&&admin.nextElementSibling===files;else ordered=ordered&&!admin;',
-  'if(ordered&&files.getAttribute("data-signature")===signature&&logout.getAttribute("data-signature")===signature&&(!adminRequired||admin.getAttribute("data-signature")===signature))return;',
-  'if(admin)admin.remove();if(files)files.remove();if(logout)logout.remove();',
+  'var staleFiles=document.getElementById("dshgw-sidebar-files"),admin=document.getElementById("dshgw-sidebar-admin"),logout=document.getElementById("dshgw-sidebar-logout");if(staleFiles)staleFiles.remove();',
+  'var ordered=logout&&logout.parentElement===foot&&logout.nextElementSibling===area;',
+  'if(adminRequired)ordered=ordered&&admin&&admin.parentElement===foot&&admin.nextElementSibling===logout;else ordered=ordered&&!admin;',
+  'if(ordered&&logout.getAttribute("data-signature")===signature&&(!adminRequired||admin.getAttribute("data-signature")===signature))return;',
+  'if(admin)admin.remove();if(logout)logout.remove();',
   'var adminIcon="<path d=\\"M2 13.5h12M3.25 13.5V6.25h9.5v7.25M5.5 6.25V3.5h5v2.75M6 9h1.25M8.75 9H10M6 11.25h1.25M8.75 11.25H10\\" stroke=\\"currentColor\\" stroke-width=\\"1.2\\" stroke-linecap=\\"round\\" stroke-linejoin=\\"round\\"/>";',
-  'var folderIcon="<path d=\\"M1.75 4.25h4l1.25 1.5h7.25v6.5H1.75z\\" stroke=\\"currentColor\\" stroke-width=\\"1.3\\" stroke-linejoin=\\"round\\"/><path d=\\"M1.75 4.25V3h3.5l1 1.25\\" stroke=\\"currentColor\\" stroke-width=\\"1.3\\" stroke-linejoin=\\"round\\"/>";',
   'var powerIcon="<path d=\\"M8 1.5v6\\" stroke=\\"currentColor\\" stroke-width=\\"1.4\\" stroke-linecap=\\"round\\"/><path d=\\"M4.25 3.5a5.25 5.25 0 1 0 7.5 0\\" stroke=\\"currentColor\\" stroke-width=\\"1.4\\" stroke-linecap=\\"round\\"/>";',
   'if(adminRequired){admin=cloneSidebarAction(settings,"dshgw-sidebar-admin","管理后台","打开用户与资源管理后台",adminIcon,function(){window.location.href="/__gw/admin";},false);admin.setAttribute("data-signature",signature);foot.insertBefore(admin,area);}',
-  'files=cloneSidebarAction(settings,"dshgw-sidebar-files","文件管理","浏览、下载与上传当前工作区的文件",folderIcon,function(){open();},true);logout=cloneSidebarAction(settings,"dshgw-sidebar-logout","退出登录","退出登录并停止当前用户的全部进程",powerIcon,function(button){window.__DSH_GATEWAY_LOGOUT__(button);},false);',
-  'files.setAttribute("data-signature",signature);logout.setAttribute("data-signature",signature);foot.insertBefore(files,area);foot.insertBefore(logout,area);',
+  'logout=cloneSidebarAction(settings,"dshgw-sidebar-logout","退出登录","退出登录并停止当前用户的全部进程",powerIcon,function(button){window.__DSH_GATEWAY_LOGOUT__(button);},false);logout.setAttribute("data-signature",signature);foot.insertBefore(logout,area);',
   '}',
-  'syncSidebarActions();',
-  'var mo=new MutationObserver(function(){syncSidebarActions();});',
+  'function findPermissionButton(){var direct=document.querySelector("button[aria-label^=\\"访问模式\\"],button[aria-label^=\\"Access mode\\"]");if(direct)return direct;var launchers=document.querySelectorAll("button[aria-haspopup=\\"listbox\\"]");for(var i=0;i<launchers.length;i++){var modes=launchers[i].nextElementSibling;if(!modes)continue;var candidate=modes.querySelector("button");if(candidate)return candidate;}return null;}',
+  'function syncComposerFileAction(){',
+  'var existing=document.getElementById("dshgw-composer-files"),permission=findPermissionButton();if(!permission){if(existing)existing.remove();return;}var anchor=permission.parentElement,target=anchor&&anchor.parentElement;if(!anchor||!target)return;var signature=String(permission.className)+"|"+String(anchor.className);if(existing&&existing.parentElement===target&&anchor.nextElementSibling===existing&&existing.getAttribute("data-signature")===signature)return;if(existing)existing.remove();var wrapper=anchor.cloneNode(false),button=permission.cloneNode(true);wrapper.id="dshgw-composer-files";wrapper.setAttribute("data-signature",signature);button.removeAttribute("disabled");button.removeAttribute("aria-expanded");button.removeAttribute("aria-controls");button.setAttribute("aria-haspopup","dialog");button.setAttribute("aria-label","文件管理");button.setAttribute("title","浏览、上传、下载和管理当前工作区文件");var labels=Array.prototype.filter.call(button.querySelectorAll("span"),function(node){return !node.hasAttribute("aria-hidden");});if(labels.length)labels[0].textContent="文件管理";var hidden=button.querySelectorAll("span[aria-hidden=\\"true\\"]");if(hidden.length){var icon=hidden[0].querySelector("svg");if(icon){while(icon.firstChild)icon.removeChild(icon.firstChild);icon.setAttribute("viewBox","0 0 16 16");icon.setAttribute("fill","none");icon.innerHTML=folderIcon;}for(var i=1;i<hidden.length;i++)hidden[i].remove();}button.addEventListener("click",open);wrapper.appendChild(button);target.insertBefore(wrapper,anchor.nextSibling);',
+  '}',
+  'syncSidebarActions();syncComposerFileAction();',
+  'var mo=new MutationObserver(function(){syncSidebarActions();syncComposerFileAction();});',
   'mo.observe(document.documentElement,{subtree:true,childList:true,attributes:true,attributeFilter:["class","style"]});',
   '})();',
   '</scr' + 'ipt>',
@@ -1578,6 +1984,7 @@ const server = http.createServer(async (req, res) => {
   const q = req.url.indexOf('?');
   const pathname = q < 0 ? req.url : req.url.slice(0, q);
   const session = getSession(req);
+  if (!session) logRejectedSession(req);
   if (session) markActive(session.u, req);
 
   if (req.method === 'GET' && STATIC_ASSETS[pathname]) {
@@ -1592,7 +1999,11 @@ const server = http.createServer(async (req, res) => {
   if (pathname === '/__gw/health') return json(res, 200, { ok: true, now: Date.now() });
 
   if (pathname === '/__gw/status') {
-    if (!session) return json(res, 401, { ok: false, user: null });
+    if (!session) return json(res, 401, {
+      ok: false,
+      user: null,
+      reason: (req.__dshSessionDiagnostic && req.__dshSessionDiagnostic.reason) || 'unknown',
+    });
     return json(res, 200, { ok: true, user: session.u, keyConfigured: hasKey(session.u) });
   }
 
@@ -1600,7 +2011,7 @@ const server = http.createServer(async (req, res) => {
   if (pathname === '/__gw/admin' || pathname === '/__gw/admin/users'
       || pathname === '/__gw/admin/plugins' || pathname === '/__gw/admin/plugin-job'
       || pathname === '/__gw/admin/plugins/add' || pathname === '/__gw/admin/plugins/remove'
-      || pathname === '/__gw/admin/plugins/cancel'
+      || pathname === '/__gw/admin/plugins/cancel' || pathname === '/__gw/admin/plugins/upload'
       || pathname === '/__gw/admin/kick') {
     const au = session && getUser(session.u);
     if (!session || !au || au.admin !== true) {
@@ -1642,6 +2053,27 @@ const server = http.createServer(async (req, res) => {
       const job = pluginJobs.get(id);
       if (!job) return json(res, 404, { ok: false, error: 'job not found' });
       return json(res, 200, { ok: true, job: publicPluginJob(job) });
+    }
+    if (pathname === '/__gw/admin/plugins/upload' && req.method === 'POST') {
+      if (req.headers['x-dsh-gateway-action'] !== 'admin-plugin') {
+        return json(res, 403, { ok: false, error: 'CSRF 校验失败' });
+      }
+      const limit = PLUGIN_TARBALL_MAX_MB * 1024 * 1024;
+      const contentLength = Number(req.headers['content-length'] || 0);
+      if (contentLength > limit) {
+        return json(res, 413, { ok: false, error: `插件离线包过大（上限 ${PLUGIN_TARBALL_MAX_MB} MB）` });
+      }
+      let body;
+      try { body = await readBodyBuf(req, limit); } catch (error) {
+        return json(res, 413, { ok: false, error: `插件离线包过大（上限 ${PLUGIN_TARBALL_MAX_MB} MB）` });
+      }
+      try {
+        const tarball = await storePluginTarball(body);
+        logLine(req, 201, `admin-plugin-upload ${tarball.name} bytes=${tarball.bytes} sha256=${tarball.sha256}`);
+        return json(res, 201, { ok: true, tarball });
+      } catch (error) {
+        return json(res, 400, { ok: false, error: error.message });
+      }
     }
     if ((pathname === '/__gw/admin/plugins/add' || pathname === '/__gw/admin/plugins/remove') && req.method === 'POST') {
       if (req.headers['x-dsh-gateway-action'] !== 'admin-plugin') {
@@ -1956,6 +2388,190 @@ const server = http.createServer(async (req, res) => {
     return json(res, 200, { ok: true, user: username, port: reply.result.port });
   }
 
+  // ---------- message history API: GET /api/users/<name>/messages ----------
+  const apiMessagesMatch = /^\/api\/users\/([A-Za-z0-9_-]{1,64})\/messages$/.exec(pathname);
+  if (apiMessagesMatch) {
+    if (req.method !== 'GET') return json(res, 405, { ok: false, error: 'method not allowed' });
+    if (!apiAuthorized(req)) return json(res, 401, { ok: false, error: 'unauthorized' });
+    const name = apiMessagesMatch[1];
+    const u = getUser(name);
+    if (!u || !u.port) return json(res, 404, { ok: false, error: 'user not found' });
+    let params;
+    try { params = new URL(req.url, 'http://gw').searchParams; } catch (error) {
+      return json(res, 400, { ok: false, error: 'invalid query string' });
+    }
+    const sessionId = String(params.get('sessionId') || '');
+    if (!sessionId || sessionId.length > 256 || /[\x00-\x1f\x7f]/.test(sessionId)) {
+      return json(res, 400, { ok: false, error: 'sessionId is required and must not exceed 256 characters' });
+    }
+    const maxMessagesRaw = params.get('maxMessages');
+    const beforeSeqRaw = params.get('beforeSeq');
+    const maxMessages = maxMessagesRaw === null ? 50 : Number(maxMessagesRaw);
+    const beforeSeq = beforeSeqRaw === null ? undefined : Number(beforeSeqRaw);
+    if (!Number.isInteger(maxMessages) || maxMessages < 1 || maxMessages > 100) {
+      return json(res, 400, { ok: false, error: 'maxMessages must be an integer from 1 to 100' });
+    }
+    if (beforeSeq !== undefined && (!Number.isInteger(beforeSeq) || beforeSeq < 0)) {
+      return json(res, 400, { ok: false, error: 'beforeSeq must be a non-negative integer' });
+    }
+    try {
+      await ensureTenantInstance(name);
+      const history = await tenantRpc(u.port, 'session.history', {
+        sessionId,
+        maxMessages,
+        ...(beforeSeq === undefined ? {} : { beforeSeq }),
+      }, 30000);
+      if (!history.ok) {
+        const rpcError = history.error || {};
+        const status = rpcError.code === 'session-not-found' ? 404 : 409;
+        return json(res, status, { ok: false, error: rpcError.message || 'history unavailable', code: rpcError.code || 'history-unavailable' });
+      }
+      const value = history.value || {};
+      const entries = Array.isArray(value.events) ? value.events : [];
+      const nextBeforeSeq = entries.length > 0 && entries[0] && entries[0].event
+        ? entries[0].event.seq : null;
+      return json(res, 200, {
+        ok: true,
+        user: name,
+        sessionId,
+        messages: messageViewsFromHistory(entries),
+        hasMore: value.hasMore === true,
+        nextBeforeSeq,
+      });
+    } catch (error) {
+      readyTenants.delete(name);
+      logLine(req, 502, 'api-messages-fail ' + name + ' ' + String(error.message).slice(0, 160));
+      return json(res, 502, { ok: false, error: 'failed to read user DSH history: ' + error.message });
+    }
+  }
+
+  // ---------- machine file upload: POST /api/users/<name>/files ----------
+  const apiFilesMatch = /^\/api\/users\/([A-Za-z0-9_-]{1,64})\/files$/.exec(pathname);
+  if (apiFilesMatch) {
+    if (req.method !== 'POST') return json(res, 405, { ok: false, error: 'method not allowed' });
+    if (!apiAuthorized(req)) return json(res, 401, { ok: false, error: 'unauthorized' });
+    const name = apiFilesMatch[1];
+    const u = getUser(name);
+    if (!u || !u.home) return json(res, 404, { ok: false, error: 'user not found' });
+    let params;
+    try { params = new URL(req.url, 'http://gw').searchParams; } catch (error) {
+      return json(res, 400, { ok: false, error: 'invalid query string' });
+    }
+    const fileName = String(params.get('name') || '');
+    if (!validUploadName(fileName)) return json(res, 400, { ok: false, error: 'invalid file name' });
+    const workspace = path.join(u.home, 'workspace');
+    const requestedDir = String(params.get('dir') || '');
+    if (requestedDir.length > 4096 || requestedDir.indexOf('\0') >= 0) {
+      return json(res, 400, { ok: false, error: 'invalid target directory' });
+    }
+    const dirAbs = path.isAbsolute(requestedDir)
+      ? path.resolve(requestedDir)
+      : path.resolve(workspace, requestedDir || '.');
+    const saved = await saveUploadRequest(req, u.home, dirAbs, fileName);
+    if (!saved.ok) return json(res, saved.status, { ok: false, error: saved.detail });
+    const target = path.join(dirAbs, fileName);
+    logLine(req, 201, 'api-upload ' + name + ' ' + path.relative(u.home, target) + ' bytes=' + req.headers['content-length']);
+    return json(res, 201, { ok: true, user: name, path: target, name: fileName, bytes: Number(req.headers['content-length']) });
+  }
+
+  // ---------- direct message API: POST /api/users/<name>/message ----------
+  // A trusted backend can enqueue or steer a text prompt without acquiring a
+  // browser session. Supplying sessionId targets an existing conversation;
+  // omitting it creates a new conversation first and returns its id.
+  const apiMessageMatch = /^\/api\/users\/([A-Za-z0-9_-]{1,64})\/message$/.exec(pathname);
+  if (apiMessageMatch) {
+    if (req.method !== 'POST') return json(res, 405, { ok: false, error: 'method not allowed' });
+    if (!apiAuthorized(req)) return json(res, 401, { ok: false, error: 'unauthorized' });
+    const name = apiMessageMatch[1];
+    const u = getUser(name);
+    if (!u || !u.port) return json(res, 404, { ok: false, error: 'user not found' });
+    let body;
+    try { body = await readJsonBody(req, 512 * 1024); } catch (error) {
+      return json(res, 400, { ok: false, error: error.message === 'payload too large' ? 'payload too large' : 'invalid JSON body' });
+    }
+    if (!body || typeof body !== 'object' || Array.isArray(body)) {
+      return json(res, 400, { ok: false, error: 'JSON body must be an object' });
+    }
+    if (typeof body.message !== 'string' || !body.message.trim()) {
+      return json(res, 400, { ok: false, error: 'message must be a non-empty string' });
+    }
+    if (body.message.length > 100000) {
+      return json(res, 400, { ok: false, error: 'message must not exceed 100000 characters' });
+    }
+    if (body.sessionId !== undefined
+        && (typeof body.sessionId !== 'string' || !body.sessionId || body.sessionId.length > 256
+          || /[\x00-\x1f\x7f]/.test(body.sessionId))) {
+      return json(res, 400, { ok: false, error: 'sessionId must be a non-empty string up to 256 characters without control characters' });
+    }
+    const mode = body.mode === undefined ? 'queue' : body.mode;
+    if (mode !== 'queue' && mode !== 'steer') {
+      return json(res, 400, { ok: false, error: 'mode must be queue or steer' });
+    }
+    if (body.stream !== undefined && typeof body.stream !== 'boolean') {
+      return json(res, 400, { ok: false, error: 'stream must be a boolean' });
+    }
+    const wantsStream = body.stream === true || /\btext\/event-stream\b/i.test(String(req.headers.accept || ''));
+    try {
+      await ensureTenantInstance(name);
+    } catch (error) {
+      logLine(req, 503, 'api-message-start-fail ' + name + ' ' + String(error.message).slice(0, 160));
+      return json(res, 503, { ok: false, error: 'failed to start user DSH: ' + error.message });
+    }
+    let streamSocket = null;
+    try {
+      let sessionId = body.sessionId;
+      const created = !sessionId;
+      if (!sessionId) {
+        const createResult = await tenantRpc(u.port, 'session.create', {}, 30000);
+        if (!createResult.ok) {
+          const rpcError = createResult.error || {};
+          logLine(req, 409, 'api-message-create-fail ' + name + ' ' + String(rpcError.code || '').slice(0, 80));
+          return json(res, 409, {
+            ok: false,
+            error: rpcError.message || 'failed to create session',
+            code: rpcError.code || 'session-create-failed',
+          });
+        }
+        sessionId = createResult.value && createResult.value.sessionId;
+        if (typeof sessionId !== 'string' || !sessionId) throw new Error('DSH returned no session id');
+      }
+      const bufferedFrames = [];
+      let frameConsumer = (frame) => { bufferedFrames.push(frame); };
+      if (wantsStream) streamSocket = await openTenantMux(u.port, (frame) => frameConsumer(frame));
+      const promptEnvelope = await tenantRpcEnvelope(u.port, 'session.prompt', {
+        sessionId,
+        mode,
+        content: [{ type: 'text', text: body.message }],
+      }, 30000);
+      const promptResult = promptEnvelope.result;
+      if (!promptResult.ok) {
+        if (streamSocket) try { streamSocket.close(); } catch (error) {}
+        const rpcError = promptResult.error || {};
+        const status = rpcError.code === 'session-not-found' ? 404 : 409;
+        logLine(req, status, 'api-message-prompt-fail ' + name + ' ' + String(rpcError.code || '').slice(0, 80));
+        return json(res, status, {
+          ok: false,
+          error: rpcError.message || 'message was not accepted',
+          code: rpcError.code || 'message-not-accepted',
+          sessionId,
+          created,
+        });
+      }
+      const details = {
+        ok: true, user: name, sessionId, created, mode, accepted: true,
+        ...(promptResult.value && promptResult.value.command ? { command: promptResult.value.command } : {}),
+      };
+      logLine(req, wantsStream ? 200 : 202, 'api-message ' + name + ' session=' + sessionId + ' mode=' + mode + ' chars=' + body.message.length + (wantsStream ? ' stream=1' : ''));
+      if (!wantsStream) return json(res, 202, details);
+      return streamAcceptedMessage(req, res, streamSocket, details, promptEnvelope.rpcId, bufferedFrames, (consumer) => { frameConsumer = consumer; });
+    } catch (error) {
+      if (streamSocket) try { streamSocket.close(); } catch (closeError) {}
+      readyTenants.delete(name);
+      logLine(req, 502, 'api-message-fail ' + name + ' ' + String(error.message).slice(0, 160));
+      return json(res, 502, { ok: false, error: 'failed to reach user DSH: ' + error.message });
+    }
+  }
+
   // ---------- model registration API: POST /api/users/<name>/provider ----------
   // Registers (or replaces) the user's custom provider AND writes its API key.
   // The supervisor writes both provider config and owner-only key. Dormant
@@ -2063,6 +2679,19 @@ const server = http.createServer(async (req, res) => {
       return json(res, 400, { ok: false, error: 'invalid presence event' });
     }
     updateTenantPresence(session, tabId, event);
+    // A close beacon must not extend authentication after the user leaves.
+    // Open/heartbeat requests are ordinary credentialed fetches, so browsers
+    // accept the renewed HttpOnly Set-Cookie response.
+    if (event !== 'close' && sessionNeedsRefresh(session)) {
+      const previousExp = session.exp;
+      const nextExp = Math.floor(Date.now() / 1000) + SESSION_TTL;
+      setSession(res, session.u, session);
+      logLine(req, 200, `session-renew ${session.u} previousExp=${previousExp} nextExp=${nextExp}`);
+      // Some reverse proxies discard response metadata on 204. Use an
+      // explicit 200 body whenever Set-Cookie carries a renewal; ordinary
+      // heartbeats that do not renew remain bodyless 204 responses below.
+      return json(res, 200, { ok: true, renewed: true, expiresAt: nextExp });
+    }
     res.writeHead(204, { 'Cache-Control': 'no-store' });
     return res.end();
   }
@@ -2140,7 +2769,7 @@ const server = http.createServer(async (req, res) => {
       if (!u || !u.port) return renderErr('账号配置异常');
       const saved = await rpcCredentialsSet(u.port, key);
       if (!saved.ok) return renderErr('写入失败：' + saved.detail);
-      setUserKeyFlag(session.u, true);
+      if (!setUserKeyFlag(session.u, true)) return renderErr('API Key 已写入，但用户状态保存失败，请联系管理员检查 users.json 权限');
       logLine(req, 200, 'set-key ' + session.u);
       return redirect(res, '/');
     }
@@ -2239,85 +2868,91 @@ const server = http.createServer(async (req, res) => {
     const name = String(q.name || '');
     if (!dir) return json(res, 400, { ok: false, error: '缺少 dir 参数' });
     const dirAbs = path.resolve(dir);
-    if (!name || name.length > 200 || name.indexOf('\0') >= 0 || /[\/\\]/.test(name) || name === '.' || name === '..' || name.startsWith('.') || /[\x00-\x1f\x7f]/.test(name)) {
+    if (!validUploadName(name)) {
       return json(res, 400, { ok: false, error: '文件名不合法' });
     }
-    // True streaming: the request body is piped straight into the root
-    // helper's stdin (which demotes to dsh-<name> before writing) with
-    // backpressure - constant memory regardless of file size. Completeness is
-    // enforced end-to-end: we require Content-Length and tell the helper the
-    // exact byte count ("BYTES <n>\n" protocol); the helper refuses to commit
-    // a short stream (exit 6), so an aborted / timed-out / oversized upload
-    // can never leave a truncated file behind.
-    const LIMIT = UPLOAD_MAX_MB * 1024 * 1024;
-    const contentLength = parseInt(req.headers['content-length'] || '', 10);
-    if (!Number.isFinite(contentLength) || contentLength < 0) return json(res, 411, { ok: false, error: '缺少 Content-Length' });
-    if (contentLength > LIMIT) return json(res, 413, { ok: false, error: '文件过大（上限 ' + UPLOAD_MAX_MB + ' MB）' });
-    let saved = { ok: false, status: 500, detail: '上传失败' };
-    {
-      const r = await new Promise((resolve) => {
-        let child;
-        try {
-          child = spawn('sudo', ['-n', UPLOAD_HELPER, home, dirAbs, name], { stdio: ['pipe', 'ignore', 'pipe'] });
-        } catch (e) { return resolve({ code: null, stderr: String((e && e.message) || e) }); }
-        let stderr = '';
-        let done = false;
-        let over = false;      // gateway-side cap tripped mid-stream (defence in depth)
-        let timedOut = false;
-        let aborted = false;
-        let reqEnded = false;
-        let paused = false;
-        let size = 0;
-        const finish = (code) => {
-          if (done) return;
-          done = true;
-          clearTimeout(timer);
-          // Close our end of the pipe so an orphaned helper (sudo killed on
-          // timeout/abort) sees EOF, verifies its byte count, and lets the
-          // EXIT trap clean the temp file.
-          try { child.stdin.destroy(); } catch (e) {}
-          resolve({ code: code, stderr: stderr, over: over, timedOut: timedOut, aborted: aborted });
-        };
-        const timer = setTimeout(() => { timedOut = true; try { child.kill('SIGKILL'); } catch (e) {} }, 600000);
-        child.stderr.on('data', (c) => { stderr += c.toString('utf8'); });
-        child.on('error', () => finish(null));
-        child.on('close', (code) => finish(code));
-        child.stdin.on('error', () => {}); // EPIPE when the helper rejected args early
-        try { child.stdin.write('BYTES ' + contentLength + '\n'); } catch (e) {}
-        req.on('data', (c) => {
-          if (done || over) return; // over: draining the remainder of a doomed body
-          size += c.length;
-          if (size > LIMIT) {
-            over = true;
-            try { child.kill('SIGKILL'); } catch (e) {}
-            finish(null);
-            req.resume();
-            return;
-          }
-          let writable = true;
-          try { writable = child.stdin.write(c); } catch (e) { writable = false; }
-          if (!writable && !paused) { paused = true; req.pause(); }
-        });
-        child.stdin.on('drain', () => { if (paused && !done && !over) { paused = false; req.resume(); } });
-        req.on('end', () => { reqEnded = true; if (!done && !over) { try { child.stdin.end(); } catch (e) {} } });
-        req.on('error', () => { if (!done) { aborted = true; try { child.kill('SIGKILL'); } catch (e) {} finish(null); } });
-        req.on('close', () => { if (!done && !reqEnded) { aborted = true; try { child.kill('SIGKILL'); } catch (e) {} finish(null); } });
-      });
-      if (r.over) saved = { ok: false, status: 413, detail: '文件过大（上限 ' + UPLOAD_MAX_MB + ' MB）' };
-      else if (r.timedOut) saved = { ok: false, status: 504, detail: '上传超时' };
-      else if (r.aborted) saved = { ok: false, status: 400, detail: '上传中断' };
-      else if (r.code === 0) saved = { ok: true, status: 200, detail: '' };
-      else if (r.code === 2) saved = { ok: false, status: 400, detail: '文件名不合法' };
-      else if (r.code === 3) saved = { ok: false, status: 403, detail: '目标目录超出你的工作区' };
-      else if (r.code === 4) saved = { ok: false, status: 404, detail: '目标目录不存在' };
-      else if (r.code === 5) saved = { ok: false, status: 413, detail: '文件过大' };
-      else if (r.code === 6) saved = { ok: false, status: 400, detail: '上传中断（数据不完整）' };
-      else saved = { ok: false, status: 500, detail: '写入失败：' + ((r.stderr && r.stderr.split('\n')[0]) ? String(r.stderr).split('\n')[0] : '未知错误') };
-    }
+    const saved = await saveUploadRequest(req, home, dirAbs, name);
     if (!saved.ok) return json(res, saved.status, { ok: false, error: saved.detail });
     const target = path.join(dirAbs, name);
     logLine(req, 200, 'upload ' + path.relative(home, target));
     return json(res, 200, { ok: true, path: target, name: name });
+  }
+
+  if (pathname === '/__gw/delete') {
+    if (req.method !== 'POST') return json(res, 405, { ok: false, error: '方法不允许' });
+    if (!session) return json(res, 401, { ok: false, error: '未登录' });
+    if (!hasKey(session.u)) return json(res, 403, { ok: false, error: '请先配置 API Key', redirect: '/setup' });
+    if (req.headers['x-dsh-gateway-action'] !== 'delete-file') {
+      return json(res, 403, { ok: false, error: 'CSRF 校验失败' });
+    }
+    const home = userHome(session.u);
+    if (!home) {
+      clearSession(res);
+      return json(res, 401, { ok: false, error: '账号不可用' });
+    }
+    let body;
+    try { body = await readJsonBody(req, 4096); } catch (error) {
+      return json(res, 400, { ok: false, error: '请求格式无效' });
+    }
+    const rawPath = typeof body.path === 'string' ? body.path : '';
+    if (!rawPath || rawPath.length > 4096 || rawPath.includes('\0')) {
+      return json(res, 400, { ok: false, error: '缺少或非法的 path 参数' });
+    }
+    const abs = path.resolve(rawPath);
+    const result = await runHelper([FILE_DELETE_HELPER, home, abs], { maxStdout: 64 * 1024, maxStderr: 64 * 1024 });
+    if (result.code === 2) return json(res, 400, { ok: false, error: '路径参数无效' });
+    if (result.code === 3) return json(res, 403, { ok: false, error: '路径超出你的工作区或不能删除根目录' });
+    if (result.code === 4) return json(res, 404, { ok: false, error: '文件或目录不存在，或当前类型不支持删除' });
+    if (result.code === 5) return json(res, 403, { ok: false, error: '不允许删除隐藏文件' });
+    if (result.code === 6) return json(res, 409, { ok: false, error: '目录不为空，不能删除' });
+    if (result.code !== 0) {
+      const detail = String(result.stderr || '').trim().split('\n')[0];
+      return json(res, 500, { ok: false, error: '删除助手不可用或执行失败' + (detail ? '：' + detail : '') });
+    }
+    let detail = {};
+    try { detail = JSON.parse(result.stdout); } catch (error) {}
+    logLine(req, 200, 'delete ' + path.relative(home, abs));
+    return json(res, 200, { ok: true, path: abs, type: detail.type || 'file' });
+  }
+
+  if (pathname === '/__gw/mkdir') {
+    if (req.method !== 'POST') return json(res, 405, { ok: false, error: '方法不允许' });
+    if (!session) return json(res, 401, { ok: false, error: '未登录' });
+    if (!hasKey(session.u)) return json(res, 403, { ok: false, error: '请先配置 API Key', redirect: '/setup' });
+    if (req.headers['x-dsh-gateway-action'] !== 'create-directory') {
+      return json(res, 403, { ok: false, error: 'CSRF 校验失败' });
+    }
+    const home = userHome(session.u);
+    if (!home) {
+      clearSession(res);
+      return json(res, 401, { ok: false, error: '账号不可用' });
+    }
+    let body;
+    try { body = await readJsonBody(req, 4096); } catch (error) {
+      return json(res, 400, { ok: false, error: '请求格式无效' });
+    }
+    const dir = typeof body.dir === 'string' ? body.dir : '';
+    const name = typeof body.name === 'string' ? body.name.trim() : '';
+    if (!dir || dir.length > 4096 || dir.includes('\0')) return json(res, 400, { ok: false, error: '目录路径无效' });
+    if (!name || name.length > 200 || name === '.' || name === '..' || name.startsWith('.')
+        || /[\\/\r\n]/.test(name) || /[\x00-\x1f\x7f]/.test(name)) {
+      return json(res, 400, { ok: false, error: '文件夹名称无效' });
+    }
+    const result = await runHelper([FILE_MKDIR_HELPER, home, path.resolve(dir), name], {
+      maxStdout: 64 * 1024,
+      maxStderr: 64 * 1024,
+    });
+    if (result.code === 2) return json(res, 400, { ok: false, error: '文件夹名称无效' });
+    if (result.code === 3) return json(res, 403, { ok: false, error: '目标目录超出你的工作区' });
+    if (result.code === 4) return json(res, 404, { ok: false, error: '目标目录不存在' });
+    if (result.code === 6) return json(res, 409, { ok: false, error: '同名文件或文件夹已经存在' });
+    if (result.code !== 0) {
+      const detail = String(result.stderr || '').trim().split('\n')[0];
+      return json(res, 500, { ok: false, error: '新建文件夹助手不可用或执行失败' + (detail ? '：' + detail : '') });
+    }
+    const target = path.join(path.resolve(dir), name);
+    logLine(req, 200, 'mkdir ' + path.relative(home, target));
+    return json(res, 200, { ok: true, path: target, name });
   }
 
   if (pathname === '/__gw/download' || pathname === '/__gw/files') {
@@ -2357,24 +2992,39 @@ const server = http.createServer(async (req, res) => {
         'Cache-Control': 'no-store',
       };
       if (size >= 0) head['Content-Length'] = String(size);
-      const child = spawn('sudo', ['-n', FILE_READ_HELPER, home, abs], { stdio: ['ignore', 'pipe', 'ignore'] });
-      let started = false;
-      child.stdout.on('data', (c) => {
-        if (!started) { res.writeHead(200, head); started = true; }
-        res.write(c);
+      // Stat already established scope, type and size. Commit the response
+      // headers exactly once, then let stream piping own the response end.
+      // ChildProcess `exit` may fire before stdout is fully drained; ending or
+      // writing an error response from that event races late `data` chunks and
+      // previously crashed the whole gateway with ERR_HTTP_HEADERS_SENT.
+      const direct = process.env.DSH_HELPER_DIRECT === '1';
+      const child = spawn(direct ? FILE_READ_HELPER : 'sudo', direct ? [home, abs] : ['-n', FILE_READ_HELPER, home, abs], {
+        stdio: ['ignore', 'pipe', 'ignore'],
       });
-      child.on('error', () => { try { res.destroy(); } catch (e) {} });
-      child.on('exit', (code) => {
-        if (!started) {
-          if (code === 3) return json(res, 403, { ok: false, error: '路径超出你的工作区' });
-          if (code === 5) return json(res, 403, { ok: false, error: '不允许下载隐藏文件' });
-          return json(res, 404, { ok: false, error: '文件不存在' });
-        }
-        res.end();
+      let childSucceeded = false;
+      let responseFinished = false;
+      let logged = false;
+      const logSuccess = () => {
+        if (logged || !childSucceeded || !responseFinished) return;
+        logged = true;
         logLine(req, 200, 'download ' + path.relative(home, abs));
+      };
+      res.writeHead(200, head);
+      child.stdout.on('error', () => { try { res.destroy(); } catch (error) {} });
+      child.stdout.pipe(res);
+      child.once('error', () => { try { res.destroy(); } catch (error) {} });
+      child.once('close', (code) => {
+        childSucceeded = code === 0;
+        if (!childSucceeded && !res.writableEnded) { try { res.destroy(); } catch (error) {} }
+        logSuccess();
       });
-      req.on('error', () => { try { child.kill(); } catch (e) {} });
-      res.on('close', () => { try { child.kill(); } catch (e) {} });
+      res.once('finish', () => { responseFinished = true; logSuccess(); });
+      req.once('error', () => { try { child.kill(); } catch (error) {} });
+      res.once('close', () => {
+        if (!res.writableEnded && child.exitCode === null && child.signalCode === null) {
+          try { child.kill(); } catch (error) {}
+        }
+      });
       return;
     }
 
@@ -2442,9 +3092,9 @@ const server = http.createServer(async (req, res) => {
     for (const e of listing.entries) {
       const p = path.join(dir, e.name);
       if (e.dir) {
-        rows.push('<a class="row" href="/__gw/files?dir=' + encodeURIComponent(p) + '"><span class="ic">&#128193;</span><span class="nm">' + esc(e.name) + '/</span><span class="sz"></span></a>');
+        rows.push('<div class="row"><a class="folder" href="/__gw/files?dir=' + encodeURIComponent(p) + '"><span class="ic">&#128193;</span><span class="nm">' + esc(e.name) + '/</span><span class="sz"></span></a><button type="button" class="del" data-delete-path="' + esc(p) + '" data-delete-kind="directory" data-delete-name="' + esc(e.name) + '">删除</button></div>');
       } else {
-        rows.push('<div class="row"><span class="ic">&#128196;</span><span class="nm">' + esc(e.name) + '</span><span class="sz">' + (e.size >= 0 ? fmtSize(e.size) : '') + '</span><a class="dl" href="/__gw/download?path=' + encodeURIComponent(p) + '">下载</a></div>');
+        rows.push('<div class="row"><span class="ic">&#128196;</span><span class="nm">' + esc(e.name) + '</span><span class="sz">' + (e.size >= 0 ? fmtSize(e.size) : '') + '</span><a class="dl" href="/__gw/download?path=' + encodeURIComponent(p) + '">下载</a><button type="button" class="del" data-delete-path="' + esc(p) + '" data-delete-kind="file" data-delete-name="' + esc(e.name) + '">删除</button></div>');
       }
     }
     const truncated = listing.truncated === true;
@@ -2455,6 +3105,7 @@ const server = http.createServer(async (req, res) => {
       '</div>',
       '<div class="crumbs">' + crumbs.join('') + '</div>',
       '<div class="upbar"><input type="file" id="upfile" multiple><button type="button" id="upbtn">上传到当前目录</button></div>',
+      '<div class="mkdirbar"><input type="text" id="mkdirname" maxlength="200" placeholder="新文件夹名称"><button type="button" id="mkdirbtn">新建文件夹</button></div>',
       '<div class="upmsg" id="upmsg"></div>',
       '<div class="list">' + (rows.length ? rows.join('') : '<p class="empty">此目录为空</p>') + '</div>',
       truncated ? '<p class="hint">目录内容过多，仅显示前 2000 项。</p>' : '',
@@ -2465,6 +3116,8 @@ const server = http.createServer(async (req, res) => {
       'function next(){if(i>=files.length){m.textContent="上传完成，正在刷新…";location.reload();return;}var file=files[i];m.textContent="上传中 "+(i+1)+"/"+files.length+"："+file.name;',
       'fetch("/__gw/upload?dir="+encodeURIComponent(dir)+"&name="+encodeURIComponent(file.name),{method:"POST",body:file}).then(function(r){return r.json().catch(function(){return {};}).then(function(j){if(!r.ok)throw new Error(j.error||("HTTP "+r.status));});}).then(function(){i++;next();}).catch(function(e){m.textContent="上传失败："+(e&&e.message?e.message:e)+"（第 "+(i+1)+" 个："+file.name+"）";});}',
       'next();});})();',
+      '(function(){var dir=' + JSON.stringify(dir).replace(/</g, '\\u003c') + ';var input=document.getElementById("mkdirname"),button=document.getElementById("mkdirbtn"),m=document.getElementById("upmsg");function create(){var name=input.value.trim();if(!name){m.textContent="请输入文件夹名称";input.focus();return;}button.disabled=true;button.textContent="创建中…";fetch("/__gw/mkdir",{method:"POST",credentials:"same-origin",headers:{"Content-Type":"application/json","X-DSH-Gateway-Action":"create-directory"},body:JSON.stringify({dir:dir,name:name})}).then(function(r){return r.json().catch(function(){return {};}).then(function(j){if(!r.ok||!j.ok)throw new Error(j.error||("HTTP "+r.status));});}).then(function(){m.textContent="文件夹已创建，正在刷新…";location.reload();}).catch(function(e){button.disabled=false;button.textContent="新建文件夹";m.textContent="创建失败："+(e&&e.message?e.message:e);});}button.addEventListener("click",create);input.addEventListener("keydown",function(e){if(e.key==="Enter"){e.preventDefault();create();}});})();',
+      '(function(){var m=document.getElementById("upmsg");Array.prototype.forEach.call(document.querySelectorAll("[data-delete-path]"),function(button){button.addEventListener("click",function(){var target=button.getAttribute("data-delete-path"),name=button.getAttribute("data-delete-name"),kind=button.getAttribute("data-delete-kind");var hint=kind==="directory"?"仅空目录可以删除。":"删除后无法从文件管理中恢复。";if(!window.confirm("确定删除“"+name+"”吗？\\n"+hint))return;button.disabled=true;button.textContent="删除中…";fetch("/__gw/delete",{method:"POST",credentials:"same-origin",headers:{"Content-Type":"application/json","X-DSH-Gateway-Action":"delete-file"},body:JSON.stringify({path:target})}).then(function(r){return r.json().catch(function(){return {};}).then(function(j){if(!r.ok||!j.ok)throw new Error(j.error||("HTTP "+r.status));});}).then(function(){m.textContent="已删除 "+name+"，正在刷新…";location.reload();}).catch(function(e){button.disabled=false;button.textContent="删除";m.textContent="删除失败："+(e&&e.message?e.message:e);});});});})();',
       '</scr' + 'ipt>',
       '<style>',
       'body{background:#f6f8fa}',
@@ -2482,10 +3135,12 @@ const server = http.createServer(async (req, res) => {
       '.list{border:1px solid #e2e8f0;border-radius:12px;overflow:hidden;max-height:52vh;overflow-y:auto;background:#fff}',
       '.row{display:flex;align-items:center;gap:10px;padding:10px 14px;font-size:14px;border-bottom:1px solid #f1f5f9;color:#1e293b;text-decoration:none}',
       '.row:last-child{border-bottom:0}.row:hover{background:#f8fafc}',
+      '.folder{display:flex;align-items:center;gap:10px;flex:1;min-width:0;color:#1e293b;text-decoration:none}',
       '.ic{width:20px;text-align:center}.nm{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
       '.sz{color:#94a3b8;font-size:12px;white-space:nowrap;font-variant-numeric:tabular-nums}',
       '.dl{color:#2563eb;text-decoration:none;font-size:12.5px;font-weight:600;white-space:nowrap;padding:5px 12px;border:1px solid #dbeafe;border-radius:8px;background:#eff6ff}',
       '.dl:hover{background:#dbeafe}',
+      '.del{color:#b42318;font-size:12.5px;font-weight:600;white-space:nowrap;padding:5px 12px;border:1px solid #fecaca;border-radius:8px;background:#fff1f2;cursor:pointer;width:auto;margin:0}.del:hover{background:#ffe4e6}.del:disabled{opacity:.6;cursor:not-allowed}',
       '.empty{color:#64748b;font-size:13px;padding:20px 14px;margin:0}',
       '.upbar{display:flex;gap:10px;align-items:center;margin-bottom:10px}',
       '.upbar input[type=file]{flex:1;width:auto;background:#f8fafc;border:1px dashed #cbd5e1;border-radius:10px;color:#64748b;font-size:12.5px;padding:9px 12px}',
@@ -2493,6 +3148,7 @@ const server = http.createServer(async (req, res) => {
       '.upbar button{margin-top:0;width:auto;padding:9px 18px;font-size:13px;font-weight:600;background:#2563eb;color:#fff;border-radius:10px}',
       '.upbar button:hover{filter:none;background:#1d4ed8}',
       '.upbar button:focus-visible{outline:2px solid #2563eb;outline-offset:2px}',
+      '.mkdirbar{display:flex;gap:10px;align-items:center;margin-bottom:10px}.mkdirbar input{flex:1;margin:0;padding:9px 12px;font-size:12.5px;background:#f8fafc;border:1px solid #cbd5e1;border-radius:10px}.mkdirbar button{margin:0;width:auto;padding:9px 18px;font-size:13px;font-weight:600;background:#fff;color:#2563eb;border:1px solid #bfdbfe;border-radius:10px}.mkdirbar button:hover{background:#eff6ff}',
       '.upmsg{font-size:12.5px;color:#64748b;margin:0 0 10px;min-height:16px}',
       '.hint{font-size:12.5px;color:#64748b;margin-top:10px}',
       (embed ? 'body{background:#fcfcfd;padding:0;align-items:stretch}' : ''),
@@ -2537,7 +3193,7 @@ const server = http.createServer(async (req, res) => {
 
 server.on('upgrade', async (req, socket, head) => {
   const session = getSession(req);
-  if (!session) { socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n'); socket.destroy(); return; }
+  if (!session) { logRejectedSession(req); socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n'); socket.destroy(); return; }
   if (!hasKey(session.u)) { socket.write('HTTP/1.1 403 Forbidden\r\n\r\n'); socket.destroy(); return; }
   const u = getUser(session.u);
   if (!u || !u.port) { socket.destroy(); return; }
@@ -2550,7 +3206,8 @@ server.on('upgrade', async (req, socket, head) => {
 });
 
 server.listen(PORT, HOST, () => {
-  console.log('dsh-gateway listening on ' + HOST + ':' + PORT);
+  console.log('dsh-gateway listening on ' + HOST + ':' + PORT
+    + ` (sessionTTL=${SESSION_TTL}s, refreshInterval=${SESSION_REFRESH_INTERVAL}s, secretId=${SECRET_ID})`);
 });
 
 // Graceful shutdown: stop accepting, let in-flight proxies/uploads finish.

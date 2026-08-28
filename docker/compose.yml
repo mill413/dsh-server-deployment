@@ -23,9 +23,17 @@ services:
       # process only after that user successfully logs in.
       DSH_LAZY_TENANTS: "1"
       # Stop a tenant after its last browser tab closes. pagehide normally
-      # stops it after 5s; a 120s heartbeat timeout covers crashes/disconnects.
+      # stops it after 5s; a 24h heartbeat timeout covers crashes/disconnects
+      # without reclaiming processes merely because a browser was suspended.
       DSH_BROWSER_STOP_GRACE_MS: "5000"
-      DSH_BROWSER_PRESENCE_TTL_MS: "120000"
+      DSH_BROWSER_PRESENCE_TTL_MS: "${DSH_BROWSER_PRESENCE_TTL_MS:-86400000}"
+      # Session cookies have a fixed lifetime unless sliding renewal is
+      # enabled. Example: TTL 5 days, refresh once per active day.
+      SESSION_TTL: "${SESSION_TTL:-43200}"
+      SESSION_REFRESH_INTERVAL: "${SESSION_REFRESH_INTERVAL:-0}"
+      # Admin-uploaded npm tarballs stay in the persistent gateway state.
+      DSH_PLUGIN_TARBALL_DIR: /var/lib/dsh/gateway/plugin-tarballs
+      PLUGIN_TARBALL_MAX_MB: "${PLUGIN_TARBALL_MAX_MB:-100}"
       # Disable the public self-service registration page/link. Administrators
       # can still provision accounts with dsh-users or the authenticated API.
       DSH_ENABLE_REGISTER: "0"
@@ -36,6 +44,9 @@ services:
       # External machine-to-machine API token (Bearer). When set, enables:
       #   POST /api/register                 {"username","password"}   -> create user
       #   POST /api/users/<name>/provider    {"provider":{"name","baseURL","model"},"apiKey"} -> register the user's custom provider + key
+      #   POST /api/users/<name>/message     {"message","sessionId?","mode?"} -> send a prompt to the user's DSH
+      #   GET  /api/users/<name>/messages    ?sessionId=... -> read message history
+      #   POST /api/users/<name>/files       ?name=...&dir=... -> upload raw file bytes
       # Unset to disable the API entirely.
       DSH_REGISTER_API_KEY: "${DSH_REGISTER_API_KEY:-register-test-token}"
       # Trusted-backend automatic login (LOCAL TEST ONLY). The backend swaps

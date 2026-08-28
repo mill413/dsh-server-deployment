@@ -8,6 +8,7 @@ RUN useradd --system --no-create-home --shell /usr/sbin/nologin dsh-gateway \
     && install -o root -g root -m 0755 /opt/dsh-server-deployment/docker/dsh-users /usr/local/libexec/dsh/ \
     && install -o root -g root -m 0755 /opt/dsh-server-deployment/docker/dsh-register /usr/local/libexec/dsh/ \
     && install -o root -g root -m 0755 /opt/dsh-server-deployment/docker/dsh-provider /usr/local/libexec/dsh/ \
+    && install -o root -g root -m 0755 /opt/dsh-server-deployment/bin/dsh-batch-register-models.sh /usr/local/libexec/dsh/ \
     && install -o root -g root -m 0755 /opt/dsh-server-deployment/bin/dsh-file-* /usr/local/libexec/dsh/ \
     && install -o root -g root -m 0755 /opt/dsh-server-deployment/bin/dsh-loopback-guard* /usr/local/libexec/dsh/ \
     && install -o root -g root -m 0440 /opt/dsh-server-deployment/docker/dsh-gateway.sudoers /etc/sudoers.d/dsh-gateway \

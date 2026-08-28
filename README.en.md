@@ -16,7 +16,7 @@ A zero-dependency Node gateway that adds a **multi-user portal** to the web fron
 - **User isolation**: each user gets a dedicated DSH instance (own port) running as a dedicated system account `dsh-<name>`, with `DSH_HOME` pointing to their 0700 private directory; `userctl.js` provisions / re-passwords / deletes accounts and preloads keys with a single command.
 - **Per-user API keys**: users without a key are guided to `/setup` after login; the key is written via loopback RPC into that user's private `.credentials.yaml` (0600, owned only by them).
 - **Loopback privileged-endpoint fix**: the gateway presents `Host: 127.0.0.1:<port>` to the backend and strips browser trust markers, so DSH's loopback-pinned privileged endpoints (settings / credentials / agentPreset, …) keep working behind public HTTPS access.
-- **Delivery file drawer (file management)**: its trigger sits at the bottom of the left sidebar above Logout and Settings, cloning the Settings row style; expanded shows icon + label and the collapsed rail shows only the same-sized icon. It opens a white embedded browser for directory listing, downloads (attachment + non-ASCII filenames), and multi-file uploads (100 MB limit), automatically locating the current conversation's working directory from session RPC traces.
+- **Delivery file drawer (file management)**: its trigger sits immediately to the right of the permission selector in the composer tool row, cloning that native chip and its narrow-layout collapse; the sidebar no longer carries a file action. It opens a white embedded browser for directory listing, downloads (attachment + non-ASCII filenames), multi-file uploads (100 MB limit), one-level folder creation, and deletion of regular files/symlinks or empty directories, automatically locating the current conversation's working directory from session RPC traces. Deletion requires confirmation; hidden paths, the workspace root, out-of-scope paths, and non-empty directories are refused.
 - **Security boundary**: all user-file access goes through fixed-path sudo helper scripts — root only validates arguments and drops privileges; file operations execute as the `dsh-<name>` user itself (fixing the issue #1 TOCTOU race). The gateway process has zero permissions on user directories; hidden files (including `.credentials.yaml`) cannot be downloaded; the SPA injection respects `prefers-reduced-motion` and contains no glassmorphism / gradient decoration.
 
 ## Architecture
@@ -115,11 +115,13 @@ Behavior notes:
 - `dsh-users` shares the same user store as the gateway: a new user can log in immediately (gateway cache refreshes within at most 2s).
 - Passwords must be at least 8 characters; `passwd` immediately invalidates all of the user's issued sessions.
 - `DSH_LAZY_TENANTS=1` is the default: provisioning creates the OS account, private HOME, port record, shared-plugin links and firewall rule without spawning DSH. The gateway starts and waits for that user's instance after the first successful login. It runs until logout/browser-presence recycling or container restart. Set `DSH_LAZY_TENANTS=0` to restore eager startup.
-- Proxied DSH pages place Logout directly above Settings in the left sidebar, cloning the Settings row's styling and state: icon plus label when expanded, icon only on the collapsed rail. Manual logout persistently revokes all issued sessions for that user, stops the tenant process group, then kills any escaped process owned by that tenant's unique OS UID; the user's HOME and files are untouched. Per-tab heartbeats track browser presence: closing the last tab recycles the tenant process after a 5-second reload grace, while one tab closing among several does not. Crashes/disconnects fall back to a 120-second heartbeat timeout. Automatic recycling manages only process lifetime and preserves the login cookie, so the next request can wake the tenant with the existing session. Only manual logout, an administrator kick, or a password change revokes sessions. Tune the recycle timers with `DSH_BROWSER_STOP_GRACE_MS` and `DSH_BROWSER_PRESENCE_TTL_MS`.
+- Proxied DSH pages place Logout directly above Settings in the left sidebar, cloning the Settings row's styling and state: icon plus label when expanded, icon only on the collapsed rail. Manual logout persistently revokes all issued sessions for that user, stops the tenant process group, then kills any escaped process owned by that tenant's unique OS UID; the user's HOME and files are untouched. Per-tab heartbeats track browser presence: closing the last tab recycles the tenant process after a 5-second reload grace, while one tab closing among several does not. Crashes/disconnects fall back to a 24-hour heartbeat timeout. Automatic recycling manages only process lifetime and preserves the login cookie, so the next request can wake the tenant with the existing session. Set `SESSION_REFRESH_INTERVAL` (seconds) to renew valid sessions on active heartbeats; zero disables sliding renewal. For example, `SESSION_TTL=432000` with `SESSION_REFRESH_INTERVAL=86400` gives each cookie five days and refreshes it once per active day. Only manual logout, an administrator kick, or a password change revokes sessions. Tune process recycling with `DSH_BROWSER_STOP_GRACE_MS` and `DSH_BROWSER_PRESENCE_TTL_MS`.
 
 ### Persistent shared Web plugins (no Dockerfile change)
 
 For day-to-day installation, use `dsh-users plugin add <spec>` inside the container. The supervisor installs arbitrary DSH bundles under `/var/lib/dsh/shared-plugins`, enables dependency lifecycle scripts by default, then synchronizes shared `link:` dependencies and symlinks into every existing tenant and restarts only tenant DSH processes. Runtime-created tenants receive the same synchronization before their process starts. The shared root lives in the `/var/lib/dsh` persistent volume, so later Pod recreations validate install receipts and skip completed npm installs. Only install trusted plugins because their installation scripts run with container root privileges.
+
+The admin console can also upload `.tgz` archives produced by `npm pack` or `pnpm pack`. The gateway validates `package/package.json`, reads the real package name and `dsh.bundle.patch` declaration, stores the archive by its SHA-256 under the persistent `gateway/plugin-tarballs/` directory, and automatically submits the shared installation job. The default limit is 100 MB (`PLUGIN_TARBALL_MAX_MB`); override the directory with `DSH_PLUGIN_TARBALL_DIR`. A tarball is fully offline only when it contains everything it needs, or when the container's pnpm store/internal registry can supply its dependencies.
 
 The command streams pnpm download/build and tenant synchronization progress to the current terminal. Configure an internal registry in the shared installation home (a normal `npm config set registry` writes `/root/.npmrc`, which this isolated installation home does not read):
 
@@ -185,9 +187,9 @@ DSH_LOGIN_API_KEY='<token>' CONCURRENCY=10 HOLD_SECONDS=60 \
   ./bin/dsh-browser-login-load.sh https://dsh.example.com /tmp/dsh-users.txt
 ```
 
-### External registration API & model registration (machine-to-machine)
+### External registration, model configuration, and messaging (machine-to-machine)
 
-Setting `DSH_REGISTER_API_KEY` (compose env var, default `register-test-token`) enables two Bearer-token endpoints; leaving it unset disables them entirely.
+Setting `DSH_REGISTER_API_KEY` (compose env var, default `register-test-token`) enables the following Bearer-token endpoints; leaving it unset disables them entirely.
 
 **① Create a user (account only, no provider)** `POST /api/register`
 
@@ -221,6 +223,67 @@ curl -X POST http://<host>:20810/api/users/alice2/provider \
 - Re-calling the endpoint **replaces** the provider config and key (change baseURL/model/key anytime). The returned `ref` is the provider's credential name (`<NAME>_API_KEY`).
 - Once configured, the user skips `/setup` and the provider is the default on login.
 
+**③ Send a message directly** `POST /api/users/<username>/message`
+
+Omit `sessionId` to create a new conversation and deliver the prompt:
+
+```bash
+curl -X POST http://<host>:20810/api/users/alice2/message \
+  -H "Authorization: Bearer <DSH_REGISTER_API_KEY>" \
+  -H "Content-Type: application/json" \
+  -d '{"message":"Inspect the current workspace and summarize uncommitted changes"}'
+# → 202 {"ok":true,"user":"alice2","sessionId":"...","created":true,"mode":"queue","accepted":true}
+```
+
+Pass `sessionId` to address an existing conversation. `mode` defaults to `queue` (after the current turn); use `steer` to inject the prompt into a running turn:
+
+```bash
+curl -X POST http://<host>:20810/api/users/alice2/message \
+  -H "Authorization: Bearer <DSH_REGISTER_API_KEY>" \
+  -H "Content-Type: application/json" \
+  -d '{"sessionId":"<session ID>","mode":"steer","message":"Handle the production alert first"}'
+```
+
+Pass `stream:true` (or `Accept: text/event-stream`) to receive the response as SSE:
+
+```bash
+curl -N -X POST http://<host>:20810/api/users/alice2/message \
+  -H "Authorization: Bearer <DSH_REGISTER_API_KEY>" \
+  -H "Content-Type: application/json" \
+  -H "Accept: text/event-stream" \
+  -d '{"sessionId":"<session ID>","message":"Continue the analysis and give a conclusion","stream":true}'
+```
+
+The stream starts with `accepted`, emits `session.event` / `assistant.chunk` / `assistant.message`, and ends with `done`; failures end with `error`. The gateway subscribes to DSH before submitting the prompt and correlates the turn by that prompt's `rpcId`, preventing output from older queued prompts from being attributed to this request. Streams default to a 15-minute timeout, configurable through `DSH_MESSAGE_STREAM_TIMEOUT_MS`.
+
+- The target user must exist. A dormant DSH tenant is started on demand. Non-streaming HTTP `202` means DSH accepted the prompt, not that the model has completed the turn.
+- `message` must be a non-empty string of at most 100000 characters. `sessionId` is optional and capped at 256 characters; `mode` is either `queue` or `steer`.
+- DSH admission failures include its error code. Unknown users or sessions return `404`; tenant startup or loopback RPC failures return `502/503`.
+- This endpoint can cause the target user's agent to execute tools. Keep `DSH_REGISTER_API_KEY` on trusted backends only; never expose it to browser code.
+
+**④ List messages** `GET /api/users/<username>/messages`
+
+```bash
+curl 'http://<host>:20810/api/users/alice2/messages?sessionId=<sessionID>&maxMessages=50' \
+  -H "Authorization: Bearer <DSH_REGISTER_API_KEY>"
+# → {"ok":true,"sessionId":"...","messages":[...],"hasMore":false,"nextBeforeSeq":1}
+```
+
+`messages` contains finalized user/assistant messages and their structured content. `maxMessages` ranges from 1 to 100. When `hasMore=true`, pass `nextBeforeSeq` back as `beforeSeq` to page backward.
+
+**⑤ Upload a file** `POST /api/users/<username>/files`
+
+The request body is the raw file. Put its filename in the `name` query parameter; optional `dir` defaults to the user's `workspace/`, and relative directories resolve below that root:
+
+```bash
+curl -X POST 'http://<host>:20810/api/users/alice2/files?name=report.pdf&dir=deliverables' \
+  -H "Authorization: Bearer <DSH_REGISTER_API_KEY>" \
+  -H "Content-Type: application/octet-stream" \
+  --data-binary @report.pdf
+```
+
+This endpoint reuses the browser file manager's privilege-dropping helper and completeness protocol. It requires `Content-Length`, defaults to a 100 MB limit, writes only inside the target user's workspace, and rejects hidden filenames, traversal, and incomplete requests.
+
 From the host, verify that Alice can reach her instance but cannot reach Bob's:
 
 ```bash
@@ -241,7 +304,7 @@ The second command must fail to connect. In the default lazy mode, an active ten
    ```bash
    install -o root -g root -m 0755 bin/dsh-file-* /opt/deepseek-harness/bin/
    # /etc/sudoers.d/dsh-upload:
-   # <service-account> ALL=(root) NOPASSWD: /opt/deepseek-harness/bin/dsh-file-put, /opt/deepseek-harness/bin/dsh-file-stat, /opt/deepseek-harness/bin/dsh-file-read, /opt/deepseek-harness/bin/dsh-file-list
+   # <service-account> ALL=(root) NOPASSWD: /opt/deepseek-harness/bin/dsh-file-put, /opt/deepseek-harness/bin/dsh-file-stat, /opt/deepseek-harness/bin/dsh-file-read, /opt/deepseek-harness/bin/dsh-file-list, /opt/deepseek-harness/bin/dsh-file-delete, /opt/deepseek-harness/bin/dsh-file-mkdir
    ```
 
    After upgrades or for self-checks, verify the helpers on the server against this checklist (replace `<user>` with a real username):
@@ -252,6 +315,8 @@ The second command must fail to connect. In the default lazy mode, an active ten
    printf 'BYTES 6\nhello\n' | sudo -n /opt/deepseek-harness/bin/dsh-file-put "$H" "$H/workspace" t.txt   # v2 length protocol; short streams exit=6 and are NOT committed
    sudo -n /opt/deepseek-harness/bin/dsh-file-stat  "$H" "$H/workspace/t.txt"   # prints 6
    sudo -n /opt/deepseek-harness/bin/dsh-file-read  "$H" "$H/workspace/t.txt"   # prints hello
+   sudo -n /opt/deepseek-harness/bin/dsh-file-delete "$H" "$H/workspace/t.txt"  # deletes a regular file
+   sudo -n /opt/deepseek-harness/bin/dsh-file-mkdir "$H" "$H/workspace" reports # creates one folder level
    sudo -n /opt/deepseek-harness/bin/dsh-file-read  "$H" /etc/passwd; echo "exit=$?"  # exit=3 (out-of-scope denied)
    ps -ef | grep -E 'runuser.*dsh-'                                  # child processes should be dsh-<user>, not root
    ```
@@ -266,8 +331,9 @@ The second command must fail to connect. In the default lazy mode, an active ten
 | `DSH_BASE_DIR` | installation prefix userctl / dsh-users.sh derives paths from | `/opt/deepseek-harness` |
 | `DSH_USERS_DIR`, `DSH_USERS_FILE`, `DSH_SETTINGS_SRC`, `DSH_NODE_BIN`, `DSH_DSH_BIN` | fine-grained userctl overrides | derived from BASE_DIR |
 | `USERS_FILE`, `SECRET_FILE`, `USERS_DIR` | gateway | `/opt/deepseek-harness/...` |
-| `UPLOAD_HELPER`, `FILE_STAT_HELPER`, `FILE_READ_HELPER`, `FILE_LIST_HELPER` | absolute paths of helpers called by the gateway | `/opt/deepseek-harness/bin/dsh-file-*` (**if you customize the prefix you MUST update sudoers and these four variables in sync**) |
-| `HOST`, `PORT`, `SESSION_TTL`, `COOKIE_SECURE`, `DEEPSEEK_BASE_URL`, `UPLOAD_MAX_MB`, `MAX_IP_ATTEMPTS`, `MAX_USER_ATTEMPTS`, `WINDOW_MS`, `LOCK_MS` | gateway | see `gateway/server.js` |
+| `UPLOAD_HELPER`, `FILE_STAT_HELPER`, `FILE_READ_HELPER`, `FILE_LIST_HELPER`, `FILE_DELETE_HELPER`, `FILE_MKDIR_HELPER` | absolute paths of helpers called by the gateway | `/opt/deepseek-harness/bin/dsh-file-*` (**if you customize the prefix you MUST update sudoers and these six variables in sync**) |
+| `HOST`, `PORT`, `SESSION_TTL`, `SESSION_REFRESH_INTERVAL`, `DSH_MESSAGE_STREAM_TIMEOUT_MS`, `COOKIE_SECURE`, `DEEPSEEK_BASE_URL`, `UPLOAD_MAX_MB`, `DSH_PLUGIN_TARBALL_DIR`, `PLUGIN_TARBALL_MAX_MB`, `MAX_IP_ATTEMPTS`, `MAX_USER_ATTEMPTS`, `WINDOW_MS`, `LOCK_MS` | gateway | `SESSION_TTL` defaults to 43200 seconds; `SESSION_REFRESH_INTERVAL` defaults to 0; message streams time out after 900000 ms by default; plugin tarballs default to the gateway state directory with a 100 MB limit; see `gateway/server.js` for the rest |
+| `DSH_REGISTER_API_KEY` | gateway machine API: user registration, model configuration, direct messaging | disabled by default; use a strong random value and inject it into trusted backends only |
 | `DSH_LOGIN_API_KEY`, `LOGIN_TICKET_TTL` | gateway external login | disabled by default; tickets default to 60s |
 
 `bin/dsh-users.sh` and `bin/dsh-file-list` locate themselves relative to their own path: any checkout directory works as-is (`dsh-users.sh` auto-re-privileges to root on first call; node resolves relative to the script location, falling back to `PATH`). When using a custom installation prefix, generate the systemd units with the `sed` command above; the gateway systemd unit also supports `EnvironmentFile=-/etc/default/dsh-gateway` for injecting the environment variables above in one place.
@@ -277,15 +343,17 @@ The second command must fail to connect. In the default lazy mode, an active ten
 - **Auto-location**: the gateway sniffs proxied traffic for `session.history` (opening a session) and `session.list` (cwd per session), remembers the current conversation directory and persists it to `state-cwd.json`; opening "文件管理" lists that directory (falling back to the workspace if it no longer exists).
 - **Embedding & closing**: the drawer is embedded as a same-origin iframe (`X-Frame-Options: SAMEORIGIN`); the in-page "back to app" control detects the iframe environment at runtime and sends `postMessage('dshgw-close')` to close the drawer instead of navigating, preventing nested drawers.
 - **Uploads**: raw-byte body `POST /__gw/upload?dir=&name=`; the helper drops privileges to `dsh-<name>` before writing (root only validates arguments), so file ownership is naturally the user's own; same-name files are overwritten; over-limit uploads get 413.
+- **Deletion**: `POST /__gw/delete` requires the same-origin custom action header and a JSON path; the helper drops privileges before deleting a regular file, symlink, or empty directory. Hidden paths, the workspace root, out-of-scope paths, and non-empty directories are refused, and the UI asks for confirmation.
+- **Folder creation**: `POST /__gw/mkdir` accepts the current directory and one folder name; the helper drops privileges and creates one visible level inside the workspace. It does not create missing parents, and an existing target returns 409.
 
 ## Security notes
 
 - **Install-tree integrity (the most critical item)**: the entire `/opt/deepseek-harness` tree — including the DSH monorepo sources (`packages/`, `apps/`, `node_modules/`) and the `.agents/` skill library — must carry no group/other write bits. All tenant instances **share and execute** this code, so any writable point is a cross-tenant injection vector (modify shared code or skill files → execute as another tenant → steal their API key). After every deploy/upgrade, self-check: `find /opt/deepseek-harness -not -path '*/users*' -perm /022 | wc -l` must print 0 (the `users/` user directories are the exception).
 - Keep `gateway/` at `root:dsh-gateway 0770`: the gateway needs tmp+rename atomic writes inside it (users.json / secret / state-cwd.json); code files inside the directory (server/userctl/auth/credentials/static) are root:root 0644. Everything in `bin/` is root:root.
-- The gateway runs as a dedicated system account `dsh-gateway` (no shell). **Never** run the gateway under a cloud-image account like `ubuntu` that ships NOPASSWD sudo; its sudo capability must be limited to the four file helpers allowlisted in `/etc/sudoers.d/dsh-upload`. The gateway systemd unit must **not** set `NoNewPrivileges=yes` (it blocks sudo to the root helpers, breaking upload/download/listing entirely).
+- The gateway runs as a dedicated system account `dsh-gateway` (no shell). **Never** run the gateway under a cloud-image account like `ubuntu` that ships NOPASSWD sudo; its sudo capability must be limited to the six file helpers allowlisted in `/etc/sudoers.d/dsh-upload`. The gateway systemd unit must **not** set `NoNewPrivileges=yes` (it blocks sudo to the root helpers, breaking upload/download/listing/deletion/folder creation entirely).
 - **Loopback tenant isolation** (`bin/dsh-loopback-guard` + `units/dsh-loopback-guard.service`): DSH instances authorize privileged endpoints by "the Host header is loopback", yet all instances share 127.0.0.1 — any tenant's agent can forge the Host header and hit another tenant's port directly to steal their API key. The mitigation is an iptables OUTPUT chain: each `dsh-<name>` may connect only to its own instance port; other tenant ports and the gateway port are REJECTed, while root/gateway accounts are unaffected. userctl refreshes the rules automatically on add/delete; rules REJECT **per destination port** (do not blanket-reject by uid — that would kill the kernel's reply path).
 - Per-user instances carry systemd resource limits (TasksMax/MemoryMax/CPUQuota, tunable via `DSH_MEM_MAX`/`DSH_CPU_QUOTA`) and kernel-hardening directives.
-- File helpers (dsh-file-put/read/stat/list): root only string-validates arguments and switches identity; all file operations run via `runuser -u dsh-<name>` as the user themselves (fixing the issue #1 TOCTOU race); the realpath prefix checks inside the helpers are kept only for exit-code semantics and are no longer the security boundary. Depends on `runuser` from util-linux. **The upload helper uses the v2 length protocol** (`BYTES <n>` header + exact byte-count verification): the gateway streams the request body through, and aborted/timed-out/over-limit uploads are refused with exit 6 — no truncated file is ever committed.
+- File helpers (dsh-file-put/read/stat/list/delete/mkdir): root only string-validates arguments and switches identity; all file operations run via `runuser -u dsh-<name>` as the user themselves (fixing the issue #1 TOCTOU race); the realpath prefix checks inside the helpers are kept only for exit-code semantics and are no longer the security boundary. Depends on `runuser` from util-linux. **The upload helper uses the v2 length protocol** (`BYTES <n>` header + exact byte-count verification): the gateway streams the request body through, and aborted/timed-out/over-limit uploads are refused with exit 6 — no truncated file is ever committed.
 - User credential files must remain owner-readable only (0600): DSH enforces this at startup (`assertOwnerOnly`). The root-helper model satisfies this naturally; do not add any ACL read grants to user directories (this once caused instances to refuse to start).
 - The gateway and all instances listen on 127.0.0.1 only; the public internet sees only the TLS reverse proxy. The proxy must **overwrite** (not append to) `X-Forwarded-For` with `$remote_addr` (the `nginx/dsh-https-1145.conf` template ships with this safe default) — otherwise an attacker can forge the XFF chain and bypass the gateway's IP-level rate limiting.
 - Login rate limiting operates at both IP and account level; account lockout (5 attempts / 15 minutes) can itself be abused for DoS and is mitigated only by IP-level throttling and strong passwords. Changing a password bumps `pwdVer`, immediately invalidating every previously issued session (including old unversioned tokens).

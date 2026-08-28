@@ -3,6 +3,7 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const http = require('http');
+const { execFileSync } = require('child_process');
 const { hashPassword } = require('./auth.js');
 
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'dshgw-'));
@@ -10,10 +11,29 @@ const USERS_DIR = path.join(TMP, 'users');
 const USERS_FILE = path.join(TMP, 'users.json');
 const TENANT_HELPER = path.join(TMP, 'dsh-register-test-helper');
 const TENANT_HELPER_LOG = path.join(TMP, 'dsh-register-test-helper.log');
+const FILE_LIST_TEST_HELPER = path.join(TMP, 'dsh-file-list-test-helper');
+const FILE_DELETE_TEST_HELPER = path.join(TMP, 'dsh-file-delete-test-helper');
+const FILE_DELETE_TEST_LOG = path.join(TMP, 'dsh-file-delete-test-helper.log');
+const FILE_MKDIR_TEST_HELPER = path.join(TMP, 'dsh-file-mkdir-test-helper');
+const FILE_MKDIR_TEST_LOG = path.join(TMP, 'dsh-file-mkdir-test-helper.log');
+const FILE_STAT_TEST_HELPER = path.join(TMP, 'dsh-file-stat-test-helper');
+const FILE_READ_TEST_HELPER = path.join(TMP, 'dsh-file-read-test-helper');
+const FILE_PUT_TEST_HELPER = path.join(TMP, 'dsh-file-put-test-helper');
 const CONTROL_SOCKET = path.join(TMP, 'run', 'control.sock');
+const PLUGIN_TARBALL_DIR = path.join(TMP, 'plugin-tarballs');
+const TEST_TARBALL = path.join(TMP, 'offline-plugin-1.0.0.tgz');
+const packageDir = path.join(TMP, 'pack', 'package');
 fs.mkdirSync(path.join(USERS_DIR, 'tester'), { recursive: true });
 fs.mkdirSync(path.join(USERS_DIR, 'nokey'), { recursive: true });
 fs.mkdirSync(path.join(USERS_DIR, 'admin'), { recursive: true });
+fs.mkdirSync(packageDir, { recursive: true });
+fs.writeFileSync(path.join(packageDir, 'package.json'), JSON.stringify({
+  name: 'offline-plugin',
+  version: '1.0.0',
+  dsh: { bundle: { patch: './cordis.patch.yml' } },
+}));
+fs.writeFileSync(path.join(packageDir, 'cordis.patch.yml'), '[]\n');
+execFileSync('/usr/bin/tar', ['-czf', TEST_TARBALL, '-C', path.join(TMP, 'pack'), 'package']);
 // The production gateway reaches the root supervisor through dsh-register for
 // lazy wake/sleep. This standalone smoke test already owns a mock upstream, so
 // use a tiny successful control helper instead of invoking host sudo.
@@ -41,6 +61,58 @@ fs.writeFileSync(TENANT_HELPER, [
   'esac',
   '',
 ].join('\n'), { mode: 0o755 });
+const testerWorkspace = path.join(USERS_DIR, 'tester', 'workspace');
+fs.mkdirSync(path.join(testerWorkspace, 'empty-dir'), { recursive: true });
+fs.writeFileSync(path.join(testerWorkspace, 'result.txt'), 'result');
+fs.writeFileSync(FILE_LIST_TEST_HELPER, [
+  '#!/bin/sh',
+  'printf \'%s\\n\' ' + JSON.stringify(JSON.stringify({
+    home: testerWorkspace,
+    dir: testerWorkspace,
+    truncated: false,
+    entries: [
+      { name: 'empty-dir', dir: true, size: -1, mtime: 0 },
+      { name: 'result.txt', dir: false, size: 6, mtime: 0 },
+    ],
+  })),
+  '',
+].join('\n'), { mode: 0o755 });
+fs.writeFileSync(FILE_DELETE_TEST_HELPER, [
+  '#!/bin/sh',
+  'printf \'%s\\n\' "$*" >> ' + JSON.stringify(FILE_DELETE_TEST_LOG),
+  'printf \'%s\\n\' \'{"ok":true,"type":"file"}\'',
+  '',
+].join('\n'), { mode: 0o755 });
+fs.writeFileSync(FILE_MKDIR_TEST_HELPER, [
+  '#!/bin/sh',
+  'printf \'%s\\n\' "$*" >> ' + JSON.stringify(FILE_MKDIR_TEST_LOG),
+  'printf \'%s\\n\' \'{"ok":true}\'',
+  '',
+].join('\n'), { mode: 0o755 });
+fs.writeFileSync(FILE_STAT_TEST_HELPER, [
+  '#!/bin/sh',
+  'case "$2" in',
+  '  *empty.txt) printf \'0\\n\' ;;',
+  '  *) printf \'6\\n\' ;;',
+  'esac',
+  '',
+].join('\n'), { mode: 0o755 });
+fs.writeFileSync(FILE_READ_TEST_HELPER, [
+  '#!/bin/sh',
+  'case "$2" in',
+  '  *empty.txt) exit 0 ;;',
+  '  *) printf result ;;',
+  'esac',
+  '',
+].join('\n'), { mode: 0o755 });
+fs.writeFileSync(FILE_PUT_TEST_HELPER, [
+  '#!/bin/sh',
+  'read -r magic bytes',
+  '[ "$magic" = "BYTES" ] || exit 2',
+  'head -c "$bytes" > "$2/$3"',
+  '[ "$(wc -c < "$2/$3")" -eq "$bytes" ] || exit 6',
+  '',
+].join('\n'), { mode: 0o755 });
 
 const users = {
   version: 1,
@@ -63,19 +135,70 @@ process.env.DSH_LOGIN_API_KEY = 'login-test-token';
 process.env.DSH_REGISTER_API_KEY = 'register-test-token';
 process.env.DSH_REGISTER_HELPER = TENANT_HELPER;
 process.env.DSH_PROVIDER_HELPER = TENANT_HELPER;
+process.env.FILE_LIST_HELPER = FILE_LIST_TEST_HELPER;
+process.env.FILE_DELETE_HELPER = FILE_DELETE_TEST_HELPER;
+process.env.FILE_MKDIR_HELPER = FILE_MKDIR_TEST_HELPER;
+process.env.FILE_STAT_HELPER = FILE_STAT_TEST_HELPER;
+process.env.FILE_READ_HELPER = FILE_READ_TEST_HELPER;
+process.env.UPLOAD_HELPER = FILE_PUT_TEST_HELPER;
 process.env.DSH_HELPER_DIRECT = '1';
 process.env.DSH_BROWSER_STOP_GRACE_MS = '1000';
+process.env.SESSION_TTL = '60';
+process.env.SESSION_REFRESH_INTERVAL = '1';
+process.env.DSH_PLUGIN_TARBALL_DIR = PLUGIN_TARBALL_DIR;
+process.env.PLUGIN_TARBALL_MAX_MB = '10';
 process.env.DEEPSEEK_BASE_URL = 'http://127.0.0.1:3999';
 
+const tenantRpcCalls = [];
+const muxSockets = new Set();
+function websocketTextFrame(value) {
+  const payload = Buffer.from(value);
+  if (payload.length < 126) return Buffer.concat([Buffer.from([0x81, payload.length]), payload]);
+  const header = Buffer.alloc(4);
+  header[0] = 0x81;
+  header[1] = 126;
+  header.writeUInt16BE(payload.length, 2);
+  return Buffer.concat([header, payload]);
+}
+function pushMux(payload) {
+  const full = JSON.stringify({ type: 'server-request', rpcId: 'mux-' + Date.now(), method: payload.type, payload });
+  const frame = websocketTextFrame(full);
+  for (const socket of muxSockets) socket.write(frame);
+}
 const upstream = http.createServer((req, res) => {
-  if (req.method === 'POST' && req.url === '/api/credentials.set') {
+  if (req.method === 'POST' && req.url.startsWith('/api/')) {
     let body = '';
     req.on('data', (c) => body += c);
     req.on('end', () => {
       let rpcId = 'x';
-      try { rpcId = JSON.parse(body).rpcId || 'x'; } catch (e) {}
+      let message = {};
+      try { message = JSON.parse(body); rpcId = message.rpcId || 'x'; } catch (e) {}
+      tenantRpcCalls.push({ path: req.url, message });
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ type: 'server-response', rpcId: rpcId, result: { ok: true, value: {} } }));
+      if (req.url === '/api/session.create') {
+        return res.end(JSON.stringify({ type: 'server-response', rpcId, result: { ok: true, value: { sessionId: 'api-created-session' } } }));
+      }
+      if (req.url === '/api/session.prompt') {
+        res.end(JSON.stringify({ type: 'server-response', rpcId, result: { ok: true, value: { accepted: true } } }));
+        if (muxSockets.size > 0) setTimeout(() => {
+          const sessionId = message.payload.sessionId;
+          pushMux({ type: 'session/event', sessionId, event: { type: 'user/message', seq: 10, time: Date.now(), data: { id: 'u1', role: 'user', content: [{ type: 'text', text: message.payload.content[0].text }], source: { kind: 'user', rpcId } } } });
+          pushMux({ type: 'session/event', sessionId, event: { type: 'assistant/chunk', seq: 11, time: Date.now(), data: { turn: 1, step: 0, chunk: { type: 'text-delta', index: 0, text: '流式回复' } } } });
+          pushMux({ type: 'session/event', sessionId, event: { type: 'assistant/message', seq: 12, time: Date.now(), data: { turn: 1, step: 0, message: { id: 'a1', role: 'assistant', content: [{ type: 'text', text: '流式回复' }], source: { kind: 'model', provider: 'test', model: 'test' } } } } });
+          pushMux({ type: 'session/event', sessionId, event: { type: 'turn/end', seq: 13, time: Date.now(), data: { turn: 1, reason: { kind: 'completed' } } } });
+        }, 10);
+        return;
+      }
+      if (req.url === '/api/session.history') {
+        return res.end(JSON.stringify({ type: 'server-response', rpcId, result: { ok: true, value: {
+          events: [
+            { event: { type: 'user/message', seq: 1, time: 100, data: { id: 'u-history', role: 'user', content: [{ type: 'text', text: '历史问题' }], source: { kind: 'user' } } } },
+            { event: { type: 'assistant/message', seq: 2, time: 200, data: { turn: 1, step: 0, message: { id: 'a-history', role: 'assistant', content: [{ type: 'text', text: '历史回答' }], source: { kind: 'model', provider: 'test', model: 'test' } } } } },
+          ],
+          hasMore: false,
+        } } }));
+      }
+      res.end(JSON.stringify({ type: 'server-response', rpcId, result: { ok: true, value: {} } }));
     });
     return;
   }
@@ -86,6 +209,16 @@ const upstream = http.createServer((req, res) => {
   }
   res.writeHead(200, { 'Content-Type': 'text/html' });
   res.end('UPSTREAM-OK ' + req.url);
+});
+upstream.on('upgrade', (req, socket) => {
+  if (req.url !== '/api/events.mux') return socket.destroy();
+  const accept = require('crypto').createHash('sha1')
+    .update(String(req.headers['sec-websocket-key']) + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11')
+    .digest('base64');
+  socket.write('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ' + accept + '\r\n\r\n');
+  muxSockets.add(socket);
+  socket.on('close', () => muxSockets.delete(socket));
+  socket.on('error', () => muxSockets.delete(socket));
 });
 upstream.listen(3999, '127.0.0.1');
 
@@ -132,8 +265,78 @@ function check(name, cond) {
 
   r = await req('GET', '/__gw/health');
   check('health 200', r.status === 200 && r.body.indexOf('"ok":true') >= 0);
+  r = await req('GET', '/__gw/status');
+  check('status reports missing session reason', r.status === 401
+    && JSON.parse(r.body).reason === 'missing-cookie');
 
   const providerHeaders = { Authorization: 'Bearer register-test-token', 'Content-Type': 'application/json' };
+  r = await req('POST', '/api/users/tester/message', {
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ message: 'unauthorized' }),
+  });
+  check('direct message requires bearer token', r.status === 401);
+  r = await req('POST', '/api/users/missing/message', {
+    headers: providerHeaders,
+    body: JSON.stringify({ message: 'hello' }),
+  });
+  check('direct message rejects unknown user', r.status === 404);
+  r = await req('POST', '/api/users/tester/message', {
+    headers: providerHeaders,
+    body: JSON.stringify({ message: 'API 新会话消息' }),
+  });
+  const newMessageReply = JSON.parse(r.body);
+  const createCall = tenantRpcCalls.find((call) => call.path === '/api/session.create');
+  const newPromptCall = tenantRpcCalls.find((call) => call.path === '/api/session.prompt');
+  check('direct message creates a session and queues the prompt', r.status === 202
+    && newMessageReply.sessionId === 'api-created-session'
+    && newMessageReply.created === true
+    && createCall.message.method === 'session.create'
+    && newPromptCall.message.payload.content[0].text === 'API 新会话消息'
+    && newPromptCall.message.payload.mode === 'queue');
+  r = await req('POST', '/api/users/tester/message', {
+    headers: providerHeaders,
+    body: JSON.stringify({ message: '插入运行中的会话', sessionId: 'existing-session', mode: 'steer' }),
+  });
+  const existingMessageReply = JSON.parse(r.body);
+  const lastPromptCall = tenantRpcCalls.filter((call) => call.path === '/api/session.prompt').pop();
+  check('direct message can steer an existing session', r.status === 202
+    && existingMessageReply.sessionId === 'existing-session'
+    && existingMessageReply.created === false
+    && lastPromptCall.message.payload.sessionId === 'existing-session'
+    && lastPromptCall.message.payload.mode === 'steer');
+
+  r = await req('GET', '/api/users/tester/messages?sessionId=existing-session&maxMessages=20', {
+    headers: { Authorization: 'Bearer register-test-token' },
+  });
+  const historyReply = JSON.parse(r.body);
+  check('message history returns user and assistant messages', r.status === 200
+    && historyReply.messages.length === 2
+    && historyReply.messages[0].role === 'user'
+    && historyReply.messages[0].message.content[0].text === '历史问题'
+    && historyReply.messages[1].role === 'assistant'
+    && historyReply.nextBeforeSeq === 1);
+
+  r = await req('POST', '/api/users/tester/message', {
+    headers: { ...providerHeaders, Accept: 'text/event-stream' },
+    body: JSON.stringify({ message: '请流式回复', sessionId: 'stream-session', stream: true }),
+  });
+  check('direct message streams the correlated DSH turn as SSE', r.status === 200
+    && /^text\/event-stream/.test(r.headers['content-type'])
+    && r.body.indexOf('event: accepted') >= 0
+    && r.body.indexOf('event: assistant.chunk') >= 0
+    && r.body.indexOf('流式回复') >= 0
+    && r.body.indexOf('event: assistant.message') >= 0
+    && r.body.indexOf('event: done') >= 0);
+
+  r = await req('POST', '/api/users/tester/files?name=machine-upload.txt', {
+    headers: { Authorization: 'Bearer register-test-token', 'Content-Type': 'application/octet-stream' },
+    body: Buffer.from('machine-upload-body'),
+  });
+  const uploadReply = JSON.parse(r.body);
+  check('machine API uploads a raw file into the user workspace', r.status === 201
+    && uploadReply.bytes === 19
+    && fs.readFileSync(path.join(testerWorkspace, 'machine-upload.txt'), 'utf8') === 'machine-upload-body');
+
   r = await req('POST', '/api/users/tester/provider', {
     headers: providerHeaders,
     body: JSON.stringify({
@@ -222,25 +425,83 @@ function check(name, cond) {
 
   r = await req('GET', '/some/path', { headers: { 'Cookie': 'dsh_session=' + sess } });
   check('proxy upstream', r.status === 200 && r.body.indexOf('UPSTREAM-OK /some/path') >= 0);
+  check('file manager trigger targets composer permission control', r.body.indexOf('dshgw-composer-files') >= 0
+    && r.body.indexOf('aria-label^=\\"访问模式\\"') >= 0
+    && r.body.indexOf('nextElementSibling') >= 0
+    && r.body.indexOf('files=cloneSidebarAction') < 0);
+  const proxyScripts = Array.from(r.body.matchAll(/<script>([\s\S]*?)<\/script>/g), (match) => match[1]);
+  let proxyScriptsValid = proxyScripts.length > 0;
+  try { proxyScripts.forEach((script) => { new Function(script); }); } catch (error) { proxyScriptsValid = false; }
+  check('injected gateway scripts parse', proxyScriptsValid);
+
+  r = await req('GET', '/__gw/files?dir=' + encodeURIComponent(testerWorkspace), {
+    headers: { Cookie: 'dsh_session=' + sess },
+  });
+  check('file manager renders delete controls', r.status === 200
+    && r.body.indexOf('delete-file') >= 0
+    && r.body.indexOf('create-directory') >= 0
+    && r.body.indexOf('data-delete-kind="file"') >= 0
+    && r.body.indexOf('data-delete-kind="directory"') >= 0);
+  const fileScripts = Array.from(r.body.matchAll(/<script>([\s\S]*?)<\/script>/g), (match) => match[1]);
+  let fileScriptsValid = fileScripts.length > 0;
+  try { fileScripts.forEach((script) => { new Function(script); }); } catch (error) { fileScriptsValid = false; }
+  check('file manager inline scripts parse', fileScriptsValid);
+  r = await req('GET', '/__gw/download?path=' + encodeURIComponent(path.join(testerWorkspace, 'result.txt')), {
+    headers: { Cookie: 'dsh_session=' + sess },
+  });
+  check('download streams one committed response', r.status === 200
+    && r.body === 'result' && r.headers['content-length'] === '6');
+  r = await req('GET', '/__gw/download?path=' + encodeURIComponent(path.join(testerWorkspace, 'empty.txt')), {
+    headers: { Cookie: 'dsh_session=' + sess },
+  });
+  check('download supports an empty file', r.status === 200
+    && r.body === '' && r.headers['content-length'] === '0');
+  r = await req('POST', '/__gw/delete', {
+    headers: { Cookie: 'dsh_session=' + sess, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ path: path.join(testerWorkspace, 'result.txt') }),
+  });
+  check('file delete requires action header', r.status === 403);
+  r = await req('POST', '/__gw/delete', {
+    headers: { Cookie: 'dsh_session=' + sess, 'Content-Type': 'application/json', 'X-DSH-Gateway-Action': 'delete-file' },
+    body: JSON.stringify({ path: path.join(testerWorkspace, 'result.txt') }),
+  });
+  check('file delete uses the scoped helper', r.status === 200
+    && fs.readFileSync(FILE_DELETE_TEST_LOG, 'utf8').indexOf(path.join(testerWorkspace, 'result.txt')) >= 0);
+  r = await req('POST', '/__gw/mkdir', {
+    headers: { Cookie: 'dsh_session=' + sess, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ dir: testerWorkspace, name: 'reports' }),
+  });
+  check('mkdir requires action header', r.status === 403);
+  r = await req('POST', '/__gw/mkdir', {
+    headers: { Cookie: 'dsh_session=' + sess, 'Content-Type': 'application/json', 'X-DSH-Gateway-Action': 'create-directory' },
+    body: JSON.stringify({ dir: testerWorkspace, name: 'reports' }),
+  });
+  check('mkdir uses the scoped helper', r.status === 200
+    && fs.readFileSync(FILE_MKDIR_TEST_LOG, 'utf8').indexOf(testerWorkspace + ' reports') >= 0);
 
   // Closing the last tab may recycle the tenant process, but it is not a
   // logout. Browser timer throttling and reloads must not invalidate the
   // signed session cookie.
   const sessionPayload = JSON.parse(Buffer.from(sess.split('.')[0], 'base64url').toString('utf8'));
+  await new Promise((resolve) => setTimeout(resolve, 1100));
   r = await req('POST', '/__gw/presence', {
     headers: { Cookie: 'dsh_session=' + sess },
     body: 'tab=smoke-tab-1234&event=open',
   });
-  check('presence opens tenant lease', r.status === 204);
+  const refreshedSess = cookies(r.headers['set-cookie'])['dsh_session'];
+  const refreshedPayload = JSON.parse(Buffer.from(refreshedSess.split('.')[0], 'base64url').toString('utf8'));
+  check('presence opens tenant lease', r.status === 200 && JSON.parse(r.body).renewed === true);
+  check('presence renews an aged session cookie', refreshedPayload.n === sessionPayload.n
+    && refreshedPayload.iat > sessionPayload.iat && refreshedPayload.exp > sessionPayload.exp);
   r = await req('POST', '/__gw/presence', {
-    headers: { Cookie: 'dsh_session=' + sess },
+    headers: { Cookie: 'dsh_session=' + refreshedSess },
     body: 'tab=smoke-tab-1234&event=close',
   });
   check('presence closes tenant lease', r.status === 204 && !!sessionPayload.n);
   await new Promise((resolve) => setTimeout(resolve, 1200));
   const autoSleepLog = fs.readFileSync(TENANT_HELPER_LOG, 'utf8');
   check('automatic tenant sleep preserves sessions', autoSleepLog.indexOf('--sleep tester ' + CONTROL_SOCKET + ' browser-close 0') >= 0);
-  r = await req('GET', '/some/path', { headers: { Cookie: 'dsh_session=' + sess } });
+  r = await req('GET', '/some/path', { headers: { Cookie: 'dsh_session=' + refreshedSess } });
   check('session survives automatic tenant sleep', r.status === 200 && r.body.indexOf('UPSTREAM-OK /some/path') >= 0);
 
   const adminCsrf = cookies((await req('GET', '/login')).headers['set-cookie'])['dsh_csrf'];
@@ -275,9 +536,24 @@ function check(name, cond) {
     body: JSON.stringify({ spec: 'test-plugin@1.0.0' }),
   });
   check('admin plugin mutation requires action header', r.status === 403);
+  const tarballBody = fs.readFileSync(TEST_TARBALL);
+  r = await req('POST', '/__gw/admin/plugins/upload', {
+    headers: { Cookie: 'dsh_session=' + adminSess, 'Content-Type': 'application/octet-stream' },
+    body: tarballBody,
+  });
+  check('admin plugin upload requires action header', r.status === 403);
+  r = await req('POST', '/__gw/admin/plugins/upload', {
+    headers: { Cookie: 'dsh_session=' + adminSess, 'Content-Type': 'application/octet-stream', 'X-DSH-Gateway-Action': 'admin-plugin' },
+    body: tarballBody,
+  });
+  const uploadedTarball = JSON.parse(r.body).tarball;
+  check('admin accepts an npm plugin tarball', r.status === 201
+    && uploadedTarball.name === 'offline-plugin'
+    && uploadedTarball.version === '1.0.0'
+    && uploadedTarball.spec.startsWith('file:' + PLUGIN_TARBALL_DIR + '/'));
   r = await req('POST', '/__gw/admin/plugins/add', {
     headers: { Cookie: 'dsh_session=' + adminSess, 'Content-Type': 'application/json', 'X-DSH-Gateway-Action': 'admin-plugin' },
-    body: JSON.stringify({ spec: 'test-plugin@1.0.0' }),
+    body: JSON.stringify({ spec: uploadedTarball.spec, name: uploadedTarball.name }),
   });
   const pluginJob = JSON.parse(r.body).job;
   check('admin starts plugin install job', r.status === 202 && pluginJob.status === 'running');

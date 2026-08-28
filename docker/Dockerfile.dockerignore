@@ -11,5 +11,6 @@
 **/*.log
 **/*.tar.gz
 **/*.tar.gz.tmp
+**/*.tar.zst
 # runtime data bind mount (docker/data) - never part of the image
 docker/data

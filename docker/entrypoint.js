@@ -114,11 +114,19 @@ function ensureOsUser(name, home, uid) {
   return osUser;
 }
 
-function writeAtomic(file, content, mode) {
+function writeAtomic(file, content, mode, owner) {
   const temporary = `${file}.tmp-${process.pid}`;
-  fs.writeFileSync(temporary, content, { mode });
-  fs.renameSync(temporary, file);
-  fs.chmodSync(file, mode);
+  try {
+    fs.writeFileSync(temporary, content, { mode });
+    // Publish with the final owner already set. Renaming a root-owned 0640
+    // file and chowning afterwards exposes a short EACCES window to the
+    // concurrently running dsh-gateway process.
+    if (owner) execFileSync('chown', [owner, temporary]);
+    fs.renameSync(temporary, file);
+    fs.chmodSync(file, mode);
+  } finally {
+    try { fs.unlinkSync(temporary); } catch (error) {}
+  }
 }
 
 // A tenant cannot open the shared 0711 USERS_DIR to fsync its own HOME entry.
@@ -846,13 +854,19 @@ function gatewayArgs() {
     `DSH_CONTROL_SOCKET=${CONTROL_SOCKET}`,
     `USERS_DIR=${USERS_DIR}`,
     `COOKIE_SECURE=${process.env.COOKIE_SECURE || '0'}`,
+    `SESSION_TTL=${process.env.SESSION_TTL || '43200'}`,
+    `SESSION_REFRESH_INTERVAL=${process.env.SESSION_REFRESH_INTERVAL || '0'}`,
+    `DSH_PLUGIN_TARBALL_DIR=${process.env.DSH_PLUGIN_TARBALL_DIR || path.join(STATE_DIR, 'plugin-tarballs')}`,
+    `PLUGIN_TARBALL_MAX_MB=${process.env.PLUGIN_TARBALL_MAX_MB || '100'}`,
     `DEEPSEEK_BASE_URL=${process.env.DEEPSEEK_BASE_URL || 'https://api.deepseek.com'}`,
-    `DSH_BROWSER_PRESENCE_TTL_MS=${process.env.DSH_BROWSER_PRESENCE_TTL_MS || '120000'}`,
+    `DSH_BROWSER_PRESENCE_TTL_MS=${process.env.DSH_BROWSER_PRESENCE_TTL_MS || '86400000'}`,
     `DSH_BROWSER_STOP_GRACE_MS=${process.env.DSH_BROWSER_STOP_GRACE_MS || '5000'}`,
     'UPLOAD_HELPER=/usr/local/libexec/dsh/dsh-file-put',
     'FILE_STAT_HELPER=/usr/local/libexec/dsh/dsh-file-stat',
     'FILE_READ_HELPER=/usr/local/libexec/dsh/dsh-file-read',
     'FILE_LIST_HELPER=/usr/local/libexec/dsh/dsh-file-list',
+    'FILE_DELETE_HELPER=/usr/local/libexec/dsh/dsh-file-delete',
+    'FILE_MKDIR_HELPER=/usr/local/libexec/dsh/dsh-file-mkdir',
   ];
   return ['-u', 'dsh-gateway', '--', 'env', ...env, NODE_BIN, GATEWAY_SERVER];
 }
@@ -860,8 +874,7 @@ function gatewayArgs() {
 // ---------- users.json persistence + firewall refresh ----------
 
 function saveUsersDb(db) {
-  writeAtomic(USERS_FILE, `${JSON.stringify(db, null, 2)}\n`, 0o640);
-  execFileSync('chown', ['dsh-gateway:dsh-gateway', USERS_FILE]);
+  writeAtomic(USERS_FILE, `${JSON.stringify(db, null, 2)}\n`, 0o640, 'dsh-gateway:dsh-gateway');
 }
 
 function usedPorts(db) {
@@ -1129,7 +1142,8 @@ async function controlSleep(payload) {
     record.pwdVer = (typeof record.pwdVer === 'number' ? record.pwdVer : 0) + 1;
     saveUsersDb(state.db);
   }
-  console.log(`tenant ${name} stopped on ${payload.reason || 'logout'} (wasRunning=${wasRunning}, swept=${swept})`);
+  console.log(`tenant ${name} stopped on ${payload.reason || 'logout'} `
+    + `(wasRunning=${wasRunning}, swept=${swept}, revokeSessions=${payload.revokeSessions === true}, pwdVer=${record.pwdVer || 0})`);
   return { ok: true, result: { name, stopped: wasRunning, swept } };
 }
 
@@ -1418,6 +1432,14 @@ async function main() {
   fs.mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 });
   execFileSync('chown', ['dsh-gateway:dsh-gateway', STATE_DIR]);
   fs.chmodSync(STATE_DIR, 0o700);
+  // Heal state files created by an older root-running gateway. An unreadable
+  // persisted secret makes every gateway restart mint a new signing key and
+  // invalidates otherwise-live browser sessions.
+  for (const file of [SECRET_FILE, CWD_STATE_FILE]) {
+    if (!fs.existsSync(file)) continue;
+    execFileSync('chown', ['dsh-gateway:dsh-gateway', file]);
+    fs.chmodSync(file, 0o600);
+  }
 
   state.sharedWebPlugins = await ensureRuntimeSharedPlugins(parseSharedPluginConfigs());
   console.log(`shared web plugins ready: ${state.sharedWebPlugins.map((plugin) => plugin.name).join(', ')}`);

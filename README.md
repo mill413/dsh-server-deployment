@@ -16,7 +16,7 @@
 - **用户隔离**：每个用户一个独立 DSH 实例（独立端口），以独立系统账号 `dsh-<name>` 运行，`DSH_HOME` 指向其 0700 私有目录；`userctl.js` 一条命令完成建号 / 改密 / 删号 / 预置 Key。
 - **每用户独立 API Key**：登录后无 Key 自动引导 `/setup` 填写，经回环 RPC 写入该用户私有的 `.credentials.yaml`（0600，属主仅本人）。
 - **回环特权接口修复**：网关向后端呈现 `Host: 127.0.0.1:<port>` 并剥离浏览器信任标记，DSH 钉在回环的 settings / credentials / agentPreset 等特权接口在公网访问下同样可用。
-- **交付文件抽屉（文件管理）**：入口位于左侧栏底部、“退出登录”和“设置”上方，复用设置行样式；侧栏展开时显示图标与“文件管理”，收起时只显示同尺寸图标。点击后打开白色文件抽屉——目录浏览、下载（attachment + 中文文件名）、多文件上传（100MB 上限）；自动定位到当前对话所在工作目录（嗅探会话 RPC 追踪 cwd，持久化恢复）。
+- **交付文件抽屉（文件管理）**：入口位于对话输入框底部工具行的权限选择右侧，克隆原生权限按钮样式，窄屏时同步折叠；侧栏不再显示文件管理。点击后打开白色文件抽屉——目录浏览、下载（attachment + 中文文件名）、多文件上传（100MB 上限）、新建单层文件夹、删除普通文件/符号链接与空目录；自动定位到当前对话所在工作目录（嗅探会话 RPC 追踪 cwd，持久化恢复）。删除需二次确认，隐藏文件、工作区根目录、越界路径和非空目录均拒绝。
 - **安全边界**：所有用户文件访问经 sudoers 固定路径的助手脚本——root 仅校验参数并降权，文件操作以 `dsh-<name>` 用户自身身份执行（修复 issue #1 的 TOCTOU 竞态）；网关进程对用户目录零权限；隐藏文件（含 `.credentials.yaml`）不可下载；SPA 注入尊重 `prefers-reduced-motion`、无玻璃拟态/渐变装饰。
 
 ## 架构
@@ -115,7 +115,7 @@ docker compose -f docker/compose.yml exec dsh-multitenant dsh-users del carol   
 - `dsh-users` 与网关共享同一份用户库：新用户立即可登录（网关侧缓存最长 2 秒刷新）。
 - 口令最少 8 位；`passwd` 会使该用户所有已签发会话立即失效。
 - 默认启用 `DSH_LAZY_TENANTS=1`：建号只创建 OS 账号、独立 HOME、端口记录、共享插件链接和防火墙规则，不启动 DSH。用户首次成功登录时网关调用监管进程启动该用户实例并等待就绪；实例运行到用户退出/浏览器离线回收或容器重启。设置 `DSH_LAZY_TENANTS=0` 可恢复启动容器/建号时立即拉起全部实例的旧行为。
-- 登录后的 DSH 页面在左侧栏“设置”正上方提供“退出登录”按钮，直接复用设置行的样式和宽/窄状态：侧栏展开时显示图标与文字，收起时只显示同尺寸图标。手动退出会撤销该用户全部已签发会话，先停止租户进程组，再按租户唯一 OS UID 强制清理任何脱离进程组的后台进程；不会删除或修改用户 HOME、工作区、会话文件、配置或凭据。浏览器页面通过标签页心跳登记在线状态，关闭最后一个标签页后默认宽限 5 秒再回收租户进程；多标签页只关闭其中一个不会停止。浏览器崩溃、断网或来不及发送关闭通知时，默认 120 秒心跳超时后兜底回收。自动回收只管理进程生命周期，不撤销登录 Cookie；用户下次访问会使用原会话重新唤醒实例。只有手动退出、管理员强退或改密才撤销会话。可用 `DSH_BROWSER_STOP_GRACE_MS` 和 `DSH_BROWSER_PRESENCE_TTL_MS` 调整。
+- 登录后的 DSH 页面在左侧栏“设置”正上方提供“退出登录”按钮，直接复用设置行的样式和宽/窄状态：侧栏展开时显示图标与文字，收起时只显示同尺寸图标。手动退出会撤销该用户全部已签发会话，先停止租户进程组，再按租户唯一 OS UID 强制清理任何脱离进程组的后台进程；不会删除或修改用户 HOME、工作区、会话文件、配置或凭据。浏览器页面通过标签页心跳登记在线状态，关闭最后一个标签页后默认宽限 5 秒再回收租户进程；多标签页只关闭其中一个不会停止。浏览器崩溃、断网或来不及发送关闭通知时，默认 24 小时心跳超时后兜底回收。自动回收只管理进程生命周期，不撤销登录 Cookie；用户下次访问会使用原会话重新唤醒实例。设置 `SESSION_REFRESH_INTERVAL`（秒）可让有效心跳按间隔滑动续期，`0` 表示关闭；例如 `SESSION_TTL=432000`、`SESSION_REFRESH_INTERVAL=86400` 表示每次签发有效 5 天且在线时每 24 小时续期。只有手动退出、管理员强退或改密才撤销会话。可用 `DSH_BROWSER_STOP_GRACE_MS` 和 `DSH_BROWSER_PRESENCE_TTL_MS` 调整进程回收时间。
 
 ### 持久化共享 Web 插件（无需修改 Dockerfile）
 
@@ -137,6 +137,8 @@ docker compose -f docker/compose.yml exec dsh-multitenant \
 docker compose -f docker/compose.yml exec dsh-multitenant \
   dsh-users plugin remove some-plugin
 ```
+
+管理后台也可直接上传 `npm pack` / `pnpm pack` 生成的 `.tgz` 离线包；网关校验包内 `package/package.json`、读取真实包名与 `dsh.bundle.patch` 声明后，按内容 SHA-256 保存到持久化的 `gateway/plugin-tarballs/`，并自动提交共享安装任务。默认上限 100 MB，可用 `PLUGIN_TARBALL_MAX_MB` 调整；存储目录可用 `DSH_PLUGIN_TARBALL_DIR` 覆盖。离线包自身仍须包含运行所需依赖，或容器的 pnpm store/内网 registry 必须能提供依赖。
 
 命令通过入口监管进程把插件安装到 `/var/lib/dsh/shared-plugins`，默认允许插件及其全部传递依赖执行 `preinstall`、`install`、`postinstall` 等构建脚本，不需要 `--allow-build`。随后将共享 `link:` 依赖和软链接同步到所有已有用户，并只重启各用户的 DSH 进程使插件生效（容器和网关不重启）。运行时新增用户在自己的 DSH 进程启动前自动执行同一同步，因此会直接拥有并启用当前全部共享插件。共享目录位于 `/var/lib/dsh` 持久化卷中，Pod 重建后仍然存在，不会为每个用户重复安装依赖。由于安装脚本以容器 root 权限执行，只应安装可信插件。
 
@@ -210,9 +212,9 @@ DSH_LOGIN_API_KEY='<token>' CONCURRENCY=10 HOLD_SECONDS=60 \
   ./bin/dsh-browser-login-load.sh https://dsh.example.com /tmp/dsh-users.txt
 ```
 
-### 外部注册 API 与模型注册接口（机器对机器）
+### 外部注册、模型配置与消息接口（机器对机器）
 
-配置 `DSH_REGISTER_API_KEY`（compose 环境变量，默认 `register-test-token`）后启用两个 Bearer Token 接口；不配置则完全关闭。
+配置 `DSH_REGISTER_API_KEY`（compose 环境变量，默认 `register-test-token`）后启用以下 Bearer Token 接口；不配置则完全关闭。
 
 **① 注册用户（仅建号，不含提供商）** `POST /api/register`
 
@@ -246,6 +248,67 @@ curl -X POST http://<主机>:20810/api/users/alice2/provider \
 - 重复调用 = **覆盖更新**（换 baseURL/模型/Key 都行）；返回的 `ref` 是该提供商的凭证名（`<NAME>_API_KEY`）。
 - 配置完成后用户跳过 `/setup`，登录即默认使用该提供商。
 
+**③ 直接发送消息** `POST /api/users/<username>/message`
+
+不传 `sessionId` 时创建一个新会话并投递消息：
+
+```bash
+curl -X POST http://<主机>:20810/api/users/alice2/message \
+  -H "Authorization: Bearer <DSH_REGISTER_API_KEY>" \
+  -H "Content-Type: application/json" \
+  -d '{"message":"检查当前工作区并汇总未提交的修改"}'
+# → 202 {"ok":true,"user":"alice2","sessionId":"...","created":true,"mode":"queue","accepted":true}
+```
+
+向已有会话发送时传入其 `sessionId`。`mode` 默认为 `queue`（排到当前轮次之后）；需要插入正在运行的轮次时可传 `steer`：
+
+```bash
+curl -X POST http://<主机>:20810/api/users/alice2/message \
+  -H "Authorization: Bearer <DSH_REGISTER_API_KEY>" \
+  -H "Content-Type: application/json" \
+  -d '{"sessionId":"<会话 ID>","mode":"steer","message":"先处理刚发现的线上告警"}'
+```
+
+需要实时接收回应时传 `stream:true`（或请求头 `Accept: text/event-stream`），接口返回 SSE：
+
+```bash
+curl -N -X POST http://<主机>:20810/api/users/alice2/message \
+  -H "Authorization: Bearer <DSH_REGISTER_API_KEY>" \
+  -H "Content-Type: application/json" \
+  -H "Accept: text/event-stream" \
+  -d '{"sessionId":"<会话 ID>","message":"继续分析并给出结论","stream":true}'
+```
+
+流依次产生 `accepted`、`session.event` / `assistant.chunk` / `assistant.message`，最后以 `done` 结束；异常以 `error` 结束。网关在发送 prompt 前先订阅 DSH 事件，并用该 prompt 的 `rpcId` 关联轮次，因此不会把之前排队消息的回应误归入当前请求。流默认最长保持 15 分钟，可通过 `DSH_MESSAGE_STREAM_TIMEOUT_MS` 调整。
+
+- 目标用户必须存在；休眠中的 DSH 会先按需启动。非流式接口返回 `202` 表示 DSH 已接受消息，不表示模型已经完成整轮回复。
+- `message` 必须是非空字符串，最多 100000 个字符；`sessionId` 可选，最长 256 个字符；`mode` 仅可取 `queue` 或 `steer`。
+- DSH 拒绝消息时会返回其错误码；不存在的用户或会话返回 `404`，实例启动或回环 RPC 失败返回 `502/503`。
+- 该接口可触发目标用户 DSH 中智能体的工具操作，`DSH_REGISTER_API_KEY` 必须只交给可信后端，不能放入浏览器代码。
+
+**④ 获取消息列表** `GET /api/users/<username>/messages`
+
+```bash
+curl 'http://<主机>:20810/api/users/alice2/messages?sessionId=<会话ID>&maxMessages=50' \
+  -H "Authorization: Bearer <DSH_REGISTER_API_KEY>"
+# → {"ok":true,"sessionId":"...","messages":[...],"hasMore":false,"nextBeforeSeq":1}
+```
+
+`messages` 只包含最终的用户/助手消息及其结构化 content；`maxMessages` 范围 1–100。`hasMore=true` 时，把返回的 `nextBeforeSeq` 作为下一次请求的 `beforeSeq` 向前翻页。
+
+**⑤ 上传文件** `POST /api/users/<username>/files`
+
+请求体是文件原始字节，文件名放在 `name` 查询参数中；`dir` 可选，默认用户的 `workspace/`，相对路径也以该目录为基准：
+
+```bash
+curl -X POST 'http://<主机>:20810/api/users/alice2/files?name=report.pdf&dir=deliverables' \
+  -H "Authorization: Bearer <DSH_REGISTER_API_KEY>" \
+  -H "Content-Type: application/octet-stream" \
+  --data-binary @report.pdf
+```
+
+上传复用浏览器文件管理的降权助手和完整性协议：要求 `Content-Length`，默认上限 100 MB；只允许写入目标用户工作区，拒绝隐藏文件名、路径穿越以及不完整请求。
+
 可在宿主机验证 Alice 能访问自己的实例但无法访问 Bob 的实例：
 
 ```bash
@@ -266,7 +329,7 @@ docker compose -f docker/compose.yml exec dsh-multitenant runuser -u dsh-alice -
    ```bash
    install -o root -g root -m 0755 bin/dsh-file-* /opt/deepseek-harness/bin/
    # /etc/sudoers.d/dsh-upload:
-   # <服务账号> ALL=(root) NOPASSWD: /opt/deepseek-harness/bin/dsh-file-put, /opt/deepseek-harness/bin/dsh-file-stat, /opt/deepseek-harness/bin/dsh-file-read, /opt/deepseek-harness/bin/dsh-file-list
+   # <服务账号> ALL=(root) NOPASSWD: /opt/deepseek-harness/bin/dsh-file-put, /opt/deepseek-harness/bin/dsh-file-stat, /opt/deepseek-harness/bin/dsh-file-read, /opt/deepseek-harness/bin/dsh-file-list, /opt/deepseek-harness/bin/dsh-file-delete, /opt/deepseek-harness/bin/dsh-file-mkdir
    ```
 
    升级或自检时可在服务器上按以下清单验证助手（把 `<user>` 换成真实用户名）：
@@ -277,6 +340,8 @@ docker compose -f docker/compose.yml exec dsh-multitenant runuser -u dsh-alice -
    printf 'BYTES 6\nhello\n' | sudo -n /opt/deepseek-harness/bin/dsh-file-put "$H" "$H/workspace" t.txt   # v2 长度协议；短流 exit=6 不落盘
    sudo -n /opt/deepseek-harness/bin/dsh-file-stat  "$H" "$H/workspace/t.txt"   # 输出 6
    sudo -n /opt/deepseek-harness/bin/dsh-file-read  "$H" "$H/workspace/t.txt"   # 输出 hello
+   sudo -n /opt/deepseek-harness/bin/dsh-file-delete "$H" "$H/workspace/t.txt"  # 删除普通文件
+   sudo -n /opt/deepseek-harness/bin/dsh-file-mkdir "$H" "$H/workspace" reports # 新建单层文件夹
    sudo -n /opt/deepseek-harness/bin/dsh-file-read  "$H" /etc/passwd; echo "exit=$?"  # exit=3（越界拒绝）
    ps -ef | grep -E 'runuser.*dsh-'                                  # 子进程应为 dsh-<user> 而非 root
    ```
@@ -291,8 +356,9 @@ docker compose -f docker/compose.yml exec dsh-multitenant runuser -u dsh-alice -
 | `DSH_BASE_DIR` | userctl / dsh-users.sh 派生路径的安装前缀 | `/opt/deepseek-harness` |
 | `DSH_USERS_DIR`、`DSH_USERS_FILE`、`DSH_SETTINGS_SRC`、`DSH_NODE_BIN`、`DSH_DSH_BIN` | userctl 细粒度覆盖 | 由 BASE_DIR 派生 |
 | `USERS_FILE`、`SECRET_FILE`、`USERS_DIR` | 网关 | `/opt/deepseek-harness/...` |
-| `UPLOAD_HELPER`、`FILE_STAT_HELPER`、`FILE_READ_HELPER`、`FILE_LIST_HELPER` | 网关调用助手的绝对路径 | `/opt/deepseek-harness/bin/dsh-file-*`（**自定义前缀时必须同步改 sudoers 与这四个变量**） |
-| `HOST`、`PORT`、`SESSION_TTL`、`COOKIE_SECURE`、`DEEPSEEK_BASE_URL`、`UPLOAD_MAX_MB`、`MAX_IP_ATTEMPTS`、`MAX_USER_ATTEMPTS`、`WINDOW_MS`、`LOCK_MS` | 网关 | 见 `gateway/server.js` |
+| `UPLOAD_HELPER`、`FILE_STAT_HELPER`、`FILE_READ_HELPER`、`FILE_LIST_HELPER`、`FILE_DELETE_HELPER`、`FILE_MKDIR_HELPER` | 网关调用助手的绝对路径 | `/opt/deepseek-harness/bin/dsh-file-*`（**自定义前缀时必须同步改 sudoers 与这六个变量**） |
+| `HOST`、`PORT`、`SESSION_TTL`、`SESSION_REFRESH_INTERVAL`、`DSH_MESSAGE_STREAM_TIMEOUT_MS`、`COOKIE_SECURE`、`DEEPSEEK_BASE_URL`、`UPLOAD_MAX_MB`、`DSH_PLUGIN_TARBALL_DIR`、`PLUGIN_TARBALL_MAX_MB`、`MAX_IP_ATTEMPTS`、`MAX_USER_ATTEMPTS`、`WINDOW_MS`、`LOCK_MS` | 网关 | `SESSION_TTL` 默认 43200 秒；`SESSION_REFRESH_INTERVAL` 默认 0；消息流默认超时 900000 ms；插件离线包默认保存到 gateway 状态目录且上限 100 MB；其余见 `gateway/server.js` |
+| `DSH_REGISTER_API_KEY` | 网关机器接口：注册用户、配置模型、直接发送消息 | 默认关闭；必须使用强随机值并仅注入可信后端 |
 | `DSH_LOGIN_API_KEY`、`LOGIN_TICKET_TTL` | 网关外部自动登录 | 默认关闭；票据默认 60 秒 |
 
 `bin/dsh-users.sh` 与 `bin/dsh-file-list` 已按自身位置自定位：任意目录检出即可直接运行（`dsh-users.sh` 首次调用自动重提权为 root；node 解析相对脚本位置，缺失时回退 `PATH`）。自定义安装前缀时 systemd 单元用上面的 `sed` 命令生成；网关 systemd 单元还支持 `EnvironmentFile=-/etc/default/dsh-gateway`，可在该文件里统一注入上述环境变量。
@@ -302,15 +368,17 @@ docker compose -f docker/compose.yml exec dsh-multitenant runuser -u dsh-alice -
 - **自动定位**：网关嗅探代理流量中的 `session.history`（打开会话）与 `session.list`（每会话含 cwd），记住当前对话目录并持久化到 `state-cwd.json`；打开「文件管理」即列出该目录（目录失效自动回退工作区）。
 - **嵌入与关闭**：抽屉以同源 iframe 内嵌（`X-Frame-Options: SAMEORIGIN`）；页面内「返回应用」运行时检测 iframe 环境，发 `postMessage('dshgw-close')` 关闭抽屉而非导航，杜绝嵌套打开。
 - **上传**：原始字节体 `POST /__gw/upload?dir=&name=`，助手降权为 `dsh-<name>` 落盘（root 仅校验参数），文件属主天然为本人，同名覆盖，超限 413。
+- **删除**：`POST /__gw/delete` 仅接受同源自定义动作头和 JSON path；助手降权后删除普通文件、符号链接或空目录。隐藏路径、工作区根目录、越界路径和非空目录拒绝，界面操作前二次确认。
+- **新建文件夹**：`POST /__gw/mkdir` 接收当前目录和一个文件夹名称；助手降权后只在工作区内创建一层非隐藏目录，不递归创建父目录，同名目标返回 409。
 
 ## 安全注意事项
 
 - **安装树完整性（最关键）**：`/opt/deepseek-harness` 整棵树——含 DSH monorepo 源码（`packages/`、`apps/`、`node_modules/`）与 `.agents/` 技能库——不得带 group/other 写位。所有租户实例**共享执行**这份代码，任何可写点都是跨租户注入点（改共享代码或技能文件 → 以其他租户身份执行 → 窃取其 API Key）。部署/升级后必须自检：`find /opt/deepseek-harness -not -path '*/users*' -perm /022 | wc -l` 输出 0（`users/` 用户目录除外）。
 - `gateway/` 目录保持 `root:dsh-gateway 0770`：网关需要在其内做 tmp+rename 原子写（users.json / secret / state-cwd.json）；目录内代码文件（server/userctl/auth/credentials/static）归 root:root 0644。`bin/` 全部归 root:root。
-- 网关以专用系统账号 `dsh-gateway`（无 shell）运行，**切勿**用 `ubuntu` 等自带 NOPASSWD sudo 的云镜像账号运行网关；其 sudo 能力仅限 `/etc/sudoers.d/dsh-upload` 白名单中的四个文件助手。网关 systemd 单元**不可**设置 `NoNewPrivileges=yes`（会阻断 sudo 调 root 助手，上传/下载/列表全部失效）。
+- 网关以专用系统账号 `dsh-gateway`（无 shell）运行，**切勿**用 `ubuntu` 等自带 NOPASSWD sudo 的云镜像账号运行网关；其 sudo 能力仅限 `/etc/sudoers.d/dsh-upload` 白名单中的六个文件助手。网关 systemd 单元**不可**设置 `NoNewPrivileges=yes`（会阻断 sudo 调 root 助手，上传/下载/列表/删除/新建目录全部失效）。
 - **回环租户隔离**（`bin/dsh-loopback-guard` + `units/dsh-loopback-guard.service`）：DSH 实例的特权接口按「Host 头是回环」放行，而所有实例同处 127.0.0.1--任何租户的 agent 都能伪造 Host 直连他人端口窃取 API Key。防护为 iptables OUTPUT 链：每个 `dsh-<name>` 只能连自己的实例端口，其他租户端口与网关端口被 REJECT，root/网关账号不受影响。userctl 增删用户自动刷新规则；规则按**目标端口**逐条 REJECT（不可按 uid 全量拒绝，否则会掐断内核回包路径）。
 - 每用户实例带 systemd 资源限制（TasksMax/MemoryMax/CPUQuota，可经 `DSH_MEM_MAX`/`DSH_CPU_QUOTA` 调整）与内核加固项。
-- 文件助手（dsh-file-put/read/stat/list）root 仅做参数字符串校验与身份切换，所有文件操作经 `runuser -u dsh-<name>` 以用户自身身份执行（修复 issue #1 的 TOCTOU 竞态）；助手内的 realpath 前缀校验仅保留退出码语义，不再是安全边界。依赖 util-linux 的 `runuser`。**上传助手为 v2 长度协议**（`BYTES <n>` 头 + 精确字节校验）：网关流式转发请求体，中断/超时/超限的上传会以 exit 6 拒绝提交，不会留下截断文件。
+- 文件助手（dsh-file-put/read/stat/list/delete/mkdir）root 仅做参数字符串校验与身份切换，所有文件操作经 `runuser -u dsh-<name>` 以用户自身身份执行（修复 issue #1 的 TOCTOU 竞态）；助手内的 realpath 前缀校验仅保留退出码语义，不再是安全边界。依赖 util-linux 的 `runuser`。**上传助手为 v2 长度协议**（`BYTES <n>` 头 + 精确字节校验）：网关流式转发请求体，中断/超时/超限的上传会以 exit 6 拒绝提交，不会留下截断文件。
 - 用户凭据文件必须保持仅属主可读（0600）：DSH 启动时会强制检查（`assertOwnerOnly`）。本网关的 root 助手模型天然满足，不要给用户目录添加任何 ACL 读取授权（曾因此触发实例拒绝启动）。
 - 网关与所有实例仅监听 127.0.0.1，公网只暴露 TLS 反代；反代必须**覆盖**（非追加）`X-Forwarded-For` 为 `$remote_addr`（`nginx/dsh-https-1145.conf` 模板已按此安全默认值配置），否则攻击者可伪造 XFF 绕过网关 IP 限流。
 - 登录限流为 IP + 账号两级；账号锁定（5 次/15 分钟）本身可被滥用作 DoS，仅靠 IP 级限流与强密码缓解。改密会使 `pwdVer` 递增，所有已签发会话立即失效（含无版本号的旧令牌）。
