@@ -3,7 +3,8 @@ FROM ${DSH_BASE_IMAGE}
 
 COPY . /opt/dsh-server-deployment
 
-RUN useradd --system --no-create-home --shell /usr/sbin/nologin dsh-gateway \
+RUN npm ci --omit=dev --ignore-scripts --prefix /opt/dsh-server-deployment \
+    && useradd --system --no-create-home --shell /usr/sbin/nologin dsh-gateway \
     && mkdir -p /usr/local/libexec/dsh \
     && install -o root -g root -m 0755 /opt/dsh-server-deployment/docker/dsh-users /usr/local/libexec/dsh/ \
     && install -o root -g root -m 0755 /opt/dsh-server-deployment/docker/dsh-register /usr/local/libexec/dsh/ \

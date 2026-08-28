@@ -20,7 +20,9 @@ const net = require('net');
 const path = require('path');
 const { execFileSync, spawn } = require('child_process');
 const { hashPassword, verifyPassword } = require('../gateway/auth.js');
-const { hasApiKey, hasAnyApiKey, repairCredentials, setApiKey, setCredential } = require('../gateway/credentials.js');
+const { credentialsPath, hasApiKey, hasAnyApiKey, repairCredentials, setApiKey, setCredential } = require('../gateway/credentials.js');
+const { ClusterStore } = require('../cluster/store.js');
+const { withFileLock } = require('../cluster/file-lock.js');
 
 const APP_DIR = process.env.DSH_APP_DIR || '/opt/deepseek-harness';
 const USERS_DIR = process.env.DSH_USERS_DIR || '/srv/dsh/users';
@@ -28,7 +30,10 @@ const STATE_DIR = process.env.DSH_GATEWAY_STATE_DIR || '/var/lib/dsh-gateway';
 const USERS_FILE = process.env.USERS_FILE || path.join(STATE_DIR, 'users.json');
 const IDENTITY_FILE = path.join(STATE_DIR, 'tenant-identities.json');
 const SECRET_FILE = process.env.SECRET_FILE || path.join(STATE_DIR, 'secret');
-const CWD_STATE_FILE = process.env.CWD_STATE_FILE || path.join(STATE_DIR, 'state-cwd.json');
+const CLUSTER_STATE_ID = String(process.env.DSH_NODE_ID || process.env.POD_UID || process.env.HOSTNAME || 'node')
+  .replace(/[^A-Za-z0-9_.-]/g, '_').slice(0, 128);
+const CWD_STATE_FILE = process.env.CWD_STATE_FILE
+  || path.join(STATE_DIR, process.env.DSH_CLUSTER_MODE === '1' ? `state-cwd-${CLUSTER_STATE_ID}.json` : 'state-cwd.json');
 const CONTROL_SOCKET = process.env.DSH_CONTROL_SOCKET || '/run/dsh/control.sock';
 const DSH_BIN = process.env.DSH_DSH_BIN || path.join(APP_DIR, 'apps/cli/lib/bin.js');
 const DEPLOYMENT_PATCH = '/opt/dsh-server-deployment/docker/disable-llm-deepseek.patch.yml';
@@ -54,16 +59,23 @@ const MIN_PASSWORD_LENGTH = 8;
 const ADMIN_NAME = (process.env.DSH_ADMIN_NAME || 'admin').trim();
 const ADMIN_PASSWORD = process.env.DSH_ADMIN_PASSWORD;
 const children = [];
+const clusterStore = new ClusterStore({ gatewayPort: GATEWAY_PORT });
+const CLUSTER_ENABLED = clusterStore.enabled;
+const USERS_DB_LOCK_OPTIONS = { timeoutMs: 180000, staleMs: 600000 };
 
 // Runtime state shared by boot provisioning and the control socket handlers.
 const state = {
   db: { version: 1, users: {} }, // live users.json mirror
   tenants: new Map(),            // exact username -> { record, child }
   tenantStarts: new Map(),        // exact username -> in-flight readiness promise
+  tenantLeases: new Map(),        // exact username -> current local cluster lease
   sharedWebPlugins: [],           // immutable image plugin + persistent runtime plugins
   sharedPluginBusy: false,        // serialize shared package mutations
   stopping: false,
   controlServer: null,
+  leaseHeartbeat: null,
+  leaseHeartbeatBusy: false,
+  leaseLastSuccessAt: Date.now(),
 };
 
 function numberEnv(name, fallback) {
@@ -646,6 +658,7 @@ function provisionTenant(tenant, port, uid, existing) {
   fs.chmodSync(home, 0o700);
   const passwordUnchanged = existing && existing.pwd && verifyPassword(tenant.password, existing.pwd);
   const record = {
+    uid,
     port,
     home,
     osUser,
@@ -683,7 +696,7 @@ function ensurePreservedRecord(name, record, uid) {
   if (repairCredentials(USERS_DIR, name)) console.log(`credentials repaired for tenant ${name}`);
   execFileSync('chown', ['-hR', `${osUser}:${osUser}`, record.home]);
   fs.chmodSync(record.home, 0o700);
-  return { ...record, osUser, home: record.home, port: record.port };
+  return { ...record, uid, osUser, home: record.home, port: record.port };
 }
 
 function readJson(file, fallback) {
@@ -868,6 +881,19 @@ function gatewayArgs() {
     'FILE_DELETE_HELPER=/usr/local/libexec/dsh/dsh-file-delete',
     'FILE_MKDIR_HELPER=/usr/local/libexec/dsh/dsh-file-mkdir',
   ];
+  for (const name of [
+    'DSH_CLUSTER_MODE',
+    'DSH_CLUSTER_DATABASE_URL',
+    'DSH_CLUSTER_TOKEN',
+    'DSH_NODE_ID',
+    'DSH_NODE_ADDRESS',
+    'POD_UID',
+    'POD_IP',
+    'DSH_SESSION_SECRET',
+    'DSH_TENANT_LEASE_SECONDS',
+  ]) {
+    if (process.env[name]) env.push(`${name}=${process.env[name]}`);
+  }
   return ['-u', 'dsh-gateway', '--', 'env', ...env, NODE_BIN, GATEWAY_SERVER];
 }
 
@@ -875,6 +901,25 @@ function gatewayArgs() {
 
 function saveUsersDb(db) {
   writeAtomic(USERS_FILE, `${JSON.stringify(db, null, 2)}\n`, 0o640, 'dsh-gateway:dsh-gateway');
+}
+
+function refreshUsersDb() {
+  const db = readJson(USERS_FILE, { version: 1, users: {} });
+  if (!db || typeof db !== 'object' || !db.users || typeof db.users !== 'object') {
+    throw new Error(`${USERS_FILE} has an invalid structure`);
+  }
+  state.db = db;
+  return db;
+}
+
+function ensureLocalUser(record, name) {
+  const uid = Number(record && record.uid);
+  if (!Number.isInteger(uid) || uid < 20000) throw new Error(`user ${name} has no valid uid`);
+  let existed = true;
+  try { execFileSync('id', [record.osUser || osUserOf(name)], { stdio: 'ignore' }); } catch (error) { existed = false; }
+  const osUser = ensureOsUser(name, record.home, uid);
+  if (record.osUser !== osUser) record.osUser = osUser;
+  return { osUser, created: !existed };
 }
 
 function usedPorts(db) {
@@ -896,7 +941,10 @@ function nextFreePort(used) {
 // full tenant and receives the same loopback isolation rule as other users.
 function applyLoopbackGuard() {
   const specs = Object.values(state.db.users)
-    .filter((record) => record && record.osUser && Number.isInteger(record.port))
+    .filter((record) => {
+      if (!record || !record.osUser || !Number.isInteger(record.port)) return false;
+      try { execFileSync('id', [record.osUser], { stdio: 'ignore' }); return true; } catch (error) { return false; }
+    })
     .map((record) => `${record.osUser}:${record.port}`);
   execFileSync(LOOPBACK_GUARD, ['--apply', ...specs], {
     stdio: 'inherit',
@@ -905,6 +953,93 @@ function applyLoopbackGuard() {
 }
 
 // ---------- tenant process lifecycle ----------
+
+function ownerResult(owner, started = false) {
+  return {
+    name: owner.username,
+    port: owner.tenantPort,
+    started,
+    local: owner.local,
+    owner: {
+      nodeId: owner.nodeId,
+      address: owner.nodeAddress,
+      gatewayPort: owner.gatewayPort,
+      generation: owner.generation,
+      leaseUntil: owner.leaseUntil,
+    },
+  };
+}
+
+function stopRemoteTenant(owner, name, reason, revokeSessions) {
+  const token = process.env.DSH_CLUSTER_TOKEN || '';
+  return new Promise((resolve, reject) => {
+    const body = JSON.stringify({ action: 'sleep', name, reason, revokeSessions });
+    const request = http.request({
+      host: owner.nodeAddress,
+      port: owner.gatewayPort,
+      method: 'POST',
+      path: '/__gw/internal/tenant-control',
+      headers: {
+        'content-type': 'application/json',
+        'content-length': Buffer.byteLength(body),
+        'x-dsh-cluster-token': token,
+      },
+    }, (response) => {
+      let raw = '';
+      response.setEncoding('utf8');
+      response.on('data', (chunk) => { if (raw.length < 65536) raw += chunk; });
+      response.on('end', () => {
+        let reply;
+        try { reply = JSON.parse(raw); } catch (error) {}
+        if ((response.statusCode || 500) >= 200 && (response.statusCode || 500) < 300 && reply && reply.ok === true) resolve(reply);
+        else reject(new Error((reply && reply.error) || `remote owner returned HTTP ${response.statusCode}`));
+      });
+    });
+    request.setTimeout(150000, () => request.destroy(new Error('remote tenant stop timeout')));
+    request.once('error', reject);
+    request.end(body);
+  });
+}
+
+async function releaseTenantLease(name) {
+  const lease = state.tenantLeases.get(name);
+  state.tenantLeases.delete(name);
+  if (!lease) return;
+  try {
+    await clusterStore.releaseTenant(name, lease.generation);
+  } catch (error) {
+    console.error(`tenant ${name} lease release failed: ${error.message}`);
+  }
+}
+
+function startLeaseHeartbeat() {
+  if (!CLUSTER_ENABLED || state.leaseHeartbeat) return;
+  const intervalMs = Math.max(1000, Math.floor(clusterStore.leaseSeconds * 1000 / 4));
+  const fenceMs = Math.max(5000, Math.floor(clusterStore.leaseSeconds * 1000 * 0.6));
+  state.leaseLastSuccessAt = Date.now();
+  state.leaseHeartbeat = setInterval(async () => {
+    if (state.stopping || state.leaseHeartbeatBusy) return;
+    state.leaseHeartbeatBusy = true;
+    try {
+      await clusterStore.registerNode(false);
+      for (const [name, lease] of state.tenantLeases) {
+        const renewed = await clusterStore.renewTenant(name, lease.generation);
+        if (!renewed) throw new Error(`tenant lease was lost: ${name}`);
+        lease.lastRenewedAt = Date.now();
+      }
+      state.leaseLastSuccessAt = Date.now();
+    } catch (error) {
+      console.error(`cluster lease heartbeat failed: ${error.message}`);
+      if (Date.now() - state.leaseLastSuccessAt >= fenceMs) {
+        console.error('cluster lease fencing deadline reached; stopping this container before leases expire');
+        shutdown(1);
+      }
+    } finally {
+      state.leaseHeartbeatBusy = false;
+    }
+  }, intervalMs);
+  state.leaseHeartbeat.unref();
+}
 
 function startTenant(name, record) {
   const existing = state.tenants.get(name);
@@ -915,6 +1050,7 @@ function startTenant(name, record) {
     onUnexpectedExit: () => {
       const active = state.tenants.get(name);
       if (active && active.child === child) state.tenants.delete(name);
+      releaseTenantLease(name).catch(() => {});
     },
   });
   const entry = { record, child, termination: child.__dshTermination };
@@ -1071,7 +1207,7 @@ function requirePassword(password) {
   return password;
 }
 
-function controlAdd(payload) {
+function controlAddUnlocked(payload) {
   const startedAt = Date.now();
   const { name, password } = payload;
   if (!validName(name)) throw new Error('invalid username (letters, digits, underscore, hyphen only)');
@@ -1115,16 +1251,35 @@ function controlAdd(payload) {
   };
 }
 
+function controlAdd(payload) {
+  return withFileLock(USERS_FILE, async () => {
+    refreshUsersDb();
+    return controlAddUnlocked(payload);
+  }, USERS_DB_LOCK_OPTIONS);
+}
+
 async function controlWake(payload) {
   const { name } = payload;
+  refreshUsersDb();
   const record = state.db.users[name];
   if (!record) throw new Error(`user not found: ${name}`);
-  const result = await ensureTenantStarted(name, record);
-  return { ok: true, result };
+  const localUser = ensureLocalUser(record, name);
+  if (localUser.created) applyLoopbackGuard();
+  const owner = await clusterStore.acquireTenant(name, record.port);
+  if (!owner.local) return { ok: true, result: ownerResult(owner, false) };
+  state.tenantLeases.set(name, { ...owner, lastRenewedAt: Date.now() });
+  try {
+    const result = await ensureTenantStarted(name, record);
+    return { ok: true, result: ownerResult(owner, result.started) };
+  } catch (error) {
+    await releaseTenantLease(name);
+    throw error;
+  }
 }
 
 async function controlSleep(payload) {
   const { name } = payload;
+  refreshUsersDb();
   const record = state.db.users[name];
   if (!record) throw new Error(`user not found: ${name}`);
   const startup = state.tenantStarts.get(name);
@@ -1139,15 +1294,22 @@ async function controlSleep(payload) {
   // untouched in the user's persistent HOME.
   const swept = killAllProcessesForOsUser(record.osUser);
   if (payload.revokeSessions === true) {
-    record.pwdVer = (typeof record.pwdVer === 'number' ? record.pwdVer : 0) + 1;
-    saveUsersDb(state.db);
+    await withFileLock(USERS_FILE, async () => {
+      refreshUsersDb();
+      const current = state.db.users[name];
+      if (current) {
+        current.pwdVer = (typeof current.pwdVer === 'number' ? current.pwdVer : 0) + 1;
+        saveUsersDb(state.db);
+      }
+    }, USERS_DB_LOCK_OPTIONS);
   }
+  await releaseTenantLease(name);
   console.log(`tenant ${name} stopped on ${payload.reason || 'logout'} `
     + `(wasRunning=${wasRunning}, swept=${swept}, revokeSessions=${payload.revokeSessions === true}, pwdVer=${record.pwdVer || 0})`);
   return { ok: true, result: { name, stopped: wasRunning, swept } };
 }
 
-function controlPasswd(payload) {
+function controlPasswdUnlocked(payload) {
   const { name, password } = payload;
   const record = state.db.users[name];
   if (!record) throw new Error(`user not found: ${name}`);
@@ -1160,20 +1322,37 @@ function controlPasswd(payload) {
   return { ok: true, result: { name } };
 }
 
+function controlPasswd(payload) {
+  return withFileLock(USERS_FILE, async () => {
+    refreshUsersDb();
+    return controlPasswdUnlocked(payload);
+  }, USERS_DB_LOCK_OPTIONS);
+}
+
 async function controlDel(payload) {
-  const { name } = payload;
-  const record = state.db.users[name];
-  if (!record) throw new Error(`user not found: ${name}`);
-  await stopTenant(name);
-  try { execFileSync('userdel', [record.osUser]); } catch (e) {}
-  try { fs.rmSync(record.home, { recursive: true, force: true }); } catch (e) {}
-  delete state.db.users[name];
-  saveUsersDb(state.db);
-  applyLoopbackGuard();
-  return { ok: true, result: { name } };
+  return withFileLock(USERS_FILE, async () => {
+    refreshUsersDb();
+    const { name } = payload;
+    const record = state.db.users[name];
+    if (!record) throw new Error(`user not found: ${name}`);
+    const owner = await clusterStore.getTenantOwner(name);
+    if (owner && !owner.local) {
+      await stopRemoteTenant(owner, name, 'user-delete', false);
+    }
+    await stopTenant(name);
+    await releaseTenantLease(name);
+    await clusterStore.deleteUserState(name);
+    try { execFileSync('userdel', [record.osUser]); } catch (e) {}
+    try { fs.rmSync(record.home, { recursive: true, force: true }); } catch (e) {}
+    delete state.db.users[name];
+    saveUsersDb(state.db);
+    applyLoopbackGuard();
+    return { ok: true, result: { name } };
+  }, USERS_DB_LOCK_OPTIONS);
 }
 
 function controlList() {
+  refreshUsersDb();
   const names = Object.keys(state.db.users).sort();
   return {
     ok: true,
@@ -1192,12 +1371,14 @@ function controlList() {
 }
 
 function controlStats() {
+  if (CLUSTER_ENABLED) throw new Error('synchronous process statistics are disabled in cluster mode');
   return { ok: true, result: tenantProcessStats() };
 }
 
 // Retained for explicit diagnostics; the admin user list no longer invokes it.
 let diskUsageCache = { at: 0, result: null };
 function controlDiskUsage() {
+  if (CLUSTER_ENABLED) throw new Error('synchronous disk usage scans are disabled in cluster mode');
   const now = Date.now();
   if (diskUsageCache.result && now - diskUsageCache.at < 60000) {
     return { ok: true, result: diskUsageCache.result };
@@ -1217,19 +1398,27 @@ function controlDiskUsage() {
   return { ok: true, result };
 }
 
-function controlSetKey(payload) {
+function controlSetKeyUnlocked(payload) {
   const { name, key } = payload;
   const record = state.db.users[name];
   if (!record) throw new Error(`user not found: ${name}`);
   if (typeof key !== 'string' || key.length === 0) throw new Error('API key required');
   setApiKey(USERS_DIR, name, key);
-  try { execFileSync('chown', ['-hR', `${record.osUser}:${record.osUser}`, record.home]); } catch (e) {}
+  try { execFileSync('chown', [`${record.osUser}:${record.osUser}`, credentialsPath(USERS_DIR, name)]); } catch (e) {}
   record.keyConfigured = true;
   saveUsersDb(state.db);
   return { ok: true, result: { name } };
 }
 
+function controlSetKey(payload) {
+  return withFileLock(USERS_FILE, async () => {
+    refreshUsersDb();
+    return controlSetKeyUnlocked(payload);
+  }, USERS_DB_LOCK_OPTIONS);
+}
+
 function controlKeyStatus(payload) {
+  refreshUsersDb();
   const { name } = payload;
   const record = state.db.users[name];
   if (!record) throw new Error(`user not found: ${name}`);
@@ -1237,6 +1426,7 @@ function controlKeyStatus(payload) {
 }
 
 function controlKeyStatusAll() {
+  refreshUsersDb();
   const result = {};
   for (const name of Object.keys(state.db.users)) {
     result[name] = hasAnyApiKey(USERS_DIR, name);
@@ -1249,6 +1439,7 @@ function controlSharedPluginList() {
 }
 
 async function controlSharedPluginAdd(payload, onProgress) {
+  if (CLUSTER_ENABLED) throw new Error('runtime shared plugin mutation is disabled in cluster mode; rebuild the image instead');
   if (state.sharedPluginBusy) throw new Error('another shared plugin operation is still running');
   const config = validateSharedPluginConfig(payload, 'shared plugin');
   state.sharedPluginBusy = true;
@@ -1268,6 +1459,7 @@ async function controlSharedPluginAdd(payload, onProgress) {
 }
 
 async function controlSharedPluginRemove(payload, onProgress) {
+  if (CLUSTER_ENABLED) throw new Error('runtime shared plugin mutation is disabled in cluster mode; rebuild the image instead');
   if (state.sharedPluginBusy) throw new Error('another shared plugin operation is still running');
   const { name } = payload;
   if (!validPackageName(name)) throw new Error('invalid shared plugin package name');
@@ -1310,7 +1502,7 @@ async function controlSharedPluginRemove(payload, onProgress) {
 // Register (or replace) a custom provider for an EXISTING user: write their
 // settings.yaml, owner-only credential and user record. Restart only an
 // already-active tenant; a dormant account stays dormant until login.
-async function controlSetProvider(payload) {
+async function controlSetProviderUnlocked(payload) {
   const { name } = payload;
   const record = state.db.users[name];
   if (!record) throw new Error(`user not found: ${name}`);
@@ -1321,7 +1513,9 @@ async function controlSetProvider(payload) {
   fs.writeFileSync(settingsFile, providerSettingsYaml(provider), { mode: 0o644 });
   const ref = providerApiKeyEnv(provider.name);
   setCredential(USERS_DIR, name, ref, key);
-  try { execFileSync('chown', ['-hR', record.osUser + ':' + record.osUser, record.home]); } catch (e) {}
+  try {
+    execFileSync('chown', [record.osUser + ':' + record.osUser, settingsFile, credentialsPath(USERS_DIR, name)]);
+  } catch (e) {}
   record.provider = {
     name: provider.name,
     baseURL: provider.baseURL,
@@ -1338,6 +1532,13 @@ async function controlSetProvider(payload) {
     await ensureTenantStarted(name, record);
   }
   return { ok: true, result: { name, provider: record.provider, started: wasRunning } };
+}
+
+function controlSetProvider(payload) {
+  return withFileLock(USERS_FILE, async () => {
+    refreshUsersDb();
+    return controlSetProviderUnlocked(payload);
+  }, USERS_DB_LOCK_OPTIONS);
 }
 
 async function handleControl(payload, onProgress = () => {}) {
@@ -1397,6 +1598,10 @@ function startControlServer() {
 function shutdown(exitCode = 0) {
   if (state.stopping) return;
   state.stopping = true;
+  if (state.leaseHeartbeat) clearInterval(state.leaseHeartbeat);
+  clusterStore.setDraining(true).catch((error) => {
+    console.error(`cannot mark cluster node draining: ${error.message}`);
+  });
   try {
     if (state.controlServer) state.controlServer.close();
     if (fs.existsSync(CONTROL_SOCKET)) fs.unlinkSync(CONTROL_SOCKET);
@@ -1408,18 +1613,24 @@ function shutdown(exitCode = 0) {
     for (const { child } of children) {
       try { process.kill(-child.pid, 'SIGKILL'); } catch {}
     }
-    process.exit(exitCode);
+    clusterStore.releaseNode().catch(() => {}).finally(() => process.exit(exitCode));
   }, 10000).unref();
   Promise.all(children.map(({ child }) =>
     (child.exitCode !== null || child.signalCode !== null)
       ? Promise.resolve()
       : new Promise((resolve) => child.once('exit', resolve)),
-  )).finally(() => process.exit(exitCode));
+  )).then(async () => {
+    try { await clusterStore.releaseNode(); } catch (error) {}
+    try { await clusterStore.close(); } catch (error) {}
+    process.exit(exitCode);
+  });
 }
 
 async function main() {
   if (process.getuid() !== 0) throw new Error('container entrypoint must run as root');
   if (!fs.existsSync(DSH_BIN)) throw new Error(`built dsh CLI not found: ${DSH_BIN}`);
+  if (CLUSTER_ENABLED && !LAZY_TENANTS) throw new Error('DSH cluster mode requires DSH_LAZY_TENANTS=1');
+  await clusterStore.init();
   const allSeedTenants = parseTenants();
   const adminEnabled = ADMIN_PASSWORD !== undefined && ADMIN_PASSWORD !== '';
   // When DSH_ADMIN_PASSWORD owns the reserved name, provision it once through
@@ -1441,53 +1652,60 @@ async function main() {
     fs.chmodSync(file, 0o600);
   }
 
-  state.sharedWebPlugins = await ensureRuntimeSharedPlugins(parseSharedPluginConfigs());
+  const sharedPluginConfigs = parseSharedPluginConfigs();
+  if (CLUSTER_ENABLED && sharedPluginConfigs.length > 0) {
+    throw new Error('DSH_SHARED_WEB_PLUGINS_JSON is not supported in cluster mode; build shared plugins into the image');
+  }
+  state.sharedWebPlugins = await ensureRuntimeSharedPlugins(sharedPluginConfigs);
   console.log(`shared web plugins ready: ${state.sharedWebPlugins.map((plugin) => plugin.name).join(', ')}`);
 
   // Merge: DSH_TENANTS_JSON is a bootstrap seed; users that were added at
   // runtime (persisted in the volume-backed users.json) survive restarts and
   // keep their port / password / identity.
-  const previousDb = readJson(USERS_FILE, { version: 1, users: {} });
-  const previousUsers = (previousDb && previousDb.users) || {};
-  const seedNames = new Set(seedTenants.map((t) => t.name.toLowerCase()));
-  if (adminEnabled) seedNames.add(ADMIN_NAME.toLowerCase());
-  const preserved = [];
-  for (const [name, record] of Object.entries(previousUsers)) {
-    if (seedNames.has(name.toLowerCase())) continue;
-    if (!record || typeof record !== 'object' ||
-        typeof record.home !== 'string' || typeof record.osUser !== 'string' ||
-        !Number.isInteger(record.port) || !record.pwd || typeof record.pwd !== 'object') {
-      console.error(`skipping invalid preserved user record: ${name}`);
-      continue;
+  let db;
+  await withFileLock(USERS_FILE, async () => {
+    const previousDb = readJson(USERS_FILE, { version: 1, users: {} });
+    const previousUsers = (previousDb && previousDb.users) || {};
+    const seedNames = new Set(seedTenants.map((t) => t.name.toLowerCase()));
+    if (adminEnabled) seedNames.add(ADMIN_NAME.toLowerCase());
+    const preserved = [];
+    for (const [name, record] of Object.entries(previousUsers)) {
+      if (seedNames.has(name.toLowerCase())) continue;
+      if (!record || typeof record !== 'object' ||
+          typeof record.home !== 'string' || typeof record.osUser !== 'string' ||
+          !Number.isInteger(record.port) || !record.pwd || typeof record.pwd !== 'object') {
+        console.error(`skipping invalid preserved user record: ${name}`);
+        continue;
+      }
+      preserved.push({ name, record });
     }
-    preserved.push({ name, record });
-  }
 
-  const identityRequests = [...seedTenants, ...preserved.map((p) => ({ name: p.name }))];
-  if (adminEnabled) identityRequests.push({ name: ADMIN_NAME });
-  const identities = assignUids(identityRequests);
-  const db = { version: 1, users: {} };
-  // Only preserved users occupy ports from the start; a seed user reuses its
-  // OWN previous port (so restarts never shuffle ports) and only truly new
-  // users draw from the free range.
-  const used = new Set(preserved.map((p) => p.record.port));
-  for (const tenant of seedTenants) {
-    const identity = identities[tenant.name.toLowerCase()];
-    const prev = previousUsers[tenant.name];
-    let port;
-    if (prev && Number.isInteger(prev.port) && !used.has(prev.port)) port = prev.port;
-    else port = nextFreePort(used);
-    used.add(port);
-    db.users[tenant.name] = provisionTenant(tenant, port, identity.uid, prev);
-  }
-  for (const { name, record } of preserved) {
-    const identity = identities[name.toLowerCase()];
-    db.users[name] = ensurePreservedRecord(name, record, identity.uid);
-    used.add(record.port);
-  }
-  provisionAdmin(db, previousUsers, identities, used);
-  state.db = db;
-  saveUsersDb(db);
+    const identityRequests = [...seedTenants, ...preserved.map((p) => ({ name: p.name }))];
+    if (adminEnabled) identityRequests.push({ name: ADMIN_NAME });
+    const identities = assignUids(identityRequests);
+    db = { version: 1, users: {} };
+    // Only preserved users occupy ports from the start; a seed user reuses its
+    // OWN previous port (so restarts never shuffle ports) and only truly new
+    // users draw from the free range.
+    const used = new Set(preserved.map((p) => p.record.port));
+    for (const tenant of seedTenants) {
+      const identity = identities[tenant.name.toLowerCase()];
+      const prev = previousUsers[tenant.name];
+      let port;
+      if (prev && Number.isInteger(prev.port) && !used.has(prev.port)) port = prev.port;
+      else port = nextFreePort(used);
+      used.add(port);
+      db.users[tenant.name] = provisionTenant(tenant, port, identity.uid, prev);
+    }
+    for (const { name, record } of preserved) {
+      const identity = identities[name.toLowerCase()];
+      db.users[name] = ensurePreservedRecord(name, record, identity.uid);
+      used.add(record.port);
+    }
+    provisionAdmin(db, previousUsers, identities, used);
+    state.db = db;
+    saveUsersDb(db);
+  }, USERS_DB_LOCK_OPTIONS);
   // Backfill the managed-container acknowledgement for every surviving user,
   // including records created by an older image.
   for (const record of Object.values(db.users)) {
@@ -1496,13 +1714,13 @@ async function main() {
 
   applyLoopbackGuard();
   startControlServer();
+  startLeaseHeartbeat();
 
   if (!LAZY_TENANTS) {
     for (const [name, record] of Object.entries(db.users)) {
-      startTenant(name, record);
+      const reply = await controlWake({ name });
+      if (!reply.result.local) console.log(`tenant ${name} is owned by cluster node ${reply.result.owner.nodeId}`);
     }
-    await Promise.all(Object.values(db.users)
-      .map((record) => waitForPort(record.port)));
   }
   spawnManaged('gateway', 'runuser', gatewayArgs());
   await waitForPort(GATEWAY_PORT, 30000);

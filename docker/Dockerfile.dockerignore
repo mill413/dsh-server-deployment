@@ -14,3 +14,4 @@
 **/*.tar.zst
 # runtime data bind mount (docker/data) - never part of the image
 docker/data
+docker/cluster-data

@@ -9,6 +9,8 @@ const url = require('url');
 const { spawn, execFileSync } = require('child_process');
 const zlib = require('zlib');
 const { verifyPassword, timingSafeStr } = require('./auth.js');
+const { ClusterStore } = require('../cluster/store.js');
+const { withFileLock } = require('../cluster/file-lock.js');
 
 const HOST = process.env.HOST || '127.0.0.1';
 const PORT = parseInt(process.env.PORT || '3081', 10);
@@ -46,7 +48,14 @@ function markActive(user, req) {
   if (activeUsers.size > 5000) {
     for (const [k, v] of activeUsers) if (now - v.at > ACTIVE_RETAIN_MS) activeUsers.delete(k);
   }
-  activeUsers.set(user, { at: now, ip: clientIp(req) });
+  const previous = activeUsers.get(user);
+  const ip = clientIp(req);
+  activeUsers.set(user, { at: now, ip });
+  if (CLUSTER_ENABLED && (!previous || previous.loggedOut || now - previous.at >= 30000)) {
+    clusterStore.markUserActive(user, ip, false).catch((error) => {
+      console.error(`cluster activity update failed for ${user}: ${error.message}`);
+    });
+  }
 }
 
 // ---------- self-service registration (Docker deployment) ----------
@@ -136,6 +145,10 @@ const MESSAGE_STREAM_TIMEOUT_MS = Math.max(30000, parseInt(process.env.DSH_MESSA
 const PLUGIN_TARBALL_DIR = process.env.DSH_PLUGIN_TARBALL_DIR
   || path.join(path.dirname(USERS_FILE), 'plugin-tarballs');
 const PLUGIN_TARBALL_MAX_MB = Math.min(1024, Math.max(1, parseInt(process.env.PLUGIN_TARBALL_MAX_MB || '100', 10) || 100));
+const clusterStore = new ClusterStore({ gatewayPort: PORT });
+const CLUSTER_ENABLED = clusterStore.enabled;
+const CLUSTER_TOKEN = process.env.DSH_CLUSTER_TOKEN || '';
+if (CLUSTER_ENABLED && CLUSTER_TOKEN.length < 32) throw new Error('DSH_CLUSTER_TOKEN must contain at least 32 characters in cluster mode');
 
 // ---------- history page trimming + JSON gzip tuning ----------
 // Huge agent sessions accumulate tens of thousands of streaming chunk events
@@ -154,6 +167,11 @@ const GZIP_MIN_BYTES = parseInt(process.env.GZIP_MIN_BYTES || '256', 10);
 const HISTORY_BUF_MAX = 64 * 1024 * 1024;
 
 function loadSecret() {
+  const configured = String(process.env.DSH_SESSION_SECRET || '').trim();
+  if (configured) {
+    if (configured.length < 32) throw new Error('DSH_SESSION_SECRET must contain at least 32 characters');
+    return configured;
+  }
   try {
     const s = fs.readFileSync(SECRET_FILE, 'utf8').trim();
     if (s.length >= 32) return s;
@@ -178,11 +196,23 @@ function hmac(data) {
 // ---------- users store (small JSON, cached) ----------
 let usersCache = { version: 1, users: {} };
 let usersCacheAt = 0;
+let usersCacheSignature = '';
 function loadUsers() {
   const now = Date.now();
-  if (now - usersCacheAt < 2000) return usersCache;
+  if (!CLUSTER_ENABLED && now - usersCacheAt < 2000) return usersCache;
+  if (CLUSTER_ENABLED && usersCacheAt > 0) {
+    try {
+      const stat = fs.statSync(USERS_FILE);
+      const signature = `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeMs}`;
+      if (signature === usersCacheSignature) return usersCache;
+    } catch (error) {}
+  }
   try {
     usersCache = JSON.parse(fs.readFileSync(USERS_FILE, 'utf8'));
+    try {
+      const stat = fs.statSync(USERS_FILE);
+      usersCacheSignature = `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeMs}`;
+    } catch (error) { usersCacheSignature = ''; }
   } catch (e) {
     // A corrupt store must be loud, not silently "no users" (lockout for
     // everyone + impossible to debug from the outside).
@@ -213,24 +243,30 @@ function hasKey(user) {
 // Atomically update one user record inside users.json (read-modify-write via
 // temp file + rename) so a crash never leaves a truncated store and the
 // in-memory cache is refreshed immediately.
-function mutateUserStore(user, fn) {
-  let db;
-  try { db = JSON.parse(fs.readFileSync(USERS_FILE, 'utf8')); } catch (e) {
-    // Never turn a permission/read failure into an empty database write: that
-    // would erase every user while trying to update one keyConfigured flag.
-    if (!e || e.code !== 'ENOENT') console.error('users.json update read failed:', e.message);
-    return false;
-  }
-  if (!db.users || !db.users[user]) return false;
-  fn(db.users[user]);
-  try {
-    const tmp = USERS_FILE + '.tmp-' + process.pid + '-' + Date.now().toString(36);
-    fs.writeFileSync(tmp, JSON.stringify(db, null, 2) + '\n', { mode: 0o640 });
-    fs.renameSync(tmp, USERS_FILE);
-  } catch (e) { console.error('users.json write failed:', e.message); return false; }
-  usersCache = db;
-  usersCacheAt = Date.now();
-  return true;
+async function mutateUserStore(user, fn) {
+  return withFileLock(USERS_FILE, async () => {
+    let db;
+    try { db = JSON.parse(fs.readFileSync(USERS_FILE, 'utf8')); } catch (e) {
+      // Never turn a permission/read failure into an empty database write: that
+      // would erase every user while trying to update one keyConfigured flag.
+      if (!e || e.code !== 'ENOENT') console.error('users.json update read failed:', e.message);
+      return false;
+    }
+    if (!db.users || !db.users[user]) return false;
+    fn(db.users[user]);
+    try {
+      const tmp = USERS_FILE + '.tmp-' + process.pid + '-' + Date.now().toString(36);
+      fs.writeFileSync(tmp, JSON.stringify(db, null, 2) + '\n', { mode: 0o640 });
+      fs.renameSync(tmp, USERS_FILE);
+    } catch (e) { console.error('users.json write failed:', e.message); return false; }
+    usersCache = db;
+    usersCacheAt = Date.now();
+    try {
+      const stat = fs.statSync(USERS_FILE);
+      usersCacheSignature = `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeMs}`;
+    } catch (error) { usersCacheSignature = ''; }
+    return true;
+  });
 }
 
 // Persist the flag and refresh the in-memory cache so the very next request
@@ -493,14 +529,30 @@ function registerFailure(map, key, max) {
   e.count += 1;
   if (e.count >= max) e.lockedUntil = now + LOCK_MS;
 }
-function checkAttempts(req, username) {
+async function checkAttempts(req, username) {
   const ip = clientIp(req);
+  if (CLUSTER_ENABLED) {
+    const [a, b] = await Promise.all([
+      clusterStore.rateLimitStatus('login-ip', ip),
+      clusterStore.rateLimitStatus('login-user', username),
+    ]);
+    return (a || b)
+      ? { allowed: false, retryAfter: Math.ceil((Math.max(a, b) - Date.now()) / 1000) }
+      : { allowed: true, retryAfter: 0 };
+  }
   const a = lockedUntil(ipFails, ip);
   const b = lockedUntil(userFails, username);
   if (a || b) return { allowed: false, retryAfter: Math.ceil((Math.max(a, b) - Date.now()) / 1000) };
   return { allowed: true, retryAfter: 0 };
 }
-function recordFailure(req, username) {
+async function recordFailure(req, username) {
+  if (CLUSTER_ENABLED) {
+    await Promise.all([
+      clusterStore.recordRateLimitFailure('login-ip', clientIp(req), MAX_IP_ATTEMPTS, WINDOW_MS, LOCK_MS),
+      clusterStore.recordRateLimitFailure('login-user', username, MAX_USER_ATTEMPTS, WINDOW_MS, LOCK_MS),
+    ]);
+    return;
+  }
   registerFailure(ipFails, clientIp(req), MAX_IP_ATTEMPTS);
   registerFailure(userFails, username, MAX_USER_ATTEMPTS);
   if (ipFails.size > 10000 || userFails.size > 10000) {
@@ -508,7 +560,14 @@ function recordFailure(req, username) {
     for (const m of [ipFails, userFails]) for (const [k, v] of m) if (now - v.windowStart > WINDOW_MS + LOCK_MS) m.delete(k);
   }
 }
-function recordSuccess(req, username) {
+async function recordSuccess(req, username) {
+  if (CLUSTER_ENABLED) {
+    await Promise.all([
+      clusterStore.clearRateLimit('login-ip', clientIp(req)),
+      clusterStore.clearRateLimit('login-user', username),
+    ]);
+    return;
+  }
   ipFails.delete(clientIp(req));
   userFails.delete(username);
 }
@@ -624,7 +683,11 @@ function cleanLoginTickets(now) {
     if (!value || value.expiresAt <= now) loginTickets.delete(key);
   }
 }
-function issueLoginTicket(user, returnTo) {
+async function issueLoginTicket(user, returnTo) {
+  if (CLUSTER_ENABLED) {
+    const result = await clusterStore.issueLoginTicket(user, returnTo, LOGIN_TICKET_TTL, LOGIN_TICKET_MAX);
+    return result.ticket;
+  }
   const now = Date.now();
   cleanLoginTickets(now);
   if (loginTickets.size >= LOGIN_TICKET_MAX) return null;
@@ -636,8 +699,9 @@ function issueLoginTicket(user, returnTo) {
   });
   return ticket;
 }
-function consumeLoginTicket(ticket) {
+async function consumeLoginTicket(ticket) {
   if (!ticket || typeof ticket !== 'string' || ticket.length > 256) return null;
+  if (CLUSTER_ENABLED) return clusterStore.consumeLoginTicket(ticket);
   const key = ticketKey(ticket);
   const value = loginTickets.get(key);
   // Delete before checking/using it, so concurrent requests cannot replay it.
@@ -859,16 +923,16 @@ function registerPage(csrf, error) {
 // instead of lingering on the coarse ACTIVE_WINDOW_MS last-request window.
 // `lastActiveAt` keeps the last authenticated-request time for the offline
 // display; users with no entry at all have never logged in.
-function adminUsersPayload(processStats, statsError, realKeys, diskUsage) {
+function adminUsersPayload(processStats, statsError, realKeys, diskUsage, clusterState) {
   const db = loadUsers();
   const now = Date.now();
   const users = Object.keys(db.users || {}).sort().map((name) => {
     const u = db.users[name];
-    const act = activeUsers.get(name);
+    const act = (clusterState && clusterState.activity.get(name)) || activeUsers.get(name);
     const process = processStats[name] || {};
     const tabs = tenantTabs.get(name);
-    let liveTab = false;
-    if (tabs) {
+    let liveTab = !!(clusterState && clusterState.online.has(name));
+    if (!clusterState && tabs) {
       for (const value of tabs.values()) {
         if (value && now - value.at <= PRESENCE_TTL_MS) { liveTab = true; break; }
       }
@@ -1374,14 +1438,17 @@ function publicPluginJob(job) {
 // instance through the root-only supervisor. Cache readiness for this gateway
 // lifetime and coalesce concurrent browser/API/WebSocket requests so one user
 // can never spawn duplicate processes.
-const readyTenants = new Map(); // username -> stable record marker (port + created)
+const readyTenants = new Map(); // username -> { marker, owner, checkedAt }
 const wakingTenants = new Map();
 const stoppingTenants = new Map();
 function ensureTenantInstance(name) {
   const record = getUser(name);
   if (!record || !record.port) return Promise.reject(new Error('user has no tenant instance'));
   const marker = String(record.port) + ':' + String(record.created || '');
-  if (readyTenants.get(name) === marker) return Promise.resolve();
+  const cached = readyTenants.get(name);
+  if (cached && cached.marker === marker && (!CLUSTER_ENABLED || Date.now() - cached.checkedAt < 2000)) {
+    return Promise.resolve(cached.owner);
+  }
   if (wakingTenants.has(name)) return wakingTenants.get(name);
   const wake = (async () => {
     const r = await runHelper([REGISTER_HELPER, '--wake', name, CONTROL_SOCKET], {
@@ -1393,7 +1460,24 @@ function ensureTenantInstance(name) {
     if (r.code !== 0 || !reply || reply.ok !== true) {
       throw new Error((reply && reply.error) || String(r.stderr || '').trim() || 'tenant startup failed');
     }
-    readyTenants.set(name, marker);
+    const raw = reply.result || {};
+    const owner = raw.owner ? {
+      local: raw.local !== false,
+      nodeId: raw.owner.nodeId,
+      address: raw.owner.address,
+      gatewayPort: Number(raw.owner.gatewayPort || PORT),
+      generation: Number(raw.owner.generation || 0),
+      tenantPort: Number(raw.port || record.port),
+    } : {
+      local: true,
+      nodeId: clusterStore.nodeId,
+      address: clusterStore.nodeAddress,
+      gatewayPort: PORT,
+      generation: 0,
+      tenantPort: record.port,
+    };
+    readyTenants.set(name, { marker, owner, checkedAt: Date.now() });
+    return owner;
   })();
   wakingTenants.set(name, wake);
   return wake.finally(() => wakingTenants.delete(name));
@@ -1410,21 +1494,31 @@ function stopTenantInstance(name, reason, revokeSessions = false) {
     return existing.promise;
   }
   const operation = (async () => {
-    const r = await runHelper([
-      REGISTER_HELPER,
-      '--sleep',
-      name,
-      CONTROL_SOCKET,
-      reason || 'browser-idle',
-      revokeSessions ? '1' : '0',
-    ], {
-      timeoutMs: 150000,
-      maxStdout: 64 * 1024,
-    });
-    let reply = null;
-    try { reply = JSON.parse(r.stdout); } catch (e) {}
-    if (r.code !== 0 || !reply || reply.ok !== true) {
-      throw new Error((reply && reply.error) || String(r.stderr || '').trim() || 'tenant stop failed');
+    let reply;
+    const owner = CLUSTER_ENABLED ? await clusterStore.getTenantOwner(name) : null;
+    if (owner && !owner.local) {
+      reply = await peerTenantControl(owner, {
+        action: 'sleep',
+        name,
+        reason: reason || 'browser-idle',
+        revokeSessions,
+      });
+    } else {
+      const r = await runHelper([
+        REGISTER_HELPER,
+        '--sleep',
+        name,
+        CONTROL_SOCKET,
+        reason || 'browser-idle',
+        revokeSessions ? '1' : '0',
+      ], {
+        timeoutMs: 150000,
+        maxStdout: 64 * 1024,
+      });
+      try { reply = JSON.parse(r.stdout); } catch (e) {}
+      if (r.code !== 0 || !reply || reply.ok !== true) {
+        throw new Error((reply && reply.error) || String(r.stderr || '').trim() || 'tenant stop failed');
+      }
     }
     readyTenants.delete(name);
     usersCacheAt = 0;
@@ -1436,6 +1530,36 @@ function stopTenantInstance(name, reason, revokeSessions = false) {
   });
   stoppingTenants.set(name, entry);
   return entry.promise;
+}
+
+function peerTenantControl(owner, payload) {
+  return new Promise((resolve, reject) => {
+    const body = JSON.stringify(payload);
+    const request = http.request({
+      host: owner.nodeAddress,
+      port: owner.gatewayPort,
+      method: 'POST',
+      path: '/__gw/internal/tenant-control',
+      headers: {
+        'content-type': 'application/json',
+        'content-length': Buffer.byteLength(body),
+        'x-dsh-cluster-token': CLUSTER_TOKEN,
+      },
+    }, (response) => {
+      let raw = '';
+      response.setEncoding('utf8');
+      response.on('data', (chunk) => { if (raw.length < 65536) raw += chunk; });
+      response.on('end', () => {
+        let reply;
+        try { reply = JSON.parse(raw); } catch (error) {}
+        if ((response.statusCode || 500) >= 200 && (response.statusCode || 500) < 300 && reply && reply.ok === true) resolve(reply);
+        else reject(new Error((reply && reply.error) || `cluster owner returned HTTP ${response.statusCode}`));
+      });
+    });
+    request.setTimeout(150000, () => request.destroy(new Error('cluster owner control timeout')));
+    request.once('error', reject);
+    request.end(body);
+  });
 }
 
 // Browser presence drives automatic process recycling. pagehide/sendBeacon
@@ -1492,6 +1616,11 @@ function schedulePresenceStop(user, reason) {
 
 function updateTenantPresence(session, tabId, event) {
   const user = session.u;
+  if (CLUSTER_ENABLED) {
+    clusterStore.updatePresence(user, tabId, String(session.n || ''), event).catch((error) => {
+      console.error(`cluster presence update failed for ${user}: ${error.message}`);
+    });
+  }
   let tabs = tenantTabs.get(user);
   if (!tabs) { tabs = new Map(); tenantTabs.set(user, tabs); }
   let nonces = presenceNonces.get(user);
@@ -1966,6 +2095,63 @@ function proxyUpgrade(req, socket, head, port, user) {
   upstream.on('close', () => socket.destroy());
 }
 
+function peerHeaders(req) {
+  const headers = cleanHeaders(req.headers);
+  delete headers['x-dsh-cluster-token'];
+  delete headers['x-dsh-cluster-hop'];
+  headers['x-dsh-cluster-token'] = CLUSTER_TOKEN;
+  headers['x-dsh-cluster-hop'] = '1';
+  headers['x-forwarded-for'] = clientIp(req);
+  return headers;
+}
+
+function proxyPeerRequest(req, res, owner, user) {
+  const upstreamReq = http.request({
+    host: owner.address,
+    port: owner.gatewayPort,
+    method: req.method,
+    path: req.url,
+    headers: peerHeaders(req),
+  }, (upstreamRes) => {
+    upstreamRes.on('error', () => { try { res.destroy(); } catch (error) {} });
+    res.writeHead(upstreamRes.statusCode || 502, cleanHeaders(upstreamRes.headers));
+    upstreamRes.pipe(res);
+  });
+  upstreamReq.on('error', (error) => {
+    readyTenants.delete(user);
+    console.error(`cluster proxy error -> ${owner.nodeId}@${owner.address}:${owner.gatewayPort}: ${error.message}`);
+    if (!res.headersSent) res.writeHead(503, { 'Content-Type': 'application/json; charset=utf-8', 'Retry-After': '2' });
+    if (!res.writableEnded) res.end(JSON.stringify({ ok: false, error: '用户实例正在故障转移，请稍后重试' }));
+  });
+  req.on('error', () => upstreamReq.destroy());
+  res.on('close', () => { try { upstreamReq.destroy(); } catch (error) {} });
+  req.pipe(upstreamReq);
+}
+
+function proxyPeerUpgrade(req, socket, head, owner, user) {
+  const headers = peerHeaders(req);
+  const lines = [req.method + ' ' + req.url + ' HTTP/1.1'];
+  for (const [key, value] of Object.entries(headers)) {
+    if (Array.isArray(value)) lines.push(key + ': ' + value.join(', '));
+    else if (value !== undefined) lines.push(key + ': ' + value);
+  }
+  lines.push('Connection: Upgrade', 'Upgrade: websocket', '', '');
+  const upstream = net.connect(owner.gatewayPort, owner.address, () => {
+    upstream.write(lines.join('\r\n'));
+    if (head && head.length) upstream.write(head);
+    socket.pipe(upstream);
+    upstream.pipe(socket);
+  });
+  upstream.on('error', () => {
+    readyTenants.delete(user);
+    try { socket.write('HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n'); } catch (error) {}
+    socket.destroy();
+  });
+  socket.on('error', () => upstream.destroy());
+  socket.on('close', () => upstream.destroy());
+  upstream.on('close', () => socket.destroy());
+}
+
 // ---------- request logging ----------
 function logLine(req, status, extra) {
   // Login tickets are bearer credentials. Redact them even from local logs.
@@ -1996,7 +2182,69 @@ const server = http.createServer(async (req, res) => {
     } catch (e) { /* fall through to normal handling */ }
   }
 
-  if (pathname === '/__gw/health') return json(res, 200, { ok: true, now: Date.now() });
+  if (pathname === '/__gw/health') {
+    try {
+      const cluster = await clusterStore.health();
+      return json(res, 200, { ok: true, now: Date.now(), ...cluster });
+    } catch (error) {
+      return json(res, 503, { ok: false, error: 'cluster state unavailable' });
+    }
+  }
+
+  if (pathname === '/__gw/internal/tenant-control') {
+    if (!CLUSTER_ENABLED || req.method !== 'POST'
+        || !timingSafeStr(String(req.headers['x-dsh-cluster-token'] || ''), CLUSTER_TOKEN)) {
+      return json(res, 403, { ok: false, error: 'forbidden' });
+    }
+    let payload;
+    try { payload = await readJsonBody(req, 8192); } catch (error) {
+      return json(res, 400, { ok: false, error: 'invalid cluster control payload' });
+    }
+    if (!payload || payload.action !== 'sleep' || !/^[A-Za-z0-9_-]{1,64}$/.test(String(payload.name || ''))) {
+      return json(res, 400, { ok: false, error: 'invalid cluster control operation' });
+    }
+    const r = await runHelper([
+      REGISTER_HELPER,
+      '--sleep',
+      payload.name,
+      CONTROL_SOCKET,
+      String(payload.reason || 'cluster-control').slice(0, 64),
+      payload.revokeSessions === true ? '1' : '0',
+    ], { timeoutMs: 150000, maxStdout: 64 * 1024 });
+    let reply;
+    try { reply = JSON.parse(r.stdout); } catch (error) {}
+    if (r.code !== 0 || !reply || reply.ok !== true) {
+      return json(res, 500, { ok: false, error: (reply && reply.error) || String(r.stderr || '').trim() || 'tenant control failed' });
+    }
+    return json(res, 200, reply);
+  }
+
+  if (CLUSTER_ENABLED) {
+    const peerHop = req.headers['x-dsh-cluster-hop'] === '1';
+    if (req.headers['x-dsh-cluster-hop'] && (!peerHop || !timingSafeStr(String(req.headers['x-dsh-cluster-token'] || ''), CLUSTER_TOKEN))) {
+      return json(res, 403, { ok: false, error: 'invalid cluster peer request' });
+    }
+    let routeUser = session && session.u;
+    if (!routeUser && apiAuthorized(req)) {
+      const match = /^\/api\/users\/([A-Za-z0-9_-]{1,64})(?:\/|$)/.exec(pathname);
+      if (match) routeUser = match[1];
+    }
+    if (routeUser && pathname !== '/__gw/status') {
+      try {
+        const owner = await ensureTenantInstance(routeUser);
+        if (owner && !owner.local) {
+          if (peerHop) {
+            readyTenants.delete(routeUser);
+            return json(res, 503, { ok: false, error: 'tenant ownership changed during cluster routing' });
+          }
+          return proxyPeerRequest(req, res, owner, routeUser);
+        }
+      } catch (error) {
+        logLine(req, 503, 'cluster-route-fail ' + routeUser + ' ' + String(error.message).slice(0, 160));
+        return json(res, 503, { ok: false, error: '实例路由失败，请稍后重试：' + error.message });
+      }
+    }
+  }
 
   if (pathname === '/__gw/status') {
     if (!session) return json(res, 401, {
@@ -2018,6 +2266,11 @@ const server = http.createServer(async (req, res) => {
       if (req.method === 'GET') return redirect(res, '/login');
       return json(res, 403, { ok: false, error: '需要管理员权限' });
     }
+    if (CLUSTER_ENABLED && req.method === 'POST'
+        && (pathname === '/__gw/admin/plugins/add' || pathname === '/__gw/admin/plugins/remove'
+          || pathname === '/__gw/admin/plugins/cancel' || pathname === '/__gw/admin/plugins/upload')) {
+      return json(res, 409, { ok: false, error: '集群模式禁止运行时修改共享插件，请构建新镜像后滚动发布' });
+    }
     if (pathname === '/__gw/admin/users') {
       // Live user metrics are disabled because all three helpers share the
       // supervisor socket with login wake/sleep. In particular, synchronous
@@ -2034,7 +2287,11 @@ const server = http.createServer(async (req, res) => {
       const statsError = null;
       const realKeys = null; // adminUsersPayload falls back to users.json.keyConfigured
       const diskUsage = null;
-      return json(res, 200, adminUsersPayload(stats, statsError, realKeys, diskUsage));
+      let clusterState = null;
+      if (CLUSTER_ENABLED) {
+        try { clusterState = await clusterStore.clusterUserState(PRESENCE_TTL_MS); } catch (error) { return json(res, 503, { ok: false, error: error.message }); }
+      }
+      return json(res, 200, adminUsersPayload(stats, statsError, realKeys, diskUsage, clusterState));
     }
     if (pathname === '/__gw/admin/plugins' && req.method === 'GET') {
       try {
@@ -2145,21 +2402,19 @@ const server = http.createServer(async (req, res) => {
         // of the user's OS account (killAllProcessesForOsUser) and bumps pwdVer
         // (revokeSessions), which invalidates all of the user's session tokens
         // - a hard logout plus process kill in one call.
-        const r = await runHelper([REGISTER_HELPER, '--sleep', name, CONTROL_SOCKET, 'admin-force'], {
-          timeoutMs: 150000,
-          maxStdout: 64 * 1024,
-        });
-        let reply = null;
-        try { reply = JSON.parse(r.stdout); } catch (e) {}
-        if (r.code !== 0 || !reply || reply.ok !== true) {
-          throw new Error((reply && reply.error) || String(r.stderr || '').trim() || 'tenant stop failed');
-        }
+        await stopTenantInstance(name, 'admin-force', true);
         // Clear gateway-side presence state so the kicked user reads offline
         // immediately; the pwdVer bump already kills their sessions server-side.
         cancelPresenceStop(name);
         tenantTabs.delete(name);
         presenceNonces.delete(name);
         readyTenants.delete(name);
+        if (CLUSTER_ENABLED) {
+          await Promise.all([
+            clusterStore.clearUserPresence(name),
+            clusterStore.markUserActive(name, null, true),
+          ]).catch((error) => console.error(`cluster logout state update failed for ${name}: ${error.message}`));
+        }
         logLine(req, 200, 'admin-kick ' + name);
         return json(res, 200, { ok: true });
       } catch (error) {
@@ -2205,7 +2460,7 @@ const server = http.createServer(async (req, res) => {
       }
       const username = (form.username || '').trim();
       const password = form.password || '';
-      const attempt = checkAttempts(req, username);
+      const attempt = await checkAttempts(req, username);
       if (!attempt.allowed) {
         res.setHeader('Retry-After', String(attempt.retryAfter));
         logLine(req, 429, 'locked ' + username);
@@ -2223,7 +2478,7 @@ const server = http.createServer(async (req, res) => {
       if (u && u.pwd) ok = verifyPassword(password, u.pwd);
       else crypto.scryptSync(password, DUMMY_SALT, 64);
       if (!ok) {
-        recordFailure(req, username);
+        await recordFailure(req, username);
         logLine(req, 401, 'bad-creds ' + username);
         const csrf2 = crypto.randomBytes(16).toString('hex');
         res.setHeader('Set-Cookie', cookieHeader(CSRF_COOKIE, csrf2, { maxAge: 600, path: '/', sameSite: 'Lax' }));
@@ -2231,7 +2486,7 @@ const server = http.createServer(async (req, res) => {
         res.writeHead(401, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
         return res.end(loginPage(csrf2, '用户名或密码错误'));
       }
-      recordSuccess(req, username);
+      await recordSuccess(req, username);
       if (u.port) {
         try {
           await ensureTenantInstance(username);
@@ -2278,7 +2533,9 @@ const server = http.createServer(async (req, res) => {
         return renderErr('CSRF 校验失败，请刷新页面重试', 403);
       }
       const ip = clientIp(req);
-      const locked = lockedUntil(registerFails, ip);
+      const locked = CLUSTER_ENABLED
+        ? await clusterStore.rateLimitStatus('register-ip', ip)
+        : lockedUntil(registerFails, ip);
       if (locked) {
         res.setHeader('Retry-After', String(Math.ceil((locked - Date.now()) / 1000)));
         logLine(req, 429, 'register-locked ' + ip);
@@ -2297,7 +2554,11 @@ const server = http.createServer(async (req, res) => {
       let reply = null;
       try { reply = JSON.parse(r.stdout); } catch (e) {}
       if (r.code !== 0 || !reply || reply.ok !== true) {
-        registerFailure(registerFails, ip, MAX_REGISTER_ATTEMPTS);
+        if (CLUSTER_ENABLED) {
+          await clusterStore.recordRateLimitFailure('register-ip', ip, MAX_REGISTER_ATTEMPTS, WINDOW_MS, LOCK_MS);
+        } else {
+          registerFailure(registerFails, ip, MAX_REGISTER_ATTEMPTS);
+        }
         const detail = (reply && reply.error) || String(r.stderr || '').trim() || '注册失败，请稍后重试';
         logLine(req, 200, 'register-fail ' + username + ' ' + detail.slice(0, 160));
         return renderErr(detail);
@@ -2305,7 +2566,8 @@ const server = http.createServer(async (req, res) => {
       // The supervisor has persisted the user; drop the gateway's users cache
       // so the immediate redirect and any follow-up login see it right away.
       usersCacheAt = 0;
-      registerFails.delete(ip);
+      if (CLUSTER_ENABLED) await clusterStore.clearRateLimit('register-ip', ip);
+      else registerFails.delete(ip);
       logLine(req, 302, 'register ' + username + ' port=' + (reply.result && reply.result.port));
       return redirect(res, '/login?ok=1');
     }
@@ -2326,7 +2588,7 @@ const server = http.createServer(async (req, res) => {
     if (!getUser(username)) return json(res, 404, { ok: false, error: 'user not found' });
     const returnTo = safeReturnTo(body.returnTo);
     if (returnTo === null) return json(res, 400, { ok: false, error: 'returnTo must be a same-origin absolute path' });
-    const ticket = issueLoginTicket(username, returnTo);
+    const ticket = await issueLoginTicket(username, returnTo);
     if (!ticket) return json(res, 503, { ok: false, error: 'too many outstanding login tickets' });
     res.setHeader('Cache-Control', 'no-store');
     logLine(req, 200, 'login-ticket ' + username);
@@ -2340,7 +2602,7 @@ const server = http.createServer(async (req, res) => {
   if (pathname === '/auth/external' && req.method === 'GET') {
     let ticket = '';
     try { ticket = new URL(req.url, 'http://gw').searchParams.get('ticket') || ''; } catch (e) {}
-    const login = consumeLoginTicket(ticket);
+    const login = await consumeLoginTicket(ticket);
     if (!login || !getUser(login.user)) {
       logLine(req, 302, 'external-login invalid');
       return redirect(res, '/login');
@@ -2731,6 +2993,12 @@ const server = http.createServer(async (req, res) => {
         // loggedOut flag forces online=false immediately. A later login's
         // markActive overwrites the entry and clears the flag.
         activeUsers.set(session.u, { at: Date.now(), ip: clientIp(req), loggedOut: true });
+        if (CLUSTER_ENABLED) {
+          await Promise.all([
+            clusterStore.clearUserPresence(session.u),
+            clusterStore.markUserActive(session.u, clientIp(req), true),
+          ]).catch((error) => console.error(`cluster logout state update failed for ${session.u}: ${error.message}`));
+        }
         logLine(req, 302, 'logout-stop ' + session.u);
       }
     }
@@ -2769,7 +3037,7 @@ const server = http.createServer(async (req, res) => {
       if (!u || !u.port) return renderErr('账号配置异常');
       const saved = await rpcCredentialsSet(u.port, key);
       if (!saved.ok) return renderErr('写入失败：' + saved.detail);
-      if (!setUserKeyFlag(session.u, true)) return renderErr('API Key 已写入，但用户状态保存失败，请联系管理员检查 users.json 权限');
+      if (!await setUserKeyFlag(session.u, true)) return renderErr('API Key 已写入，但用户状态保存失败，请联系管理员检查 users.json 权限');
       logLine(req, 200, 'set-key ' + session.u);
       return redirect(res, '/');
     }
@@ -3192,15 +3460,29 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.on('upgrade', async (req, socket, head) => {
+  const peerHop = req.headers['x-dsh-cluster-hop'] === '1';
+  if (CLUSTER_ENABLED && req.headers['x-dsh-cluster-hop']
+      && (!peerHop || !timingSafeStr(String(req.headers['x-dsh-cluster-token'] || ''), CLUSTER_TOKEN))) {
+    socket.write('HTTP/1.1 403 Forbidden\r\n\r\n'); socket.destroy(); return;
+  }
   const session = getSession(req);
   if (!session) { logRejectedSession(req); socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n'); socket.destroy(); return; }
   if (!hasKey(session.u)) { socket.write('HTTP/1.1 403 Forbidden\r\n\r\n'); socket.destroy(); return; }
   const u = getUser(session.u);
   if (!u || !u.port) { socket.destroy(); return; }
-  try { await ensureTenantInstance(session.u); } catch (error) {
+  let owner;
+  try { owner = await ensureTenantInstance(session.u); } catch (error) {
     socket.write('HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n');
     socket.destroy();
     return;
+  }
+  if (CLUSTER_ENABLED && owner && !owner.local) {
+    if (peerHop) {
+      socket.write('HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n');
+      socket.destroy();
+      return;
+    }
+    return proxyPeerUpgrade(req, socket, head, owner, session.u);
   }
   proxyUpgrade(req, socket, head, u.port, session.u);
 });
@@ -3212,7 +3494,9 @@ server.listen(PORT, HOST, () => {
 
 // Graceful shutdown: stop accepting, let in-flight proxies/uploads finish.
 function shutdown() {
-  server.close(() => process.exit(0));
+  server.close(() => {
+    clusterStore.close().catch(() => {}).finally(() => process.exit(0));
+  });
   setTimeout(() => process.exit(0), 10000).unref();
 }
 process.on('SIGTERM', shutdown);

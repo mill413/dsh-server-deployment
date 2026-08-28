@@ -1,0 +1,10 @@
+{
+  "name": "dsh-server-deployment-runtime",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Runtime dependencies for clustered DSH server deployment",
+  "license": "MIT",
+  "dependencies": {
+    "pg": "^8.16.3"
+  }
+}

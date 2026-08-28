@@ -94,6 +94,37 @@ docker compose -f docker/compose.yml logs --tail=100
 
 默认 Compose 设置 `DSH_SKIP_KEY_SETUP=1`，仅用于无真实 API Key 的登录、页面与租户隔离测试；此模式不能实际调用模型。要测试完整对话流程，将其改为 `0`，重启后从首次登录页为每个租户分别填写 Key。
 
+### 单 Deployment 多副本模式
+
+集群模式让同一个 DSH Deployment 的所有副本同时承担 Gateway 与租户 Worker。Kubernetes Service/HAProxy 可以把请求发送到任意副本；Gateway 从 PostgreSQL 查询用户租约，将 HTTP、文件流和 WebSocket 转发到实际持有该用户 DSH 进程的 Pod。租约带单调递增的 generation，supervisor 定期续租；数据库连接持续失败或租约被抢占时，旧 owner 会在租约到期前停止全部子进程，避免两个 Pod 同时写用户 HOME。
+
+集群模式要求：
+
+- 一块所有副本同时挂载的 `ReadWriteMany` 用户数据卷，且必须提供一致的 POSIX UID、原子 `mkdir`/`rename` 语义；`users.json`、UID 表和用户 HOME 位于该卷，所有用户库写入由跨进程目录锁串行化。
+- PostgreSQL；保存 Pod 注册、租户租约、一次性登录票据、全局登录/注册限流、在线活动和浏览器 presence。
+- 所有副本使用相同的 `DSH_SESSION_SECRET` 与至少 32 字符的 `DSH_CLUSTER_TOKEN`。
+- `DSH_LAZY_TENANTS=1`；租户必须先取得租约再启动，集群模式拒绝 eager 启动。
+- 入口代理必须覆盖 `X-Forwarded-For`，并允许长连接/WebSocket。Pod 的 3100 端口只应向代理和同 Deployment 的 peer Pod开放。
+
+本仓库提供三副本 Compose 验收环境：
+
+```bash
+docker compose -f docker/compose.cluster.yml up -d --build \
+  --scale dsh-multitenant=3
+docker compose -f docker/compose.cluster.yml ps
+docker compose -f docker/compose.cluster.yml logs -f dsh-multitenant
+```
+
+默认仍从 `http://127.0.0.1:20810` 访问；若端口已占用，可设置 `DSH_GATEWAY_HOST_PORT=20811`。`docker/compose.cluster.yml` 内的数据库口令、session secret 和 cluster token 仅用于本机测试，生产环境必须替换。完整自动验收（3 个副本、跨节点 session、owner 故障接管、跨副本票据和并发注册）运行：
+
+```bash
+./docker/test-cluster.sh
+```
+
+Kubernetes 模板见 `k8s/dsh-cluster.yaml`。部署前创建 `dsh-cluster-secrets` Secret 和名为 `dsh-rwx` 的 RWX PVC。普通 HPA scale-out 可增加接收流量的 Gateway；scale-in 会使被删除 Pod 的活跃租户短暂断开，并由剩余副本在重连时接管。
+
+集群模式暂时禁止运行时安装/删除共享插件，因为插件目录发布和跨 Pod 租户重启尚未形成原子集群事务；请把插件构建进镜像后滚动发布。单副本模式的运行时插件功能不受影响。
+
 ### Docker 下运行时管理用户（无需改 Compose）
 
 `DSH_TENANTS_JSON` 只是**启动种子**：容器启动时按它创建/更新租户。之后可用镜像内置的 `dsh-users` 命令随时增删用户、改密、设置 Key，**无需编辑 compose、无需重建或重启容器**：
@@ -112,7 +143,7 @@ docker compose -f docker/compose.yml exec dsh-multitenant dsh-users del carol   
 
 - 运行时新增的用户写入 `docker/data/gateway/users.json`（容器内 `/var/lib/dsh/gateway/users.json`），**容器重建/重启后依然存在**（重启时种子列表与存量用户合并，端口/口令/身份保持不变）。所有数据通过绑定挂载持久化在宿主机 `docker/data/`（容器内 `/var/lib/dsh`：`users/` 用户目录 + `gateway/` 状态），直接可见、可备份。supervisor IPC socket 位于非持久化的 `/run/dsh/control.sock`（可用 `DSH_CONTROL_SOCKET` 覆盖），不会进入数据备份，也不能由多个实例共享。
 - 删除用户请用 `dsh-users del`（会一并删除该用户的数据）；把用户从 `DSH_TENANTS_JSON` 里删掉**不会**删除已存在的用户。
-- `dsh-users` 与网关共享同一份用户库：新用户立即可登录（网关侧缓存最长 2 秒刷新）。
+- `dsh-users` 与网关共享同一份用户库：单副本网关缓存最长 2 秒刷新；集群模式每次检查共享原子文件版本，发生替换后立即重载，因此其他副本的下一次请求即可看到新增用户或密码版本。
 - 口令最少 8 位；`passwd` 会使该用户所有已签发会话立即失效。
 - 默认启用 `DSH_LAZY_TENANTS=1`：建号只创建 OS 账号、独立 HOME、端口记录、共享插件链接和防火墙规则，不启动 DSH。用户首次成功登录时网关调用监管进程启动该用户实例并等待就绪；实例运行到用户退出/浏览器离线回收或容器重启。设置 `DSH_LAZY_TENANTS=0` 可恢复启动容器/建号时立即拉起全部实例的旧行为。
 - 登录后的 DSH 页面在左侧栏“设置”正上方提供“退出登录”按钮，直接复用设置行的样式和宽/窄状态：侧栏展开时显示图标与文字，收起时只显示同尺寸图标。手动退出会撤销该用户全部已签发会话，先停止租户进程组，再按租户唯一 OS UID 强制清理任何脱离进程组的后台进程；不会删除或修改用户 HOME、工作区、会话文件、配置或凭据。浏览器页面通过标签页心跳登记在线状态，关闭最后一个标签页后默认宽限 5 秒再回收租户进程；多标签页只关闭其中一个不会停止。浏览器崩溃、断网或来不及发送关闭通知时，默认 24 小时心跳超时后兜底回收。自动回收只管理进程生命周期，不撤销登录 Cookie；用户下次访问会使用原会话重新唤醒实例。设置 `SESSION_REFRESH_INTERVAL`（秒）可让有效心跳按间隔滑动续期，`0` 表示关闭；例如 `SESSION_TTL=432000`、`SESSION_REFRESH_INTERVAL=86400` 表示每次签发有效 5 天且在线时每 24 小时续期。只有手动退出、管理员强退或改密才撤销会话。可用 `DSH_BROWSER_STOP_GRACE_MS` 和 `DSH_BROWSER_PRESENCE_TTL_MS` 调整进程回收时间。
@@ -200,7 +231,7 @@ curl -X POST https://dsh.example.com/api/login-ticket \
 
 - 票据默认 60 秒有效、仅可使用一次、进程重启即失效；`LOGIN_TICKET_TTL` 可设为 10–300 秒。
 - 接口未配置 `DSH_LOGIN_API_KEY` 时保持关闭；未知用户返回 404，错误/缺失的 Bearer Token 返回 401。
-- 票据保存在网关进程内存中，因此当前部署必须保持单副本网关；换票与浏览器消费票据需要命中同一进程。
+- 单副本模式的票据保存在网关进程内存中；集群模式将票据原子地写入 PostgreSQL，因此换票与消费可以命中不同副本，且仍只能成功消费一次。
 - `DSH_LOGIN_API_KEY` 拥有“以任意已有用户登录”的高权限，必须与 `DSH_REGISTER_API_KEY` 分开并通过 Kubernetes Secret 等机密存储注入。
 
 浏览器并发登录压测可使用 `bin/dsh-browser-login-load.sh`。脚本为每个用户创建独立 Chromium profile，避免同源 `dsh_session` Cookie 互相覆盖；默认同时打开 5 个并保持 60 秒，建议逐步增加并发而非直接启动 100 个浏览器进程：
@@ -360,6 +391,7 @@ docker compose -f docker/compose.yml exec dsh-multitenant runuser -u dsh-alice -
 | `HOST`、`PORT`、`SESSION_TTL`、`SESSION_REFRESH_INTERVAL`、`DSH_MESSAGE_STREAM_TIMEOUT_MS`、`COOKIE_SECURE`、`DEEPSEEK_BASE_URL`、`UPLOAD_MAX_MB`、`DSH_PLUGIN_TARBALL_DIR`、`PLUGIN_TARBALL_MAX_MB`、`MAX_IP_ATTEMPTS`、`MAX_USER_ATTEMPTS`、`WINDOW_MS`、`LOCK_MS` | 网关 | `SESSION_TTL` 默认 43200 秒；`SESSION_REFRESH_INTERVAL` 默认 0；消息流默认超时 900000 ms；插件离线包默认保存到 gateway 状态目录且上限 100 MB；其余见 `gateway/server.js` |
 | `DSH_REGISTER_API_KEY` | 网关机器接口：注册用户、配置模型、直接发送消息 | 默认关闭；必须使用强随机值并仅注入可信后端 |
 | `DSH_LOGIN_API_KEY`、`LOGIN_TICKET_TTL` | 网关外部自动登录 | 默认关闭；票据默认 60 秒 |
+| `DSH_CLUSTER_MODE`、`DSH_CLUSTER_DATABASE_URL`、`DSH_CLUSTER_TOKEN`、`DSH_NODE_ID`、`DSH_NODE_ADDRESS`、`DSH_TENANT_LEASE_SECONDS`、`DSH_SESSION_SECRET` | Docker/Kubernetes 多副本集群 | 默认关闭；集群 token/session secret 至少 32 字符，租约默认 30 秒 |
 
 `bin/dsh-users.sh` 与 `bin/dsh-file-list` 已按自身位置自定位：任意目录检出即可直接运行（`dsh-users.sh` 首次调用自动重提权为 root；node 解析相对脚本位置，缺失时回退 `PATH`）。自定义安装前缀时 systemd 单元用上面的 `sed` 命令生成；网关 systemd 单元还支持 `EnvironmentFile=-/etc/default/dsh-gateway`，可在该文件里统一注入上述环境变量。
 

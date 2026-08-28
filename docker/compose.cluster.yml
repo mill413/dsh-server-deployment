@@ -1,0 +1,73 @@
+name: dsh-server-deployment-cluster
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: dsh
+      POSTGRES_USER: dsh
+      POSTGRES_PASSWORD: dsh-cluster-test-password
+    volumes:
+      - dsh-postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dsh -d dsh"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    restart: unless-stopped
+
+  dsh-multitenant:
+    image: dsh-server-deployment:cluster-local
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      args:
+        DSH_BASE_IMAGE: "${DSH_BASE_IMAGE:-dsh-server-base:local}"
+    cap_add:
+      - NET_ADMIN
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DSH_CLUSTER_MODE: "1"
+      DSH_CLUSTER_DATABASE_URL: postgresql://dsh:dsh-cluster-test-password@postgres:5432/dsh
+      DSH_CLUSTER_TOKEN: "cluster-test-routing-token-change-me-2026"
+      DSH_SESSION_SECRET: "cluster-test-session-secret-change-me-2026"
+      DSH_TENANT_LEASE_SECONDS: "30"
+      COOKIE_SECURE: "0"
+      DSH_SKIP_KEY_SETUP: "1"
+      DSH_LAZY_TENANTS: "1"
+      DSH_BROWSER_STOP_GRACE_MS: "5000"
+      DSH_BROWSER_PRESENCE_TTL_MS: "${DSH_BROWSER_PRESENCE_TTL_MS:-86400000}"
+      SESSION_TTL: "${SESSION_TTL:-43200}"
+      SESSION_REFRESH_INTERVAL: "${SESSION_REFRESH_INTERVAL:-0}"
+      DSH_ENABLE_REGISTER: "0"
+      DSH_ADMIN_PASSWORD: "${DSH_ADMIN_PASSWORD:-admin-test-password}"
+      DSH_REGISTER_API_KEY: "${DSH_REGISTER_API_KEY:-register-test-token}"
+      DSH_LOGIN_API_KEY: "${DSH_LOGIN_API_KEY:-login-test-token}"
+      LOGIN_TICKET_TTL: "${LOGIN_TICKET_TTL:-60}"
+      DSH_USERS_DIR: /var/lib/dsh/users
+      DSH_GATEWAY_STATE_DIR: /var/lib/dsh/gateway
+      DSH_CONTROL_SOCKET: /run/dsh/control.sock
+      DSH_SHARED_PLUGINS_HOME: /var/lib/dsh/shared-plugins
+      DSH_SHARED_WEB_PLUGINS_JSON: "${DSH_SHARED_WEB_PLUGINS_JSON:-[]}"
+      DSH_TENANTS_JSON: >-
+        [{"name":"alice","password":"alice-test-password"},{"name":"bob","password":"bob-test-password"}]
+    expose:
+      - "3100"
+    volumes:
+      - "${DSH_CLUSTER_DATA_DIR:-./cluster-data}:/var/lib/dsh"
+    restart: unless-stopped
+
+  load-balancer:
+    image: haproxy:3.2-alpine
+    depends_on:
+      - dsh-multitenant
+    ports:
+      - "${DSH_GATEWAY_HOST_PORT:-20810}:8080"
+    volumes:
+      - ./haproxy.cluster.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+    restart: unless-stopped
+
+volumes:
+  dsh-postgres:

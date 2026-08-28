@@ -1,0 +1,133 @@
+# Prerequisites:
+#   1. A PostgreSQL database reachable through DSH_CLUSTER_DATABASE_URL.
+#   2. An existing ReadWriteMany PVC named dsh-rwx.
+#   3. A Secret named dsh-cluster-secrets with keys:
+#        database-url, cluster-token, session-secret, admin-password, tenants-json
+#   4. Replace the example image below with the published deployment image.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dsh
+spec:
+  replicas: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: dsh
+  template:
+    metadata:
+      labels:
+        app: dsh
+    spec:
+      terminationGracePeriodSeconds: 60
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    app: dsh
+      containers:
+        - name: dsh
+          image: registry.example.com/dsh-server-deployment:cluster
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            capabilities:
+              add: ["NET_ADMIN"]
+          ports:
+            - name: http
+              containerPort: 3100
+          env:
+            - name: DSH_CLUSTER_MODE
+              value: "1"
+            - name: DSH_CLUSTER_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: dsh-cluster-secrets
+                  key: database-url
+            - name: DSH_CLUSTER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: dsh-cluster-secrets
+                  key: cluster-token
+            - name: DSH_SESSION_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: dsh-cluster-secrets
+                  key: session-secret
+            - name: DSH_ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: dsh-cluster-secrets
+                  key: admin-password
+            - name: DSH_TENANTS_JSON
+              valueFrom:
+                secretKeyRef:
+                  name: dsh-cluster-secrets
+                  key: tenants-json
+            - name: DSH_NODE_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.uid
+            - name: DSH_NODE_ADDRESS
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: DSH_LAZY_TENANTS
+              value: "1"
+            - name: DSH_USERS_DIR
+              value: /var/lib/dsh/users
+            - name: DSH_GATEWAY_STATE_DIR
+              value: /var/lib/dsh/gateway
+            - name: DSH_SHARED_PLUGINS_HOME
+              value: /var/lib/dsh/shared-plugins
+            - name: DSH_CONTROL_SOCKET
+              value: /run/dsh/control.sock
+            - name: COOKIE_SECURE
+              value: "1"
+            - name: DSH_ENABLE_REGISTER
+              value: "0"
+          readinessProbe:
+            httpGet:
+              path: /__gw/health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+          startupProbe:
+            httpGet:
+              path: /__gw/health
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 36
+          resources:
+            requests:
+              cpu: "500m"
+              memory: 1Gi
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/dsh
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: dsh-rwx
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: dsh
+spec:
+  selector:
+    app: dsh
+  ports:
+    - name: http
+      port: 3100
+      targetPort: http

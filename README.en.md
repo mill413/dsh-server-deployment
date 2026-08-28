@@ -94,6 +94,37 @@ Open `http://127.0.0.1:20810` in a browser. The default test accounts are:
 
 The Compose file defaults to `DSH_SKIP_KEY_SETUP=1` for login, UI, and tenant-isolation testing without a real API key; model calls do not work in this mode. Set it to `0` and restart to test complete conversations, then enter a separate key for each tenant at first login.
 
+### Single-Deployment multi-replica mode
+
+Cluster mode makes every replica of one DSH Deployment act as both a Gateway and a tenant worker. A Kubernetes Service or HAProxy may send a request to any replica; that Gateway consults the PostgreSQL tenant lease and forwards HTTP, file streams, and WebSockets to the Pod that actually owns the user's DSH process. Leases carry a monotonically increasing generation and are renewed by the supervisor. If database access remains unavailable or ownership is lost, the old owner stops its children before lease expiry so two Pods cannot write the same HOME.
+
+Cluster mode requires:
+
+- One `ReadWriteMany` data volume mounted by every replica, with consistent POSIX UIDs and atomic `mkdir`/`rename` semantics. `users.json`, UID identities, and tenant homes live there; a cross-process directory lock serializes every user-store mutation.
+- PostgreSQL for node registration, tenant leases, one-time login tickets, global login/registration throttles, activity, and browser presence.
+- The same `DSH_SESSION_SECRET` and a `DSH_CLUSTER_TOKEN` of at least 32 characters in every replica.
+- `DSH_LAZY_TENANTS=1`; cluster mode rejects eager startup because a tenant must acquire its lease first.
+- A front proxy that overwrites `X-Forwarded-For` and supports long-lived HTTP/WebSocket connections. Pod port 3100 should be reachable only by the proxy and peer Pods in the same Deployment.
+
+The repository includes a three-replica Compose acceptance environment:
+
+```bash
+docker compose -f docker/compose.cluster.yml up -d --build \
+  --scale dsh-multitenant=3
+docker compose -f docker/compose.cluster.yml ps
+docker compose -f docker/compose.cluster.yml logs -f dsh-multitenant
+```
+
+It remains reachable at `http://127.0.0.1:20810`; set `DSH_GATEWAY_HOST_PORT=20811` when that port is occupied. Passwords, session secret, and cluster token in `docker/compose.cluster.yml` are local-test defaults and must be replaced in production. Run the complete automated acceptance test—three replicas, cross-node sessions, owner failover, cross-replica tickets, and concurrent registration—with:
+
+```bash
+./docker/test-cluster.sh
+```
+
+See `k8s/dsh-cluster.yaml` for the Kubernetes template. Create the `dsh-cluster-secrets` Secret and an RWX PVC named `dsh-rwx` first. Ordinary HPA scale-out adds Gateway capacity; scale-in briefly disconnects tenants owned by a removed Pod, and a surviving replica takes them over when clients reconnect.
+
+Runtime shared-plugin add/remove is currently disabled in cluster mode because publishing the plugin tree and restarting tenants across Pods is not yet one atomic cluster transaction. Build plugins into the image and roll out a new version instead. Single-replica runtime plugin management is unchanged.
+
 ### Managing users at runtime (no Compose edits)
 
 `DSH_TENANTS_JSON` is only a **bootstrap seed**: tenants are created (or updated) from it at container start. Afterwards the in-image `dsh-users` command adds / removes / changes users at any time — no Compose edit, no image rebuild, no container restart:
@@ -112,7 +143,7 @@ Behavior notes:
 
 - Runtime users are written to `docker/data/gateway/users.json` (container path `/var/lib/dsh/gateway/users.json`) and **survive container rebuilds / restarts** (at boot the seed list is merged with existing users; ports, passwords and identities are kept). All data is persisted via a bind mount to `docker/data/` on the host (container `/var/lib/dsh`: `users/` for user homes, `gateway/` for state), directly visible and backup-able. The supervisor IPC socket lives outside that volume at `/run/dsh/control.sock` (override with `DSH_CONTROL_SOCKET`); it is runtime-only, is excluded from backups, and must never be shared by multiple instances.
 - To remove a user use `dsh-users del` (also removes their data); removing a user from `DSH_TENANTS_JSON` does NOT delete an existing user.
-- `dsh-users` shares the same user store as the gateway: a new user can log in immediately (gateway cache refreshes within at most 2s).
+- `dsh-users` shares the same user store as the gateway. Single-replica mode refreshes its cache within at most 2s; cluster mode checks the shared atomic file version on every lookup and reloads immediately after replacement, so another replica's next request sees a new user or password generation.
 - Passwords must be at least 8 characters; `passwd` immediately invalidates all of the user's issued sessions.
 - `DSH_LAZY_TENANTS=1` is the default: provisioning creates the OS account, private HOME, port record, shared-plugin links and firewall rule without spawning DSH. The gateway starts and waits for that user's instance after the first successful login. It runs until logout/browser-presence recycling or container restart. Set `DSH_LAZY_TENANTS=0` to restore eager startup.
 - Proxied DSH pages place Logout directly above Settings in the left sidebar, cloning the Settings row's styling and state: icon plus label when expanded, icon only on the collapsed rail. Manual logout persistently revokes all issued sessions for that user, stops the tenant process group, then kills any escaped process owned by that tenant's unique OS UID; the user's HOME and files are untouched. Per-tab heartbeats track browser presence: closing the last tab recycles the tenant process after a 5-second reload grace, while one tab closing among several does not. Crashes/disconnects fall back to a 24-hour heartbeat timeout. Automatic recycling manages only process lifetime and preserves the login cookie, so the next request can wake the tenant with the existing session. Set `SESSION_REFRESH_INTERVAL` (seconds) to renew valid sessions on active heartbeats; zero disables sliding renewal. For example, `SESSION_TTL=432000` with `SESSION_REFRESH_INTERVAL=86400` gives each cookie five days and refreshes it once per active day. Only manual logout, an administrator kick, or a password change revokes sessions. Tune process recycling with `DSH_BROWSER_STOP_GRACE_MS` and `DSH_BROWSER_PRESENCE_TTL_MS`.
@@ -175,7 +206,7 @@ The external backend then redirects the user's browser to `https://dsh.example.c
 
 - Tickets expire after 60 seconds by default, are single-use, and disappear on process restart. Set `LOGIN_TICKET_TTL` to 10–300 seconds if needed.
 - The endpoint is disabled when `DSH_LOGIN_API_KEY` is unset. Unknown users return 404; a missing or invalid Bearer token returns 401.
-- Tickets live in gateway process memory, so the current deployment must use a single gateway replica; issuing and consuming a ticket must reach the same process.
+- Single-replica mode keeps tickets in gateway memory. Cluster mode stores and atomically consumes them in PostgreSQL, so issuance and browser consumption may hit different replicas while replay remains impossible.
 - `DSH_LOGIN_API_KEY` grants the ability to log in as any existing user. Keep it separate from `DSH_REGISTER_API_KEY` and inject it from a secret store such as a Kubernetes Secret.
 
 For concurrent browser login testing, use `bin/dsh-browser-login-load.sh`. It creates one isolated Chromium profile per user so same-origin `dsh_session` cookies do not overwrite each other. The defaults run five browsers concurrently and hold each for 60 seconds; increase concurrency gradually instead of launching 100 browser processes immediately:
@@ -335,6 +366,7 @@ The second command must fail to connect. In the default lazy mode, an active ten
 | `HOST`, `PORT`, `SESSION_TTL`, `SESSION_REFRESH_INTERVAL`, `DSH_MESSAGE_STREAM_TIMEOUT_MS`, `COOKIE_SECURE`, `DEEPSEEK_BASE_URL`, `UPLOAD_MAX_MB`, `DSH_PLUGIN_TARBALL_DIR`, `PLUGIN_TARBALL_MAX_MB`, `MAX_IP_ATTEMPTS`, `MAX_USER_ATTEMPTS`, `WINDOW_MS`, `LOCK_MS` | gateway | `SESSION_TTL` defaults to 43200 seconds; `SESSION_REFRESH_INTERVAL` defaults to 0; message streams time out after 900000 ms by default; plugin tarballs default to the gateway state directory with a 100 MB limit; see `gateway/server.js` for the rest |
 | `DSH_REGISTER_API_KEY` | gateway machine API: user registration, model configuration, direct messaging | disabled by default; use a strong random value and inject it into trusted backends only |
 | `DSH_LOGIN_API_KEY`, `LOGIN_TICKET_TTL` | gateway external login | disabled by default; tickets default to 60s |
+| `DSH_CLUSTER_MODE`, `DSH_CLUSTER_DATABASE_URL`, `DSH_CLUSTER_TOKEN`, `DSH_NODE_ID`, `DSH_NODE_ADDRESS`, `DSH_TENANT_LEASE_SECONDS`, `DSH_SESSION_SECRET` | Docker/Kubernetes multi-replica cluster | disabled by default; cluster/session secrets must contain at least 32 characters; leases default to 30s |
 
 `bin/dsh-users.sh` and `bin/dsh-file-list` locate themselves relative to their own path: any checkout directory works as-is (`dsh-users.sh` auto-re-privileges to root on first call; node resolves relative to the script location, falling back to `PATH`). When using a custom installation prefix, generate the systemd units with the `sed` command above; the gateway systemd unit also supports `EnvironmentFile=-/etc/default/dsh-gateway` for injecting the environment variables above in one place.
 

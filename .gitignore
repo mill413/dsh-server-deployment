@@ -18,6 +18,7 @@ dsh-server-*.tar.zst
 
 # docker runtime data (bind mount ./data)
 docker/data/
+docker/cluster-data/
 
 # ops/deploy records - server-private, never commit
 docs/dsh-*-deployment.md
