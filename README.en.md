@@ -121,9 +121,21 @@ It remains reachable at `http://127.0.0.1:20810`; set `DSH_GATEWAY_HOST_PORT=208
 ./docker/test-cluster.sh
 ```
 
+This Compose environment also includes an acceptance-only OpenAI-compatible `mock-model` service at `http://mock-model:8080/v1` inside the cluster. Use the concurrency driver to stress registration or normal password login independently:
+
+```bash
+BASE_URL=http://127.0.0.1:20810 MODE=register USER_PREFIX=load \
+  USER_COUNT=50 CONCURRENCY=20 USER_PASSWORD=cluster-load-password \
+  node bin/dsh-cluster-concurrency.js
+
+BASE_URL=http://127.0.0.1:20810 MODE=login USER_PREFIX=load \
+  USER_COUNT=50 CONCURRENCY=15 USER_PASSWORD=cluster-load-password \
+  node bin/dsh-cluster-concurrency.js
+```
+
 See `k8s/dsh-cluster.yaml` for the Kubernetes template. Create the `dsh-cluster-secrets` Secret and an RWX PVC named `dsh-rwx` first. Ordinary HPA scale-out adds Gateway capacity; scale-in briefly disconnects tenants owned by a removed Pod, and a surviving replica takes them over when clients reconnect.
 
-Runtime shared-plugin add/remove is currently disabled in cluster mode because publishing the plugin tree and restarting tenants across Pods is not yet one atomic cluster transaction. Build plugins into the image and roll out a new version instead. Single-replica runtime plugin management is unchanged.
+Cluster mode supports runtime shared-plugin add/remove. A PostgreSQL advisory lock allows only one Pod to mutate the shared plugin tree at a time; successful publication increments a shared revision, and peer Pods discover that revision from their lease heartbeat, reload the plugin set, and restart the tenants they own. A failed/interrupted install can be submitted again for recovery; production deployments should still prefer baking fixed plugins into an image and rolling it out.
 
 ### Managing users at runtime (no Compose edits)
 

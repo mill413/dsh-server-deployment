@@ -71,6 +71,8 @@ const state = {
   tenantLeases: new Map(),        // exact username -> current local cluster lease
   sharedWebPlugins: [],           // immutable image plugin + persistent runtime plugins
   sharedPluginBusy: false,        // serialize shared package mutations
+  sharedPluginRevision: 0,        // cluster-wide published plugin generation
+  sharedPluginSyncBusy: false,    // local reaction to a peer-published generation
   stopping: false,
   controlServer: null,
   leaseHeartbeat: null,
@@ -334,6 +336,13 @@ function discoverRuntimeSharedPlugins() {
     result.push({ name, dir });
   }
   return result;
+}
+
+function discoverAllSharedPlugins() {
+  return [
+    { name: BETTER_SIDEBAR_PACKAGE, dir: BETTER_SIDEBAR_DIR },
+    ...discoverRuntimeSharedPlugins(),
+  ];
 }
 
 async function ensureRuntimeSharedPlugins(configs, onProgress) {
@@ -676,6 +685,8 @@ function provisionTenant(tenant, port, uid, existing) {
       api: tenant.provider.api,
       apiKeyEnv: providerApiKeyEnv(tenant.provider.name),
     };
+  } else if (existing && existing.provider) {
+    record.provider = existing.provider;
   }
   return record;
 }
@@ -1026,6 +1037,10 @@ function startLeaseHeartbeat() {
         const renewed = await clusterStore.renewTenant(name, lease.generation);
         if (!renewed) throw new Error(`tenant lease was lost: ${name}`);
         lease.lastRenewedAt = Date.now();
+      }
+      const pluginRevision = await clusterStore.getRevision('shared-plugins');
+      if (pluginRevision > state.sharedPluginRevision && !state.sharedPluginSyncBusy) {
+        synchronizePublishedSharedPlugins(pluginRevision).catch(() => {});
       }
       state.leaseLastSuccessAt = Date.now();
     } catch (error) {
@@ -1403,8 +1418,10 @@ function controlSetKeyUnlocked(payload) {
   const record = state.db.users[name];
   if (!record) throw new Error(`user not found: ${name}`);
   if (typeof key !== 'string' || key.length === 0) throw new Error('API key required');
+  const localUser = ensureLocalUser(record, name);
+  if (localUser.created) applyLoopbackGuard();
   setApiKey(USERS_DIR, name, key);
-  try { execFileSync('chown', [`${record.osUser}:${record.osUser}`, credentialsPath(USERS_DIR, name)]); } catch (e) {}
+  execFileSync('chown', [`${record.osUser}:${record.osUser}`, credentialsPath(USERS_DIR, name)]);
   record.keyConfigured = true;
   saveUsersDb(state.db);
   return { ok: true, result: { name } };
@@ -1435,11 +1452,18 @@ function controlKeyStatusAll() {
 }
 
 function controlSharedPluginList() {
+  if (CLUSTER_ENABLED) state.sharedWebPlugins = discoverAllSharedPlugins();
   return { ok: true, result: state.sharedWebPlugins.map(sharedPluginDetails) };
 }
 
-async function controlSharedPluginAdd(payload, onProgress) {
-  if (CLUSTER_ENABLED) throw new Error('runtime shared plugin mutation is disabled in cluster mode; rebuild the image instead');
+async function publishSharedPluginRevision() {
+  if (!CLUSTER_ENABLED) return 0;
+  const revision = await clusterStore.bumpRevision('shared-plugins');
+  state.sharedPluginRevision = revision;
+  return revision;
+}
+
+async function controlSharedPluginAddLocked(payload, onProgress) {
   if (state.sharedPluginBusy) throw new Error('another shared plugin operation is still running');
   const config = validateSharedPluginConfig(payload, 'shared plugin');
   state.sharedPluginBusy = true;
@@ -1452,14 +1476,18 @@ async function controlSharedPluginAdd(payload, onProgress) {
     const restarted = await restartAllTenantProcesses();
     const plugin = state.sharedWebPlugins.find((item) => item.name === config.name);
     if (!plugin) throw new Error(`installed plugin was not discovered: ${config.name}`);
-    return { ok: true, result: { ...sharedPluginDetails(plugin), users, restarted } };
+    const revision = await publishSharedPluginRevision();
+    return { ok: true, result: { ...sharedPluginDetails(plugin), users, restarted, revision } };
   } finally {
     state.sharedPluginBusy = false;
   }
 }
 
-async function controlSharedPluginRemove(payload, onProgress) {
-  if (CLUSTER_ENABLED) throw new Error('runtime shared plugin mutation is disabled in cluster mode; rebuild the image instead');
+function controlSharedPluginAdd(payload, onProgress) {
+  return clusterStore.withAdvisoryLock('shared-plugin-mutation', () => controlSharedPluginAddLocked(payload, onProgress));
+}
+
+async function controlSharedPluginRemoveLocked(payload, onProgress) {
   if (state.sharedPluginBusy) throw new Error('another shared plugin operation is still running');
   const { name } = payload;
   if (!validPackageName(name)) throw new Error('invalid shared plugin package name');
@@ -1485,17 +1513,34 @@ async function controlSharedPluginRemove(payload, onProgress) {
     execFileSync('chown', ['-hR', 'root:root', RUNTIME_SHARED_HOME]);
     execFileSync('chmod', ['-R', 'a+rX', RUNTIME_SHARED_HOME]);
     execFileSync('chmod', ['-R', 'go-w', RUNTIME_SHARED_HOME]);
-    state.sharedWebPlugins = [
-      { name: BETTER_SIDEBAR_PACKAGE, dir: BETTER_SIDEBAR_DIR },
-      ...discoverRuntimeSharedPlugins(),
-    ];
+    state.sharedWebPlugins = discoverAllSharedPlugins();
     onProgress('Synchronizing shared plugin links to all users...\n');
     const users = syncSharedPluginsToAllUsers();
     onProgress(`Restarting ${state.tenants.size} tenant DSH process(es)...\n`);
     const restarted = await restartAllTenantProcesses();
-    return { ok: true, result: { name, users, restarted } };
+    const revision = await publishSharedPluginRevision();
+    return { ok: true, result: { name, users, restarted, revision } };
   } finally {
     state.sharedPluginBusy = false;
+  }
+}
+
+function controlSharedPluginRemove(payload, onProgress) {
+  return clusterStore.withAdvisoryLock('shared-plugin-mutation', () => controlSharedPluginRemoveLocked(payload, onProgress));
+}
+
+async function synchronizePublishedSharedPlugins(revision) {
+  if (!CLUSTER_ENABLED || revision <= state.sharedPluginRevision || state.sharedPluginSyncBusy) return;
+  state.sharedPluginSyncBusy = true;
+  try {
+    state.sharedWebPlugins = discoverAllSharedPlugins();
+    const restarted = await restartAllTenantProcesses();
+    state.sharedPluginRevision = revision;
+    console.log(`cluster shared plugins synchronized at revision ${revision}; restarted=${restarted}`);
+  } catch (error) {
+    console.error(`cluster shared plugin synchronization failed at revision ${revision}: ${error.message}`);
+  } finally {
+    state.sharedPluginSyncBusy = false;
   }
 }
 
@@ -1509,13 +1554,13 @@ async function controlSetProviderUnlocked(payload) {
   const provider = validateProvider(payload.provider);
   const key = payload.key;
   if (typeof key !== 'string' || key.length === 0) throw new Error('provider API key required');
+  const localUser = ensureLocalUser(record, name);
+  if (localUser.created) applyLoopbackGuard();
   const settingsFile = path.join(record.home, 'settings.yaml');
   fs.writeFileSync(settingsFile, providerSettingsYaml(provider), { mode: 0o644 });
   const ref = providerApiKeyEnv(provider.name);
   setCredential(USERS_DIR, name, ref, key);
-  try {
-    execFileSync('chown', [record.osUser + ':' + record.osUser, settingsFile, credentialsPath(USERS_DIR, name)]);
-  } catch (e) {}
+  execFileSync('chown', [record.osUser + ':' + record.osUser, settingsFile, credentialsPath(USERS_DIR, name)]);
   record.provider = {
     name: provider.name,
     baseURL: provider.baseURL,
@@ -1638,6 +1683,12 @@ async function main() {
   const seedTenants = adminEnabled
     ? allSeedTenants.filter((tenant) => tenant.name.toLowerCase() !== ADMIN_NAME.toLowerCase())
     : allSeedTenants;
+  const usersParent = path.dirname(USERS_DIR);
+  const stateParent = path.dirname(STATE_DIR);
+  if (usersParent === stateParent) {
+    fs.mkdirSync(usersParent, { recursive: true, mode: 0o711 });
+    fs.chmodSync(usersParent, 0o711);
+  }
   fs.mkdirSync(USERS_DIR, { recursive: true, mode: 0o711 });
   fs.chmodSync(USERS_DIR, 0o711);
   fs.mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 });
@@ -1653,10 +1704,11 @@ async function main() {
   }
 
   const sharedPluginConfigs = parseSharedPluginConfigs();
-  if (CLUSTER_ENABLED && sharedPluginConfigs.length > 0) {
-    throw new Error('DSH_SHARED_WEB_PLUGINS_JSON is not supported in cluster mode; build shared plugins into the image');
-  }
-  state.sharedWebPlugins = await ensureRuntimeSharedPlugins(sharedPluginConfigs);
+  state.sharedWebPlugins = await clusterStore.withAdvisoryLock(
+    'shared-plugin-mutation',
+    () => ensureRuntimeSharedPlugins(sharedPluginConfigs),
+  );
+  state.sharedPluginRevision = await clusterStore.getRevision('shared-plugins');
   console.log(`shared web plugins ready: ${state.sharedWebPlugins.map((plugin) => plugin.name).join(', ')}`);
 
   // Merge: DSH_TENANTS_JSON is a bootstrap seed; users that were added at

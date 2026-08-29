@@ -2184,10 +2184,14 @@ const server = http.createServer(async (req, res) => {
 
   if (pathname === '/__gw/health') {
     try {
+      const users = JSON.parse(fs.readFileSync(USERS_FILE, 'utf8'));
+      if (!users || typeof users !== 'object' || !users.users || typeof users.users !== 'object') {
+        throw new Error('invalid users store');
+      }
       const cluster = await clusterStore.health();
-      return json(res, 200, { ok: true, now: Date.now(), ...cluster });
+      return json(res, 200, { ok: true, now: Date.now(), users: Object.keys(users.users).length, ...cluster });
     } catch (error) {
-      return json(res, 503, { ok: false, error: 'cluster state unavailable' });
+      return json(res, 503, { ok: false, error: 'gateway state unavailable' });
     }
   }
 
@@ -2265,11 +2269,6 @@ const server = http.createServer(async (req, res) => {
     if (!session || !au || au.admin !== true) {
       if (req.method === 'GET') return redirect(res, '/login');
       return json(res, 403, { ok: false, error: '需要管理员权限' });
-    }
-    if (CLUSTER_ENABLED && req.method === 'POST'
-        && (pathname === '/__gw/admin/plugins/add' || pathname === '/__gw/admin/plugins/remove'
-          || pathname === '/__gw/admin/plugins/cancel' || pathname === '/__gw/admin/plugins/upload')) {
-      return json(res, 409, { ok: false, error: '集群模式禁止运行时修改共享插件，请构建新镜像后滚动发布' });
     }
     if (pathname === '/__gw/admin/users') {
       // Live user metrics are disabled because all three helpers share the

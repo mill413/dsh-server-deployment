@@ -1,6 +1,20 @@
 name: dsh-server-deployment-cluster
 
 services:
+  mock-model:
+    image: node:24-alpine
+    command: ["node", "/app/server.js"]
+    volumes:
+      - ../test-fixtures/mock-openai:/app:ro
+    expose:
+      - "8080"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:8080/health"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    restart: unless-stopped
+
   postgres:
     image: postgres:17-alpine
     environment:

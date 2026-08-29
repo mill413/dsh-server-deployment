@@ -121,9 +121,21 @@ docker compose -f docker/compose.cluster.yml logs -f dsh-multitenant
 ./docker/test-cluster.sh
 ```
 
+该 Compose 还包含仅供验收的 `mock-model` OpenAI 兼容服务（集群内地址 `http://mock-model:8080/v1`）。可用并发驱动单独压测注册或标准密码登录：
+
+```bash
+BASE_URL=http://127.0.0.1:20810 MODE=register USER_PREFIX=load \
+  USER_COUNT=50 CONCURRENCY=20 USER_PASSWORD=cluster-load-password \
+  node bin/dsh-cluster-concurrency.js
+
+BASE_URL=http://127.0.0.1:20810 MODE=login USER_PREFIX=load \
+  USER_COUNT=50 CONCURRENCY=15 USER_PASSWORD=cluster-load-password \
+  node bin/dsh-cluster-concurrency.js
+```
+
 Kubernetes 模板见 `k8s/dsh-cluster.yaml`。部署前创建 `dsh-cluster-secrets` Secret 和名为 `dsh-rwx` 的 RWX PVC。普通 HPA scale-out 可增加接收流量的 Gateway；scale-in 会使被删除 Pod 的活跃租户短暂断开，并由剩余副本在重连时接管。
 
-集群模式暂时禁止运行时安装/删除共享插件，因为插件目录发布和跨 Pod 租户重启尚未形成原子集群事务；请把插件构建进镜像后滚动发布。单副本模式的运行时插件功能不受影响。
+集群模式支持运行时安装/删除共享插件：PostgreSQL advisory lock 保证同一时刻只有一个 Pod 修改共享插件树；发布成功后递增共享 revision，其他 Pod 在租约心跳中发现新 revision、重新发现插件并重启自己持有的租户。插件安装失败或 Pod 中途退出时可重新提交操作恢复；生产环境仍优先推荐把固定插件构建进镜像后滚动发布。
 
 ### Docker 下运行时管理用户（无需改 Compose）
 

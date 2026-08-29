@@ -1,0 +1,11 @@
+{
+  "name": "dsh-cluster-test-plugin",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Minimal shared plugin used by the clustered deployment acceptance test",
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}

@@ -77,6 +77,11 @@ class ClusterStore {
           last_seen timestamptz NOT NULL,
           PRIMARY KEY(username, tab_id)
         );
+        CREATE TABLE IF NOT EXISTS dsh_cluster_revisions (
+          name text PRIMARY KEY,
+          revision bigint NOT NULL DEFAULT 0,
+          updated_at timestamptz NOT NULL DEFAULT now()
+        );
       `);
       } finally {
         try { await client.query("SELECT pg_advisory_unlock(hashtext('dsh-server-deployment-schema-v1'))"); } catch (error) {}
@@ -371,6 +376,40 @@ class ClusterStore {
     } finally {
       client.release();
     }
+  }
+
+  async withAdvisoryLock(name, operation) {
+    if (!this.enabled) return operation();
+    await this.init();
+    const client = await this.pool.connect();
+    try {
+      await client.query('SELECT pg_advisory_lock(hashtext($1))', [`dsh-cluster:${name}`]);
+      return await operation();
+    } finally {
+      try { await client.query('SELECT pg_advisory_unlock(hashtext($1))', [`dsh-cluster:${name}`]); } catch (error) {}
+      client.release();
+    }
+  }
+
+  async getRevision(name) {
+    if (!this.enabled) return 0;
+    await this.init();
+    const result = await this.pool.query('SELECT revision FROM dsh_cluster_revisions WHERE name = $1', [name]);
+    return result.rows[0] ? Number(result.rows[0].revision) : 0;
+  }
+
+  async bumpRevision(name) {
+    if (!this.enabled) return 0;
+    await this.init();
+    const result = await this.pool.query(`
+      INSERT INTO dsh_cluster_revisions(name, revision, updated_at)
+      VALUES ($1, 1, now())
+      ON CONFLICT (name) DO UPDATE SET
+        revision = dsh_cluster_revisions.revision + 1,
+        updated_at = now()
+      RETURNING revision
+    `, [name]);
+    return Number(result.rows[0].revision);
   }
 
   async close() {

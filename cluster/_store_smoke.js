@@ -47,6 +47,12 @@ async function main() {
     await b.clearUserPresence(username);
     assert.equal((await a.clusterUserState(60000)).online.has(username), false);
 
+    const revisionName = `revision-${suffix}`;
+    assert.equal(await a.getRevision(revisionName), 0);
+    const revision = await a.withAdvisoryLock('smoke-revision', () => b.bumpRevision(revisionName));
+    assert.equal(revision, 1);
+    assert.equal(await a.getRevision(revisionName), 1);
+
     await a.releaseTenant(username, first.generation);
     const takeover = await b.acquireTenant(username, 3101);
     assert.equal(takeover.local, true);
