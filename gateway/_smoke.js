@@ -198,6 +198,14 @@ const upstream = http.createServer((req, res) => {
           hasMore: false,
         } } }));
       }
+      if (req.url === '/api/session.list') {
+        return res.end(JSON.stringify({ type: 'server-response', rpcId, result: { ok: true, value: {
+          items: [
+            { sessionId: 'existing-session', updatedAt: 200, running: true, blank: false, cwd: testerWorkspace },
+            { sessionId: 'older-session', updatedAt: 100, running: false, blank: false, cwd: testerWorkspace },
+          ],
+        } } }));
+      }
       res.end(JSON.stringify({ type: 'server-response', rpcId, result: { ok: true, value: {} } }));
     });
     return;
@@ -304,6 +312,19 @@ function check(name, cond) {
     && existingMessageReply.created === false
     && lastPromptCall.message.payload.sessionId === 'existing-session'
     && lastPromptCall.message.payload.mode === 'steer');
+
+  r = await req('GET', '/api/users/tester/sessions');
+  check('session list requires bearer token', r.status === 401);
+  r = await req('GET', '/api/users/tester/sessions', {
+    headers: { Authorization: 'Bearer register-test-token' },
+  });
+  const sessionsReply = JSON.parse(r.body);
+  check('session list returns stable session summaries', r.status === 200
+    && sessionsReply.user === 'tester'
+    && sessionsReply.sessions.length === 2
+    && sessionsReply.sessions[0].sessionId === 'existing-session'
+    && sessionsReply.sessions[0].running === true
+    && sessionsReply.sessions[1].sessionId === 'older-session');
 
   r = await req('GET', '/api/users/tester/messages?sessionId=existing-session&maxMessages=20', {
     headers: { Authorization: 'Bearer register-test-token' },

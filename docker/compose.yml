@@ -45,6 +45,7 @@ services:
       #   POST /api/register                 {"username","password"}   -> create user
       #   POST /api/users/<name>/provider    {"provider":{"name","baseURL","model"},"apiKey"} -> register the user's custom provider + key
       #   POST /api/users/<name>/message     {"message","sessionId?","mode?"} -> send a prompt to the user's DSH
+      #   GET  /api/users/<name>/sessions    -> list conversation sessions
       #   GET  /api/users/<name>/messages    ?sessionId=... -> read message history
       #   POST /api/users/<name>/files       ?name=...&dir=... -> upload raw file bytes
       # Unset to disable the API entirely.

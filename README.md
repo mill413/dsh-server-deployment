@@ -286,7 +286,17 @@ curl -N -X POST http://<主机>:20810/api/users/alice2/message \
 - DSH 拒绝消息时会返回其错误码；不存在的用户或会话返回 `404`，实例启动或回环 RPC 失败返回 `502/503`。
 - 该接口可触发目标用户 DSH 中智能体的工具操作，`DSH_REGISTER_API_KEY` 必须只交给可信后端，不能放入浏览器代码。
 
-**④ 获取消息列表** `GET /api/users/<username>/messages`
+**④ 获取会话列表** `GET /api/users/<username>/sessions`
+
+```bash
+curl 'http://<主机>:20810/api/users/alice2/sessions' \
+  -H "Authorization: Bearer <DSH_REGISTER_API_KEY>"
+# → {"ok":true,"user":"alice2","sessions":[{"sessionId":"...","updatedAt":...,"running":false,"blank":false,"cwd":"..."}],"count":1}
+```
+
+会话按最近活动时间倒序返回。调用③且不提供 `sessionId` 时，202 响应会立即返回新建的 `sessionId`；如果调用方没有保存该响应，也可以通过本接口重新发现会话 ID。
+
+**⑤ 获取指定会话的消息列表** `GET /api/users/<username>/messages`
 
 ```bash
 curl 'http://<主机>:20810/api/users/alice2/messages?sessionId=<会话ID>&maxMessages=50' \
@@ -296,7 +306,7 @@ curl 'http://<主机>:20810/api/users/alice2/messages?sessionId=<会话ID>&maxMe
 
 `messages` 只包含最终的用户/助手消息及其结构化 content；`maxMessages` 范围 1–100。`hasMore=true` 时，把返回的 `nextBeforeSeq` 作为下一次请求的 `beforeSeq` 向前翻页。
 
-**⑤ 上传文件** `POST /api/users/<username>/files`
+**⑥ 上传文件** `POST /api/users/<username>/files`
 
 请求体是文件原始字节，文件名放在 `name` 查询参数中；`dir` 可选，默认用户的 `workspace/`，相对路径也以该目录为基准：
 
@@ -306,6 +316,14 @@ curl -X POST 'http://<主机>:20810/api/users/alice2/files?name=report.pdf&dir=d
   -H "Content-Type: application/octet-stream" \
   --data-binary @report.pdf
 ```
+
+例如用户 HOME 为 `/var/lib/dsh/users/alice2` 时，`dir=deliverables` 表示目标目录：
+
+```text
+/var/lib/dsh/users/alice2/workspace/deliverables/
+```
+
+它不是相对于调用方电脑，也不是相对于容器工作目录。该目录必须事先存在；省略 `dir` 则直接上传到 `/var/lib/dsh/users/alice2/workspace/`。
 
 上传复用浏览器文件管理的降权助手和完整性协议：要求 `Content-Length`，默认上限 100 MB；只允许写入目标用户工作区，拒绝隐藏文件名、路径穿越以及不完整请求。
 

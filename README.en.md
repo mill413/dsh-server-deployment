@@ -261,7 +261,17 @@ The stream starts with `accepted`, emits `session.event` / `assistant.chunk` / `
 - DSH admission failures include its error code. Unknown users or sessions return `404`; tenant startup or loopback RPC failures return `502/503`.
 - This endpoint can cause the target user's agent to execute tools. Keep `DSH_REGISTER_API_KEY` on trusted backends only; never expose it to browser code.
 
-**④ List messages** `GET /api/users/<username>/messages`
+**④ List sessions** `GET /api/users/<username>/sessions`
+
+```bash
+curl 'http://<host>:20810/api/users/alice2/sessions' \
+  -H "Authorization: Bearer <DSH_REGISTER_API_KEY>"
+# → {"ok":true,"user":"alice2","sessions":[{"sessionId":"...","updatedAt":...,"running":false,"blank":false,"cwd":"..."}],"count":1}
+```
+
+Sessions are returned in most-recently-active order. Calling ③ without a `sessionId` returns the newly created ID in its 202 response; this endpoint lets callers rediscover IDs when that response was not retained.
+
+**⑤ List messages in one session** `GET /api/users/<username>/messages`
 
 ```bash
 curl 'http://<host>:20810/api/users/alice2/messages?sessionId=<sessionID>&maxMessages=50' \
@@ -271,7 +281,7 @@ curl 'http://<host>:20810/api/users/alice2/messages?sessionId=<sessionID>&maxMes
 
 `messages` contains finalized user/assistant messages and their structured content. `maxMessages` ranges from 1 to 100. When `hasMore=true`, pass `nextBeforeSeq` back as `beforeSeq` to page backward.
 
-**⑤ Upload a file** `POST /api/users/<username>/files`
+**⑥ Upload a file** `POST /api/users/<username>/files`
 
 The request body is the raw file. Put its filename in the `name` query parameter; optional `dir` defaults to the user's `workspace/`, and relative directories resolve below that root:
 
@@ -283,6 +293,8 @@ curl -X POST 'http://<host>:20810/api/users/alice2/files?name=report.pdf&dir=del
 ```
 
 This endpoint reuses the browser file manager's privilege-dropping helper and completeness protocol. It requires `Content-Length`, defaults to a 100 MB limit, writes only inside the target user's workspace, and rejects hidden filenames, traversal, and incomplete requests.
+
+For a user whose HOME is `/var/lib/dsh/users/alice2`, `dir=deliverables` means `/var/lib/dsh/users/alice2/workspace/deliverables/`. It is not relative to the caller's machine or the container working directory. The directory must already exist; omit `dir` to upload directly into the workspace root.
 
 From the host, verify that Alice can reach her instance but cannot reach Bob's:
 

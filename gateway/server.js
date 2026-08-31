@@ -70,6 +70,7 @@ const registerFails = new Map();
 //                                        provider and write its API key
 //   POST /api/users/<name>/message    {message,sessionId?,mode?}
 //                                     -> send a prompt to the user's DSH
+//   GET  /api/users/<name>/sessions   -> list the user's conversation sessions
 //   GET  /api/users/<name>/messages   ?sessionId=... -> read message history
 //   POST /api/users/<name>/files      ?name=...&dir=... -> upload raw bytes
 // All calls require: Authorization: Bearer <DSH_REGISTER_API_KEY>.
@@ -2386,6 +2387,36 @@ const server = http.createServer(async (req, res) => {
     usersCacheAt = 0;
     logLine(req, 200, 'api-register ' + username + ' port=' + (reply.result && reply.result.port));
     return json(res, 200, { ok: true, user: username, port: reply.result.port });
+  }
+
+  // ---------- session list API: GET /api/users/<name>/sessions ----------
+  const apiSessionsMatch = /^\/api\/users\/([A-Za-z0-9_-]{1,64})\/sessions$/.exec(pathname);
+  if (apiSessionsMatch) {
+    if (req.method !== 'GET') return json(res, 405, { ok: false, error: 'method not allowed' });
+    if (!apiAuthorized(req)) return json(res, 401, { ok: false, error: 'unauthorized' });
+    const name = apiSessionsMatch[1];
+    const u = getUser(name);
+    if (!u || !u.port) return json(res, 404, { ok: false, error: 'user not found' });
+    try {
+      await ensureTenantInstance(name);
+      const listed = await tenantRpc(u.port, 'session.list', {}, 30000);
+      if (!listed.ok) {
+        const rpcError = listed.error || {};
+        return json(res, 409, {
+          ok: false,
+          error: rpcError.message || 'session list unavailable',
+          code: rpcError.code || 'session-list-unavailable',
+        });
+      }
+      const value = listed.value || {};
+      const sessions = Array.isArray(value.items) ? value.items : [];
+      logLine(req, 200, 'api-sessions ' + name + ' count=' + sessions.length);
+      return json(res, 200, { ok: true, user: name, sessions, count: sessions.length });
+    } catch (error) {
+      readyTenants.delete(name);
+      logLine(req, 502, 'api-sessions-fail ' + name + ' ' + String(error.message).slice(0, 160));
+      return json(res, 502, { ok: false, error: 'failed to list user DSH sessions: ' + error.message });
+    }
   }
 
   // ---------- message history API: GET /api/users/<name>/messages ----------
