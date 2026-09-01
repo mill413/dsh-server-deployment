@@ -64,7 +64,7 @@ nginx/                  # TLS 反向代理示例配置（已占位化域名）
 
 ## Docker 可信网络测试
 
-Docker 测试镜像会在构建阶段从官方 `https://github.com/deepseek-ai/deepseek-harness.git` 的 `master` 分支浅克隆最新代码并完成构建，不读取本机同级 harness 仓库。构建阶段会在公共 profile 中实际执行一次 `dsh plugin --profile web add dsh-better-sidebar`；完整插件依赖树以 root 只读形式保存在 `/opt/dsh-public`。入口进程为每个租户写入轻量 `link:` 依赖和软链接，不在注册热路径启动 pnpm；已有持久化用户和运行时新增用户都会覆盖，且不会复制插件依赖树。运行镜像包含 pnpm 以及安装其他原生插件所需的构建工具，并完整保留 `/opt/deepseek-harness` 源码与构建产物，以及 `/opt/dsh-server-deployment` 下的本部署仓库。网关与多个租户实例位于同一容器网络命名空间，但每个实例仍以独立的 `dsh-<name>` OS 账号和独立 `DSH_HOME` 运行。入口进程在启动租户前应用线性规模的回环防火墙规则；隔离规则失败会直接终止容器。容器只需要 `NET_ADMIN` capability，不需要 `--privileged` 或容器内 systemd。
+Docker 测试镜像会在构建阶段从官方 `https://github.com/deepseek-ai/deepseek-harness.git` 的 `master` 分支浅克隆最新代码并完成构建，不读取本机同级 harness 仓库。base 构建会在公共 profile 中安装 `dsh-better-sidebar`；final 构建可通过 `DSH_FINAL_WEB_PLUGINS_JSON` 构建参数额外安装任意 npm/Git/file 插件 spec，默认值 `[]` 表示不额外安装。完整插件依赖树以 root 只读形式保存在 `/opt/dsh-public`。入口进程从该 profile 自动发现所有镜像插件，为每个租户写入轻量 `link:` 依赖和软链接，不在注册热路径启动 pnpm；已有持久化用户和运行时新增用户都会覆盖，且不会复制插件依赖树。运行镜像包含 pnpm 以及安装其他原生插件所需的构建工具，并完整保留 `/opt/deepseek-harness` 源码与构建产物，以及 `/opt/dsh-server-deployment` 下的本部署仓库。网关与多个租户实例位于同一容器网络命名空间，但每个实例仍以独立的 `dsh-<name>` OS 账号和独立 `DSH_HOME` 运行。入口进程在启动租户前应用线性规模的回环防火墙规则；隔离规则失败会直接终止容器。容器只需要 `NET_ADMIN` capability，不需要 `--privileged` 或容器内 systemd。
 
 所有 Docker 租户启动时都会应用部署级 patch `docker/disable-llm-deepseek.patch.yml`，以 `disabled: true` 停用内置 `llm-deepseek` 条目；`llm-pi-ai` 与每个用户自己的模型设置保持可用。该 patch 位于用户配置层之后，因此用户目录无需复制或修改这项部署策略。
 
@@ -84,6 +84,37 @@ docker compose -f docker/compose.yml logs --tail=100
 ```
 
 使用其他 base 标签时设置 `DSH_BASE_IMAGE`，例如：`DSH_BASE_IMAGE=registry.example.com/dsh-server-base:v1 docker compose -f docker/compose.yml build`。最终镜像包含全部父层，单独 `docker save dsh-server-deployment:local` 即可完整导出运行镜像。
+
+内网构建可在不修改或重建 base 的情况下，由 final 统一覆盖 APT、npm/pnpm 与 pip 源。final 会把 npm 与 pip 配置分别写入系统级 `/etc/npmrc`、`/usr/local/etc/npmrc` 和 `/etc/pip.conf`，并在所有 npm/pnpm 构建命令之前设置 `NPM_CONFIG_REGISTRY` 与 pnpm 11 使用的 `PNPM_CONFIG_REGISTRY`，因此 root、gateway 以及所有 `dsh-*` 用户都会使用这些源：
+
+```bash
+export DSH_APT_MIRROR='http://apt.example.internal/debian'
+export DSH_NPM_REGISTRY='http://npm.example.internal/'
+export DSH_PIP_INDEX_URL='http://pypi.example.internal/simple/'
+export DSH_PIP_TRUSTED_HOST='pypi.example.internal'  # HTTPS 且证书可信时留空
+
+# 临时覆盖 Dockerfile 默认值时显式传给 final 构建
+docker compose -f docker/compose.yml build \
+  --build-arg DSH_APT_MIRROR="$DSH_APT_MIRROR" \
+  --build-arg DSH_NPM_REGISTRY="$DSH_NPM_REGISTRY" \
+  --build-arg DSH_PIP_INDEX_URL="$DSH_PIP_INDEX_URL" \
+  --build-arg DSH_PIP_TRUSTED_HOST="$DSH_PIP_TRUSTED_HOST"
+
+docker compose -f docker/compose.yml up -d
+```
+
+Compose 不再为这些镜像参数提供自己的默认值，避免覆盖 Dockerfile 中为内网修改的默认地址；直接运行 `docker compose ... up -d --build` 会使用 Dockerfile 的值。
+
+默认值仍是 Debian 主仓库、npm 与 PyPI 官方源；独立的 `debian-security` 仓库条目会从 APT sources 中移除。镜像内同时安装 `python3-pip`；普通用户可在自身可写目录或虚拟环境中安装 Python 包，但不能修改系统 Python。APT 配置是全局的，但只有具备 root 权限的进程能安装系统包。带认证信息的源不要直接放进 build arg，因为它可能出现在镜像构建历史中。
+
+需要仅在 final 中预装插件时传 JSON 数组；建议固定版本以保证构建可复现：
+
+```bash
+docker build -f docker/Dockerfile \
+  --build-arg DSH_BASE_IMAGE=dsh-server-base:local \
+  --build-arg 'DSH_FINAL_WEB_PLUGINS_JSON=["@scope/plugin@1.2.3","another-plugin@4.5.6"]' \
+  -t dsh-server-deployment:local .
+```
 
 浏览器打开 `http://127.0.0.1:20810`，默认测试账号为：
 
@@ -133,7 +164,7 @@ BASE_URL=http://127.0.0.1:20810 MODE=login USER_PREFIX=load \
   node bin/dsh-cluster-concurrency.js
 ```
 
-Kubernetes 模板见 `k8s/dsh-cluster.yaml`。部署前创建 `dsh-cluster-secrets` Secret 和名为 `dsh-rwx` 的 RWX PVC。普通 HPA scale-out 可增加接收流量的 Gateway；scale-in 会使被删除 Pod 的活跃租户短暂断开，并由剩余副本在重连时接管。
+Kubernetes 模板见 `k8s/dsh-cluster.yaml`。模板为方便隔离环境测试，直接以内联明文提供数据库连接、cluster token、session secret、管理员密码和启动租户；部署前必须按目标环境修改这些测试值，并创建名为 `dsh-rwx` 的 RWX PVC。普通 HPA scale-out 可增加接收流量的 Gateway；scale-in 会使被删除 Pod 的活跃租户短暂断开，并由剩余副本在重连时接管。
 
 集群模式支持运行时安装/删除共享插件：PostgreSQL advisory lock 保证同一时刻只有一个 Pod 修改共享插件树；发布成功后递增共享 revision，其他 Pod 在租约心跳中发现新 revision、重新发现插件并重启自己持有的租户。插件安装失败或 Pod 中途退出时可重新提交操作恢复；生产环境仍优先推荐把固定插件构建进镜像后滚动发布。
 
@@ -185,17 +216,21 @@ docker compose -f docker/compose.yml exec dsh-multitenant \
 
 命令通过入口监管进程把插件安装到 `/var/lib/dsh/shared-plugins`，默认允许插件及其全部传递依赖执行 `preinstall`、`install`、`postinstall` 等构建脚本，不需要 `--allow-build`。随后将共享 `link:` 依赖和软链接同步到所有已有用户，并只重启各用户的 DSH 进程使插件生效（容器和网关不重启）。运行时新增用户在自己的 DSH 进程启动前自动执行同一同步，因此会直接拥有并启用当前全部共享插件。共享目录位于 `/var/lib/dsh` 持久化卷中，Pod 重建后仍然存在，不会为每个用户重复安装依赖。由于安装脚本以容器 root 权限执行，只应安装可信插件。
 
-插件命令会在当前终端实时显示 pnpm 下载、构建、用户同步和租户重启输出。内网 registry 必须配置到共享安装 HOME；普通 `npm config set registry` 默认写入 `/root/.npmrc`，不会被共享安装进程读取：
+插件命令会在当前终端实时显示实际使用的 npm registry、pnpm 下载/构建、用户同步和租户重启输出。`DSH_NPM_REGISTRY` 同时控制 final 构建、管理后台和 `dsh-users plugin` 的运行时安装；supervisor 会把它显式注入 pnpm，不依赖当前用户 HOME 中的 `.npmrc`。Kubernetes 可在 Deployment 中直接配置：
+
+```yaml
+env:
+  - name: DSH_NPM_REGISTRY
+    value: http://npm.example.internal/
+```
+
+可从容器启动日志及插件任务日志核对实际值：
 
 ```bash
-kubectl exec -n <namespace> <pod> -- \
-  env HOME=/var/lib/dsh/shared-plugins \
-  npm config set registry http://<内网-npm-registry>
-
-kubectl exec -n <namespace> <pod> -- \
-  env HOME=/var/lib/dsh/shared-plugins \
-  pnpm config get registry
+kubectl logs -n <namespace> <pod> | grep -E 'runtime npm registry|Using npm registry'
 ```
+
+直接 `kubectl exec ... pnpm config get registry` 会启动一个独立进程，只能看到镜像 ENV，不会经过 supervisor 的运行时覆盖；后台任务日志中的 `Using npm registry ...` 才是插件安装子进程的最终值。
 
 `DSH_SHARED_WEB_PLUGINS_JSON` 仍可作为首次部署时的批量声明方式：
 

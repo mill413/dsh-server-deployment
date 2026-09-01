@@ -39,7 +39,7 @@ const DSH_BIN = process.env.DSH_DSH_BIN || path.join(APP_DIR, 'apps/cli/lib/bin.
 const DEPLOYMENT_PATCH = '/opt/dsh-server-deployment/docker/disable-llm-deepseek.patch.yml';
 const BETTER_SIDEBAR_PACKAGE = 'dsh-better-sidebar';
 const BETTER_SIDEBAR_DIR = '/opt/dsh-public/profiles/web/node_modules/dsh-better-sidebar';
-const BETTER_SIDEBAR_SPEC = `link:${BETTER_SIDEBAR_DIR}`;
+const IMAGE_SHARED_PROFILE = '/opt/dsh-public/profiles/web';
 const RUNTIME_SHARED_HOME = process.env.DSH_SHARED_PLUGINS_HOME
   || path.join(path.dirname(USERS_DIR), 'shared-plugins');
 const RUNTIME_SHARED_PROFILE = path.join(RUNTIME_SHARED_HOME, 'profiles', 'web');
@@ -239,6 +239,35 @@ function workspaceContent() {
   ].join('\n');
 }
 
+// Discover every DSH bundle baked into the image's public web profile. The
+// base image currently contributes better-sidebar and the final image may add
+// more bundles. Keeping this manifest-driven avoids a hard-coded constant for
+// every final-stage plugin and ensures all replicas expose the same set.
+function discoverImageSharedPlugins() {
+  const manifestFile = path.join(IMAGE_SHARED_PROFILE, 'package.json');
+  if (!fs.existsSync(manifestFile)) return [];
+  const manifest = readManifest(manifestFile, 'image shared profile');
+  const dependencies = manifest.dependencies && typeof manifest.dependencies === 'object'
+    && !Array.isArray(manifest.dependencies) ? manifest.dependencies : {};
+  const bundles = manifest.dsh && manifest.dsh.profile && Array.isArray(manifest.dsh.profile.bundles)
+    ? manifest.dsh.profile.bundles : [];
+  const result = [];
+  for (const name of bundles) {
+    if (WEB_PROFILE_BUNDLES.includes(name) || !Object.prototype.hasOwnProperty.call(dependencies, name)) continue;
+    if (!validPackageName(name)) throw new Error(`image shared profile contains an invalid bundle name: ${name}`);
+    const dir = path.join(IMAGE_SHARED_PROFILE, 'node_modules', name);
+    const packageFile = path.join(dir, 'package.json');
+    if (!fs.existsSync(packageFile)) throw new Error(`image shared plugin is missing: ${packageFile}`);
+    const pluginManifest = readManifest(packageFile, `image shared plugin ${name}`);
+    if (pluginManifest.name !== name) throw new Error(`image shared plugin ${name} resolved to ${pluginManifest.name || 'an unnamed package'}`);
+    if (!pluginManifest.dsh || !pluginManifest.dsh.bundle || typeof pluginManifest.dsh.bundle.patch !== 'string') {
+      throw new Error(`image shared dependency ${name} does not declare dsh.bundle.patch`);
+    }
+    result.push({ name, dir, source: 'image' });
+  }
+  return result;
+}
+
 function ensureRuntimeSharedProfileSkeleton() {
   fs.mkdirSync(RUNTIME_SHARED_PROFILE, { recursive: true, mode: 0o755 });
   const manifestFile = path.join(RUNTIME_SHARED_PROFILE, 'package.json');
@@ -247,17 +276,22 @@ function ensureRuntimeSharedProfileSkeleton() {
     : { name: 'dsh-runtime-shared-web-plugins', private: true, dependencies: {}, dsh: { profile: { bundles: [...WEB_PROFILE_BUNDLES] } } };
   const dependencies = manifest.dependencies && typeof manifest.dependencies === 'object'
     && !Array.isArray(manifest.dependencies) ? manifest.dependencies : {};
-  dependencies[BETTER_SIDEBAR_PACKAGE] = BETTER_SIDEBAR_SPEC;
   const dsh = manifest.dsh && typeof manifest.dsh === 'object' && !Array.isArray(manifest.dsh) ? manifest.dsh : {};
   const profile = dsh.profile && typeof dsh.profile === 'object' && !Array.isArray(dsh.profile) ? dsh.profile : {};
   const bundles = Array.isArray(profile.bundles) ? profile.bundles : [...WEB_PROFILE_BUNDLES];
-  if (!bundles.includes(BETTER_SIDEBAR_PACKAGE)) bundles.push(BETTER_SIDEBAR_PACKAGE);
+  const imagePlugins = discoverImageSharedPlugins();
+  for (const plugin of imagePlugins) {
+    dependencies[plugin.name] = `link:${plugin.dir}`;
+    if (!bundles.includes(plugin.name)) bundles.push(plugin.name);
+  }
   manifest = { ...manifest, private: true, dependencies, dsh: { ...dsh, profile: { ...profile, bundles } } };
   writeAtomic(manifestFile, `${JSON.stringify(manifest, null, 2)}\n`, 0o644);
   const patchFile = path.join(RUNTIME_SHARED_PROFILE, 'cordis.patch.yml');
   if (!fs.existsSync(patchFile)) fs.writeFileSync(patchFile, '[]\n', { mode: 0o644 });
   writeAtomic(path.join(RUNTIME_SHARED_PROFILE, 'pnpm-workspace.yaml'), workspaceContent(), 0o644);
-  ensureDirectoryLink(path.join(RUNTIME_SHARED_PROFILE, 'node_modules', BETTER_SIDEBAR_PACKAGE), BETTER_SIDEBAR_DIR);
+  for (const plugin of imagePlugins) {
+    ensureDirectoryLink(path.join(RUNTIME_SHARED_PROFILE, 'node_modules', plugin.name), plugin.dir);
+  }
 }
 
 function healRuntimeSharedFallback() {
@@ -272,9 +306,40 @@ function healRuntimeSharedFallback() {
 // can kill a hung pnpm install. `detached: true` makes the child a process-
 // group leader, so the kill below sweeps pnpm and its whole tree.
 let activeSharedPluginChild = null;
+
+function runtimeNpmEnvironment(environment = process.env) {
+  const registry = String(environment.DSH_NPM_REGISTRY || environment.NPM_CONFIG_REGISTRY || '').trim();
+  if (!registry) return {};
+  if (!/^https?:\/\/[^\s]+$/.test(registry)) throw new Error('runtime npm registry must be an http(s) URL');
+  return {
+    DSH_NPM_REGISTRY: registry,
+    NPM_CONFIG_REGISTRY: registry,
+    npm_config_registry: registry,
+    PNPM_CONFIG_REGISTRY: registry,
+    pnpm_config_registry: registry,
+    NPM_CONFIG_GLOBALCONFIG: environment.NPM_CONFIG_GLOBALCONFIG || '/etc/npmrc',
+  };
+}
+
+function displayRegistry(registry) {
+  try {
+    const url = new URL(registry);
+    if (url.username) url.username = '***';
+    if (url.password) url.password = '***';
+    return url.toString();
+  } catch (error) {
+    return '(invalid registry URL)';
+  }
+}
+
 function runRuntimeSharedPluginCommand(action, spec, onProgress) {
   const streamOutput = typeof onProgress === 'function';
   return new Promise((resolve, reject) => {
+    let npmEnvironment;
+    try { npmEnvironment = runtimeNpmEnvironment(); } catch (error) { reject(error); return; }
+    if (streamOutput && npmEnvironment.NPM_CONFIG_REGISTRY) {
+      onProgress(`Using npm registry ${displayRegistry(npmEnvironment.NPM_CONFIG_REGISTRY)}\n`);
+    }
     const child = spawn(NODE_BIN, [DSH_BIN, 'plugin', '--profile', 'web', action, spec], {
       cwd: RUNTIME_SHARED_HOME,
       detached: true,
@@ -285,6 +350,7 @@ function runRuntimeSharedPluginCommand(action, spec, onProgress) {
         HOME: RUNTIME_SHARED_HOME,
         SHELL: '/bin/bash',
         NPM_CONFIG_UPDATE_NOTIFIER: 'false',
+        ...npmEnvironment,
       },
     });
     activeSharedPluginChild = child;
@@ -316,7 +382,7 @@ function controlPluginCancel() {
   return { ok: true, result: { canceled: true } };
 }
 
-function discoverRuntimeSharedPlugins() {
+function discoverRuntimeSharedPlugins(imageNames = new Set(discoverImageSharedPlugins().map((plugin) => plugin.name))) {
   const manifestFile = path.join(RUNTIME_SHARED_PROFILE, 'package.json');
   if (!fs.existsSync(manifestFile)) return [];
   const manifest = readManifest(manifestFile, 'runtime shared profile');
@@ -325,7 +391,8 @@ function discoverRuntimeSharedPlugins() {
     ? manifest.dsh.profile.bundles : [];
   const result = [];
   for (const name of bundles) {
-    if (name === BETTER_SIDEBAR_PACKAGE || !Object.prototype.hasOwnProperty.call(dependencies, name)) continue;
+    if (WEB_PROFILE_BUNDLES.includes(name) || imageNames.has(name)
+        || !Object.prototype.hasOwnProperty.call(dependencies, name)) continue;
     const dir = path.join(RUNTIME_SHARED_PROFILE, 'node_modules', name);
     const packageFile = path.join(dir, 'package.json');
     if (!fs.existsSync(packageFile)) throw new Error(`runtime shared plugin is missing: ${packageFile}`);
@@ -333,23 +400,26 @@ function discoverRuntimeSharedPlugins() {
     if (!pluginManifest.dsh || !pluginManifest.dsh.bundle || typeof pluginManifest.dsh.bundle.patch !== 'string') {
       throw new Error(`runtime shared dependency ${name} does not declare dsh.bundle.patch`);
     }
-    result.push({ name, dir });
+    result.push({ name, dir, source: 'runtime' });
   }
   return result;
 }
 
 function discoverAllSharedPlugins() {
-  return [
-    { name: BETTER_SIDEBAR_PACKAGE, dir: BETTER_SIDEBAR_DIR },
-    ...discoverRuntimeSharedPlugins(),
-  ];
+  const imagePlugins = discoverImageSharedPlugins();
+  const imageNames = new Set(imagePlugins.map((plugin) => plugin.name));
+  return [...imagePlugins, ...discoverRuntimeSharedPlugins(imageNames)];
 }
 
 async function ensureRuntimeSharedPlugins(configs, onProgress) {
-  const sharedManifest = path.join(BETTER_SIDEBAR_DIR, 'package.json');
-  if (!fs.existsSync(sharedManifest)) throw new Error(`shared better-sidebar package is missing: ${sharedManifest}`);
+  const imagePlugins = discoverImageSharedPlugins();
+  if (imagePlugins.length === 0) throw new Error(`image shared profile has no DSH plugins: ${IMAGE_SHARED_PROFILE}`);
+  const imageNames = new Set(imagePlugins.map((plugin) => plugin.name));
+  for (const config of configs) {
+    if (imageNames.has(config.name)) throw new Error(`${config.name} is built into the image and cannot be installed at runtime`);
+  }
   const alreadyExists = fs.existsSync(path.join(RUNTIME_SHARED_PROFILE, 'package.json'));
-  if (configs.length === 0 && !alreadyExists) return [{ name: BETTER_SIDEBAR_PACKAGE, dir: BETTER_SIDEBAR_DIR }];
+  if (configs.length === 0 && !alreadyExists) return imagePlugins;
 
   ensureRuntimeSharedProfileSkeleton();
   const receipts = readJson(RUNTIME_SHARED_RECEIPTS, { version: 1, specs: {} });
@@ -380,7 +450,7 @@ async function ensureRuntimeSharedPlugins(configs, onProgress) {
       // profile. Remove every dependency introduced by this failed add.
       const failedManifest = readManifest(path.join(RUNTIME_SHARED_PROFILE, 'package.json'), 'runtime shared profile');
       const addedNames = Object.keys(failedManifest.dependencies || {})
-        .filter((name) => !previousDependencies.has(name) && name !== BETTER_SIDEBAR_PACKAGE);
+        .filter((name) => !previousDependencies.has(name) && !imageNames.has(name));
       for (const addedName of addedNames) {
         try { await runRuntimeSharedPluginCommand('remove', addedName, onProgress); } catch (removeError) {
           console.error(`WARNING: DSH could not roll back ${addedName}: ${removeError.message}`);
@@ -405,10 +475,7 @@ async function ensureRuntimeSharedPlugins(configs, onProgress) {
   execFileSync('chown', ['-hR', 'root:root', RUNTIME_SHARED_HOME]);
   execFileSync('chmod', ['-R', 'a+rX', RUNTIME_SHARED_HOME]);
   execFileSync('chmod', ['-R', 'go-w', RUNTIME_SHARED_HOME]);
-  return [
-    { name: BETTER_SIDEBAR_PACKAGE, dir: BETTER_SIDEBAR_DIR },
-    ...discoverRuntimeSharedPlugins(),
-  ];
+  return [...imagePlugins, ...discoverRuntimeSharedPlugins(imageNames)];
 }
 
 function sharedPluginDetails(plugin) {
@@ -416,7 +483,7 @@ function sharedPluginDetails(plugin) {
   return {
     name: plugin.name,
     version: typeof manifest.version === 'string' ? manifest.version : null,
-    source: plugin.name === BETTER_SIDEBAR_PACKAGE ? 'image' : 'runtime',
+    source: plugin.source || (plugin.dir.startsWith('/opt/dsh-public/') ? 'image' : 'runtime'),
     dir: plugin.dir,
   };
 }
@@ -1491,8 +1558,11 @@ async function controlSharedPluginRemoveLocked(payload, onProgress) {
   if (state.sharedPluginBusy) throw new Error('another shared plugin operation is still running');
   const { name } = payload;
   if (!validPackageName(name)) throw new Error('invalid shared plugin package name');
-  if (name === BETTER_SIDEBAR_PACKAGE) throw new Error(`${name} is built into the image and cannot be removed at runtime`);
-  if (!state.sharedWebPlugins.some((plugin) => plugin.name === name)) {
+  const installedPlugin = state.sharedWebPlugins.find((plugin) => plugin.name === name);
+  if (installedPlugin && sharedPluginDetails(installedPlugin).source === 'image') {
+    throw new Error(`${name} is built into the image and cannot be removed at runtime`);
+  }
+  if (!installedPlugin) {
     throw new Error(`shared plugin is not installed: ${name}`);
   }
   state.sharedPluginBusy = true;
@@ -1675,6 +1745,11 @@ async function main() {
   if (process.getuid() !== 0) throw new Error('container entrypoint must run as root');
   if (!fs.existsSync(DSH_BIN)) throw new Error(`built dsh CLI not found: ${DSH_BIN}`);
   if (CLUSTER_ENABLED && !LAZY_TENANTS) throw new Error('DSH cluster mode requires DSH_LAZY_TENANTS=1');
+  const npmEnvironment = runtimeNpmEnvironment();
+  Object.assign(process.env, npmEnvironment);
+  if (npmEnvironment.NPM_CONFIG_REGISTRY) {
+    console.log(`runtime npm registry: ${displayRegistry(npmEnvironment.NPM_CONFIG_REGISTRY)}`);
+  }
   await clusterStore.init();
   const allSeedTenants = parseTenants();
   const adminEnabled = ADMIN_PASSWORD !== undefined && ADMIN_PASSWORD !== '';
@@ -1788,5 +1863,13 @@ if (require.main === module) {
     shutdown(1);
   });
 } else {
-  module.exports = { CONTROL_SOCKET, providerSettingsYaml, spawnManaged, validateProvider };
+  module.exports = {
+    CONTROL_SOCKET,
+    discoverAllSharedPlugins,
+    discoverImageSharedPlugins,
+    providerSettingsYaml,
+    runtimeNpmEnvironment,
+    spawnManaged,
+    validateProvider,
+  };
 }

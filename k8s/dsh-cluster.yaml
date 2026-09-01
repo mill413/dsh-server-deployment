@@ -1,9 +1,12 @@
 # Prerequisites:
-#   1. A PostgreSQL database reachable through DSH_CLUSTER_DATABASE_URL.
+#   1. A PostgreSQL Service named postgres with the inline test credentials
+#      below, or edit DSH_CLUSTER_DATABASE_URL for the target database.
 #   2. An existing ReadWriteMany PVC named dsh-rwx.
-#   3. A Secret named dsh-cluster-secrets with keys:
-#        database-url, cluster-token, session-secret, admin-password, tenants-json
-#   4. Replace the example image below with the published deployment image.
+#   3. Replace the example image below with the published deployment image.
+#
+# This manifest intentionally uses plaintext test credentials for deployment
+# testing. Change every value marked change-me before using it outside an
+# isolated test environment.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -47,30 +50,16 @@ spec:
             - name: DSH_CLUSTER_MODE
               value: "1"
             - name: DSH_CLUSTER_DATABASE_URL
-              valueFrom:
-                secretKeyRef:
-                  name: dsh-cluster-secrets
-                  key: database-url
+              value: postgresql://dsh:dsh-cluster-test-password@postgres:5432/dsh
             - name: DSH_CLUSTER_TOKEN
-              valueFrom:
-                secretKeyRef:
-                  name: dsh-cluster-secrets
-                  key: cluster-token
+              value: "cluster-test-routing-token-change-me-2026"
             - name: DSH_SESSION_SECRET
-              valueFrom:
-                secretKeyRef:
-                  name: dsh-cluster-secrets
-                  key: session-secret
+              value: "cluster-test-session-secret-change-me-2026"
             - name: DSH_ADMIN_PASSWORD
-              valueFrom:
-                secretKeyRef:
-                  name: dsh-cluster-secrets
-                  key: admin-password
+              value: "admin-test-password-change-me"
             - name: DSH_TENANTS_JSON
-              valueFrom:
-                secretKeyRef:
-                  name: dsh-cluster-secrets
-                  key: tenants-json
+              value: >-
+                [{"name":"alice","password":"alice-test-password"}]
             - name: DSH_NODE_ID
               valueFrom:
                 fieldRef:

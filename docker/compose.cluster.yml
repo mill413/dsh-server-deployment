@@ -37,6 +37,7 @@ services:
       dockerfile: docker/Dockerfile
       args:
         DSH_BASE_IMAGE: "${DSH_BASE_IMAGE:-dsh-server-base:local}"
+        DSH_FINAL_WEB_PLUGINS_JSON: "${DSH_FINAL_WEB_PLUGINS_JSON:-[]}"
     cap_add:
       - NET_ADMIN
     depends_on:
@@ -44,6 +45,9 @@ services:
         condition: service_healthy
     environment:
       DSH_CLUSTER_MODE: "1"
+      # Runtime plugin installation uses this explicitly. An empty host value
+      # falls back to the registry baked into the final image.
+      DSH_NPM_REGISTRY: "${DSH_NPM_REGISTRY:-}"
       DSH_CLUSTER_DATABASE_URL: postgresql://dsh:dsh-cluster-test-password@postgres:5432/dsh
       DSH_CLUSTER_TOKEN: "cluster-test-routing-token-change-me-2026"
       DSH_SESSION_SECRET: "cluster-test-session-secret-change-me-2026"

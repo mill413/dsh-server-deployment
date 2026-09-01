@@ -64,7 +64,7 @@ nginx/                  # TLS reverse-proxy example config (placeholder domain)
 
 ## Docker test on a trusted network
 
-During the build, the Docker test image shallow-clones the latest `master` branch directly from the official `https://github.com/deepseek-ai/deepseek-harness.git`; it does not read a sibling local Harness checkout. The build runs `dsh plugin --profile web add dsh-better-sidebar` once in a public profile and stores the complete dependency tree as root-owned read-only files under `/opt/dsh-public`. The entrypoint writes each tenant's lightweight `link:` dependency and symlink directly, without starting pnpm on the registration hot path; persisted and runtime-created users are both covered without copying the dependency tree. The runtime image includes pnpm and the build tools needed for other native plugins, and keeps the complete Harness source and build output under `/opt/deepseek-harness`, plus this complete deployment repository under `/opt/dsh-server-deployment`. The gateway and tenant instances share one container network namespace, while every instance still runs under its own `dsh-<name>` OS account with a separate `DSH_HOME`. The entrypoint applies linearly scaling loopback firewall rules before starting tenants and terminates the container if isolation cannot be installed. It needs only the `NET_ADMIN` capability, not `--privileged` or systemd inside the container.
+During the build, the Docker test image shallow-clones the latest `master` branch directly from the official `https://github.com/deepseek-ai/deepseek-harness.git`; it does not read a sibling local Harness checkout. The base build installs `dsh-better-sidebar` in the public profile; the final build can additionally install arbitrary npm/Git/file plugin specs from the `DSH_FINAL_WEB_PLUGINS_JSON` build argument, whose default `[]` installs nothing extra. Complete plugin dependency trees remain root-owned and read-only under `/opt/dsh-public`. The entrypoint discovers every image plugin from that profile and writes each tenant's lightweight `link:` dependencies and symlinks directly, without starting pnpm on the registration hot path; persisted and runtime-created users are both covered without copying dependency trees. The runtime image includes pnpm and the build tools needed for other native plugins, and keeps the complete Harness source and build output under `/opt/deepseek-harness`, plus this complete deployment repository under `/opt/dsh-server-deployment`. The gateway and tenant instances share one container network namespace, while every instance still runs under its own `dsh-<name>` OS account with a separate `DSH_HOME`. The entrypoint applies linearly scaling loopback firewall rules before starting tenants and terminates the container if isolation cannot be installed. It needs only the `NET_ADMIN` capability, not `--privileged` or systemd inside the container.
 
 Every Docker tenant starts with the deployment patch `docker/disable-llm-deepseek.patch.yml`, which disables the built-in `llm-deepseek` entry with `disabled: true`; `llm-pi-ai` and each tenant's own model settings remain available. This launcher patch is applied after user configuration, so the deployment policy does not need to be copied into or written to tenant homes.
 
@@ -84,6 +84,37 @@ docker compose -f docker/compose.yml logs --tail=100
 ```
 
 Set `DSH_BASE_IMAGE` to consume another base tag, for example: `DSH_BASE_IMAGE=registry.example.com/dsh-server-base:v1 docker compose -f docker/compose.yml build`. The final image includes all parent layers, so `docker save dsh-server-deployment:local` alone exports a complete runnable image.
+
+Internal builds can override APT, npm/pnpm, and pip sources in the final image without modifying or rebuilding the base. The final image writes npm and pip settings to system-level `/etc/npmrc`, `/usr/local/etc/npmrc`, and `/etc/pip.conf`, and sets both `NPM_CONFIG_REGISTRY` and pnpm 11's `PNPM_CONFIG_REGISTRY` before every npm/pnpm build command, so root, the gateway, and every `dsh-*` account use the same sources:
+
+```bash
+export DSH_APT_MIRROR='http://apt.example.internal/debian'
+export DSH_NPM_REGISTRY='http://npm.example.internal/'
+export DSH_PIP_INDEX_URL='http://pypi.example.internal/simple/'
+export DSH_PIP_TRUSTED_HOST='pypi.example.internal'  # leave empty for trusted HTTPS
+
+# Pass temporary overrides explicitly to the final build.
+docker compose -f docker/compose.yml build \
+  --build-arg DSH_APT_MIRROR="$DSH_APT_MIRROR" \
+  --build-arg DSH_NPM_REGISTRY="$DSH_NPM_REGISTRY" \
+  --build-arg DSH_PIP_INDEX_URL="$DSH_PIP_INDEX_URL" \
+  --build-arg DSH_PIP_TRUSTED_HOST="$DSH_PIP_TRUSTED_HOST"
+
+docker compose -f docker/compose.yml up -d
+```
+
+Compose intentionally has no separate defaults for these mirror arguments, so it cannot override internal defaults edited into the Dockerfile. A direct `docker compose ... up -d --build` uses the Dockerfile values.
+
+Defaults remain the official Debian main, npm, and PyPI sources; the separate `debian-security` repository entry is removed from APT sources. The image also installs `python3-pip`; unprivileged users can install into writable locations or virtual environments but cannot mutate system Python. APT configuration is global, although installing system packages still requires root. Do not place source credentials directly in build arguments because image build history may retain them.
+
+To preinstall plugins only in the final image, pass a JSON array. Pin versions for reproducible builds:
+
+```bash
+docker build -f docker/Dockerfile \
+  --build-arg DSH_BASE_IMAGE=dsh-server-base:local \
+  --build-arg 'DSH_FINAL_WEB_PLUGINS_JSON=["@scope/plugin@1.2.3","another-plugin@4.5.6"]' \
+  -t dsh-server-deployment:local .
+```
 
 Open `http://127.0.0.1:20810` in a browser. The default test accounts are:
 
@@ -133,7 +164,7 @@ BASE_URL=http://127.0.0.1:20810 MODE=login USER_PREFIX=load \
   node bin/dsh-cluster-concurrency.js
 ```
 
-See `k8s/dsh-cluster.yaml` for the Kubernetes template. Create the `dsh-cluster-secrets` Secret and an RWX PVC named `dsh-rwx` first. Ordinary HPA scale-out adds Gateway capacity; scale-in briefly disconnects tenants owned by a removed Pod, and a surviving replica takes them over when clients reconnect.
+See `k8s/dsh-cluster.yaml` for the Kubernetes template. For isolated-environment testing, the template contains inline plaintext values for the database connection, cluster token, session secret, administrator password, and seed tenants. Replace those test values for the target environment and create an RWX PVC named `dsh-rwx` before deployment. Ordinary HPA scale-out adds Gateway capacity; scale-in briefly disconnects tenants owned by a removed Pod, and a surviving replica takes them over when clients reconnect.
 
 Cluster mode supports runtime shared-plugin add/remove. A PostgreSQL advisory lock allows only one Pod to mutate the shared plugin tree at a time; successful publication increments a shared revision, and peer Pods discover that revision from their lease heartbeat, reload the plugin set, and restart the tenants they own. A failed/interrupted install can be submitted again for recovery; production deployments should still prefer baking fixed plugins into an image and rolling it out.
 
@@ -166,13 +197,21 @@ For day-to-day installation, use `dsh-users plugin add <spec>` inside the contai
 
 The admin console can also upload `.tgz` archives produced by `npm pack` or `pnpm pack`. The gateway validates `package/package.json`, reads the real package name and `dsh.bundle.patch` declaration, stores the archive by its SHA-256 under the persistent `gateway/plugin-tarballs/` directory, and automatically submits the shared installation job. The default limit is 100 MB (`PLUGIN_TARBALL_MAX_MB`); override the directory with `DSH_PLUGIN_TARBALL_DIR`. A tarball is fully offline only when it contains everything it needs, or when the container's pnpm store/internal registry can supply its dependencies.
 
-The command streams pnpm download/build and tenant synchronization progress to the current terminal. Configure an internal registry in the shared installation home (a normal `npm config set registry` writes `/root/.npmrc`, which this isolated installation home does not read):
+The command streams the effective npm registry, pnpm download/build, tenant synchronization, and restart progress. `DSH_NPM_REGISTRY` controls both final-image builds and runtime installation from the admin console or `dsh-users plugin`; the supervisor injects it explicitly into pnpm instead of depending on an `.npmrc` under the current HOME. Kubernetes can set it directly on the Deployment:
+
+```yaml
+env:
+  - name: DSH_NPM_REGISTRY
+    value: http://npm.example.internal/
+```
+
+Check the effective value in container startup and plugin-job logs:
 
 ```bash
-kubectl exec -n <namespace> <pod> -- \
-  env HOME=/var/lib/dsh/shared-plugins \
-  npm config set registry http://<internal-npm-registry>
+kubectl logs -n <namespace> <pod> | grep -E 'runtime npm registry|Using npm registry'
 ```
+
+A direct `kubectl exec ... pnpm config get registry` starts a separate process that only sees image ENV and does not pass through the supervisor's runtime override. The plugin job's `Using npm registry ...` line is the authoritative child-process value.
 
 ```yaml
 env:
