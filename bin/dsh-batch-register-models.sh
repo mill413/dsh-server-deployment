@@ -13,6 +13,7 @@ Usage (run as root inside the dsh deployment container):
   PROVIDER_BASE_URL='https://gateway.example.com/v1' \
   CREDENTIAL_REF='DEEPSEEK_API_KEY' \
   IMAGE_MODELS='vision-model-1,vision-model-2' \
+  MODEL_LIMITS_JSON='[{"id":"large-model","context_window":131072,"max_tokens":16384}]' \
     dsh-batch-register-models.sh
 
 Environment:
@@ -24,6 +25,7 @@ Environment:
   PROVIDER_API          openai-completions (default), openai-responses, or
                         anthropic-messages.
   IMAGE_MODELS          Optional comma-separated image-capable model ids.
+  MODEL_LIMITS_JSON     Optional JSON model-limit allowlist (default: []).
   GATEWAY_URL           Gateway origin (default: http://127.0.0.1:3100).
   USERS_FILE            users.json path; auto-detected when omitted.
   DRY_RUN               Set to 1 to read/validate without calling the API.
@@ -47,6 +49,7 @@ fi
 CREDENTIAL_REF="${CREDENTIAL_REF:-DEEPSEEK_API_KEY}"
 PROVIDER_API="${PROVIDER_API:-openai-completions}"
 IMAGE_MODELS="${IMAGE_MODELS:-}"
+MODEL_LIMITS_JSON="${MODEL_LIMITS_JSON:-[]}"
 GATEWAY_URL="${GATEWAY_URL:-http://127.0.0.1:3100}"
 DRY_RUN="${DRY_RUN:-0}"
 
@@ -123,10 +126,19 @@ call_provider_api() {
   USERNAME="$username" API_KEY="$api_key" \
   DSH_REGISTER_API_KEY="$DSH_REGISTER_API_KEY" \
   PROVIDER_NAME="$PROVIDER_NAME" PROVIDER_BASE_URL="$PROVIDER_BASE_URL" \
-  PROVIDER_API="$PROVIDER_API" IMAGE_MODELS="$IMAGE_MODELS" \
+  PROVIDER_API="$PROVIDER_API" IMAGE_MODELS="$IMAGE_MODELS" MODEL_LIMITS_JSON="$MODEL_LIMITS_JSON" \
   GATEWAY_URL="$GATEWAY_URL" node <<'NODE'
 const username = process.env.USERNAME;
 const imageModels = process.env.IMAGE_MODELS.split(',').map(x => x.trim()).filter(Boolean);
+let modelLimits;
+try { modelLimits = JSON.parse(process.env.MODEL_LIMITS_JSON); } catch (error) {
+  console.error('MODEL_LIMITS_JSON is not valid JSON: ' + error.message);
+  process.exit(2);
+}
+if (!Array.isArray(modelLimits)) {
+  console.error('MODEL_LIMITS_JSON must contain a JSON array');
+  process.exit(2);
+}
 const body = {
   provider: {
     name: process.env.PROVIDER_NAME,
@@ -135,6 +147,7 @@ const body = {
   },
   apiKey: process.env.API_KEY,
   image_models: [...new Set(imageModels)],
+  model_limits: modelLimits,
 };
 const endpoint = process.env.GATEWAY_URL.replace(/\/+$/, '')
   + '/api/users/' + encodeURIComponent(username) + '/provider';

@@ -212,13 +212,17 @@ curl -X POST http://<host>:20810/api/users/alice2/provider \
   -H "Content-Type: application/json" \
   -d '{"provider":{"name":"my-gateway","baseURL":"https://gateway.example.com/v1"},
        "apiKey":"sk-xxxx",
-       "image_models":["gpt-4o","qwen-vl-max"]}'
+       "image_models":["gpt-4o","qwen-vl-max"],
+       "model_limits":[
+         {"id":"gpt-4o","context_window":128000,"max_tokens":16384}
+       ]}'
 # → 200 {"ok":true,"user":"alice2","provider":{"name":"my-gateway","baseURL":"...","model":"gpt-4o-mini","apiKeyEnv":"MY_GATEWAY_API_KEY"},"ref":"MY_GATEWAY_API_KEY"}
 ```
 
 - **Strict validation**: `provider` is required (name limited to letters/digits/underscore/hyphen, baseURL must be an http(s) URL); `provider.api` is optional — `openai-completions` (default) / `openai-responses` / `anthropic-messages` — an invalid value makes the whole settings section rejected and the model unusable; `apiKey` is required; the target user must exist (admin included).
 - **Automatic model discovery**: when `provider.model` (or a `models` array) is omitted, the gateway calls `GET <baseURL>/models` with the API key and writes the fetched model list (capped at 100) into the user's config; a fetch failure returns 502 with a hint to pass `provider.model` explicitly. Passing `model`/`models` skips the fetch. The response's `models` array is the effective model list.
 - **Image-input allowlist**: the optional top-level `image_models` array (also accepted as `provider.image_models`) contains model ids. Discovered models in the allowlist are written with `input: [text, image]`; every other model gets `input: [text]`. It defaults to an empty array when omitted. The allowlist is not checked against the discovered catalog: unmatched entries remain in the response but do not create extra model configurations.
+- **Model-limit allowlist**: the optional top-level `model_limits` array (also accepted as `provider.model_limits`) overrides `context_window` and `max_tokens` by model id. The catalog is still discovered from `/models`; only matching models receive overrides, unmatched models retain the `32768/8192` defaults, and unknown allowlist ids remain in the response without creating model entries. Each item must set at least one limit; omitted fields use defaults. Values must be integers from `1` to `10000000`, with `max_tokens <= context_window`. `contextWindow`/`maxTokens` input aliases are accepted, while generated `settings.yaml` uses the Harness camelCase fields.
 - Effect: writes the user's `settings.yaml` (an `llm-pi-ai.providers.<name>` OpenAI-compatible profile plus `agent-default-model`) and owner-only `.credentials.yaml` (0600). A dormant user stays dormant; an already-running user's instance is restarted so the change applies immediately.
 - Re-calling the endpoint **replaces** the provider config and key (change baseURL/model/key anytime). The returned `ref` is the provider's credential name (`<NAME>_API_KEY`).
 - Once configured, the user skips `/setup` and the provider is the default on login.

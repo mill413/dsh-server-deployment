@@ -516,6 +516,23 @@ function providerApiKeyEnv(name) {
 // route stays dormant); 'openai-completions' is the OpenAI-compatible default.
 const SUPPORTED_PROVIDER_APIS = ['openai-completions', 'openai-responses', 'anthropic-messages'];
 const SUPPORTED_MODEL_INPUTS = ['text', 'image'];
+const DEFAULT_MODEL_CONTEXT_WINDOW = 32768;
+const DEFAULT_MODEL_MAX_TOKENS = 8192;
+const MAX_MODEL_TOKEN_LIMIT = 10_000_000;
+
+function providerModelLimit(source, camelName, snakeName, fallback, id) {
+  const hasCamel = Object.prototype.hasOwnProperty.call(source, camelName);
+  const hasSnake = Object.prototype.hasOwnProperty.call(source, snakeName);
+  if (hasCamel && hasSnake && source[camelName] !== source[snakeName]) {
+    throw new Error(`provider model ${id} has conflicting ${camelName}/${snakeName}`);
+  }
+  const value = hasCamel ? source[camelName] : hasSnake ? source[snakeName] : fallback;
+  if (!Number.isInteger(value) || value < 1 || value > MAX_MODEL_TOKEN_LIMIT) {
+    throw new Error(`provider model ${id} ${camelName} must be an integer from 1 to ${MAX_MODEL_TOKEN_LIMIT}`);
+  }
+  return value;
+}
+
 function validateProviderModel(value, index) {
   const source = typeof value === 'string' ? { id: value } : value;
   if (!source || typeof source !== 'object' || Array.isArray(source)) {
@@ -529,7 +546,14 @@ function validateProviderModel(value, index) {
       || new Set(rawInput).size !== rawInput.length) {
     throw new Error(`provider model ${id} input must contain unique text/image values`);
   }
-  return { id, input: [...rawInput] };
+  const contextWindow = providerModelLimit(
+    source, 'contextWindow', 'context_window', DEFAULT_MODEL_CONTEXT_WINDOW, id,
+  );
+  const maxTokens = providerModelLimit(
+    source, 'maxTokens', 'max_tokens', DEFAULT_MODEL_MAX_TOKENS, id,
+  );
+  if (maxTokens > contextWindow) throw new Error(`provider model ${id} maxTokens must not exceed contextWindow`);
+  return { id, input: [...rawInput], contextWindow, maxTokens };
 }
 function validateProvider(provider) {
   if (provider === undefined || provider === null) return null;
@@ -547,7 +571,12 @@ function validateProvider(provider) {
   } else if (typeof provider.model === 'string' && provider.model.trim() !== '') {
     const m = provider.model.trim();
     if (m.length > 128) throw new Error('provider model is too long');
-    models = [{ id: m, input: ['text'] }];
+    models = [{
+      id: m,
+      input: ['text'],
+      contextWindow: DEFAULT_MODEL_CONTEXT_WINDOW,
+      maxTokens: DEFAULT_MODEL_MAX_TOKENS,
+    }];
   } else {
     throw new Error('provider model(s) are required');
   }
@@ -610,8 +639,8 @@ function providerSettingsYaml(provider) {
     lines.push(
       `        - id: ${yq(m.id)}`,
       `          name: ${yq(m.id)}`,
-      '          contextWindow: 32768',
-      '          maxTokens: 8192',
+      `          contextWindow: ${m.contextWindow}`,
+      `          maxTokens: ${m.maxTokens}`,
       `          input: [${m.input.join(', ')}]`,
     );
   }

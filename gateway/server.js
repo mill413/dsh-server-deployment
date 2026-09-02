@@ -85,6 +85,56 @@ const LOGIN_TICKET_TTL = Math.min(300, Math.max(10, parseInt(process.env.LOGIN_T
 const LOGIN_TICKET_MAX = 10000;
 const loginTickets = new Map(); // sha256(ticket) -> { user, returnTo, expiresAt }
 const PROVIDER_HELPER = process.env.DSH_PROVIDER_HELPER || '/usr/local/libexec/dsh/dsh-provider';
+const DEFAULT_MODEL_CONTEXT_WINDOW = 32768;
+const DEFAULT_MODEL_MAX_TOKENS = 8192;
+const MAX_MODEL_TOKEN_LIMIT = 10_000_000;
+
+function modelLimitValue(source, snakeName, camelName, fallback, label) {
+  const hasSnake = Object.prototype.hasOwnProperty.call(source, snakeName);
+  const hasCamel = Object.prototype.hasOwnProperty.call(source, camelName);
+  if (hasSnake && hasCamel && source[snakeName] !== source[camelName]) {
+    throw new Error(`${label} must not specify conflicting ${snakeName} and ${camelName}`);
+  }
+  const value = hasSnake ? source[snakeName] : hasCamel ? source[camelName] : fallback;
+  if (!Number.isInteger(value) || value < 1 || value > MAX_MODEL_TOKEN_LIMIT) {
+    throw new Error(`${label}.${snakeName} must be an integer from 1 to ${MAX_MODEL_TOKEN_LIMIT}`);
+  }
+  return value;
+}
+
+function parseModelLimits(raw) {
+  if (raw === undefined) return [];
+  if (!Array.isArray(raw)) throw new Error('model_limits must be an array');
+  if (raw.length > 100) throw new Error('model_limits must not contain more than 100 entries');
+  const result = [];
+  const ids = new Set();
+  for (let index = 0; index < raw.length; index += 1) {
+    const source = raw[index];
+    const label = `model_limits[${index}]`;
+    if (!source || typeof source !== 'object' || Array.isArray(source)) {
+      throw new Error(`${label} must be an object`);
+    }
+    const id = typeof source.id === 'string' ? source.id.trim() : '';
+    if (!id || id.length > 128) throw new Error(`${label}.id must be a non-empty model id up to 128 characters`);
+    if (ids.has(id)) throw new Error(`model_limits contains duplicate model id: ${id}`);
+    const hasContext = Object.prototype.hasOwnProperty.call(source, 'context_window')
+      || Object.prototype.hasOwnProperty.call(source, 'contextWindow');
+    const hasMax = Object.prototype.hasOwnProperty.call(source, 'max_tokens')
+      || Object.prototype.hasOwnProperty.call(source, 'maxTokens');
+    if (!hasContext && !hasMax) throw new Error(`${label} must set context_window or max_tokens`);
+    const contextWindow = modelLimitValue(
+      source, 'context_window', 'contextWindow', DEFAULT_MODEL_CONTEXT_WINDOW, label,
+    );
+    const maxTokens = modelLimitValue(
+      source, 'max_tokens', 'maxTokens', DEFAULT_MODEL_MAX_TOKENS, label,
+    );
+    if (maxTokens > contextWindow) throw new Error(`${label}.max_tokens must not exceed context_window`);
+    ids.add(id);
+    result.push({ id, context_window: contextWindow, max_tokens: maxTokens });
+  }
+  return result;
+}
+
 function bearerAuthorized(req, token) {
   if (!token) return false;
   const h = req.headers['authorization'] || '';
@@ -2643,6 +2693,15 @@ const server = http.createServer(async (req, res) => {
       if (!imageModelSet.has(id)) imageModels.push(id);
       imageModelSet.add(id);
     }
+    // Per-model token-limit allowlist. The provider model catalog is still
+    // discovered normally; only matching ids receive these overrides. Unknown
+    // ids are returned to the caller but never create extra model entries.
+    const modelLimitsRaw = body.model_limits !== undefined ? body.model_limits : p.model_limits;
+    let modelLimits;
+    try { modelLimits = parseModelLimits(modelLimitsRaw); } catch (error) {
+      return json(res, 400, { ok: false, error: error.message });
+    }
+    const modelLimitMap = new Map(modelLimits.map((entry) => [entry.id, entry]));
     // Models: an explicit `model` (or `models` array) is used as-is; otherwise
     // the gateway asks the provider for its model list (GET <baseURL>/models
     // with the API key) so the caller does not have to know them.
@@ -2666,10 +2725,15 @@ const server = http.createServer(async (req, res) => {
       }
     }
     models = [...new Set(models)];
-    const configuredModels = models.map((id) => ({
-      id,
-      input: imageModelSet.has(id) ? ['text', 'image'] : ['text'],
-    }));
+    const configuredModels = models.map((id) => {
+      const limits = modelLimitMap.get(id);
+      return {
+        id,
+        input: imageModelSet.has(id) ? ['text', 'image'] : ['text'],
+        contextWindow: limits ? limits.context_window : DEFAULT_MODEL_CONTEXT_WINDOW,
+        maxTokens: limits ? limits.max_tokens : DEFAULT_MODEL_MAX_TOKENS,
+      };
+    });
     const u = getUser(name);
     if (!u || !u.port) return json(res, 404, { ok: false, error: 'user not found' });
     const r = await runHelper(
@@ -2693,6 +2757,7 @@ const server = http.createServer(async (req, res) => {
       ref: ref,
       models: models,
       image_models: imageModels,
+      model_limits: modelLimits,
     });
   }
 

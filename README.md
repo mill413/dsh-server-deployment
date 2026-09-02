@@ -237,13 +237,17 @@ curl -X POST http://<主机>:20810/api/users/alice2/provider \
   -H "Content-Type: application/json" \
   -d '{"provider":{"name":"my-gateway","baseURL":"https://gateway.example.com/v1"},
        "apiKey":"sk-xxxx",
-       "image_models":["gpt-4o","qwen-vl-max"]}'
+       "image_models":["gpt-4o","qwen-vl-max"],
+       "model_limits":[
+         {"id":"gpt-4o","context_window":128000,"max_tokens":16384}
+       ]}'
 # → 200 {"ok":true,"user":"alice2","provider":{"name":"my-gateway","baseURL":"...","model":"gpt-4o-mini","apiKeyEnv":"MY_GATEWAY_API_KEY"},"ref":"MY_GATEWAY_API_KEY"}
 ```
 
 - **严格校验**：`provider` 必填（name 限字母/数字/下划线/连字符、baseURL 必须是 http(s) URL）；`provider.api` 可选，取值 `openai-completions`（默认）/ `openai-responses` / `anthropic-messages`，必须合法否则整个设置段会被拒绝、模型不可用；`apiKey` 必填；目标用户必须存在（包括 admin）。
 - **模型自动获取**：不传 `provider.model`（或 `models` 数组）时，网关用 `apiKey` 调 `GET <baseURL>/models` 自动拉取模型列表（上限 100 个）全部写入配置；拉取失败返回 502 并提示可显式传 `model` 兜底。显式传 `model`/`models` 则跳过拉取。响应里的 `models` 即生效的模型列表。
 - **图片输入白名单**：可选的顶层 `image_models` 是模型 ID 数组（也兼容放在 `provider.image_models`）；命中的已获取模型写入 `input: [text, image]`，其余模型写入 `input: [text]`。未传时默认空数组。白名单本身不校验模型是否存在，不在本次模型列表中的条目会被保留在响应中但不会生成额外模型配置。
+- **模型限制白名单**：可选的顶层 `model_limits` 数组（也兼容放在 `provider.model_limits`）按模型 ID 覆盖 `context_window` 和 `max_tokens`。模型列表仍由 `/models` 自动获取；只有命中的模型使用覆盖值，未命中模型保持 `32768/8192` 默认值，未知白名单 ID 会保留在响应中但不会生成额外模型。每项至少提供一个限制，省略的字段使用默认值；二者必须是 `1`–`10000000` 的整数，且 `max_tokens <= context_window`。输入也兼容 `contextWindow`/`maxTokens`，写入 `settings.yaml` 时统一使用 Harness 的 camelCase 字段。
 - 效果：写入用户 `settings.yaml`（`llm-pi-ai.providers.<name>` OpenAI 兼容适配器 + `agent-default-model` 指向第一个模型）以及私有 `.credentials.yaml`（0600，属主仅本人）。未登录用户保持休眠，不会因为配置 provider 而启动；若实例已经运行，则只重启该用户实例使配置立即生效。
 - 重复调用 = **覆盖更新**（换 baseURL/模型/Key 都行）；返回的 `ref` 是该提供商的凭证名（`<NAME>_API_KEY`）。
 - 配置完成后用户跳过 `/setup`，登录即默认使用该提供商。

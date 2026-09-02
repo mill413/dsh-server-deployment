@@ -364,14 +364,25 @@ function check(name, cond) {
       provider: { name: 'vision-gateway', baseURL: 'http://127.0.0.1:3999' },
       apiKey: 'sk-provider-test',
       image_models: ['vision-model'],
+      model_limits: [
+        { id: 'text-model', context_window: 131072, max_tokens: 16384 },
+        { id: 'missing-model', context_window: 65536, max_tokens: 4096 },
+      ],
     }),
   });
   const providerReply = JSON.parse(r.body);
   const providerLog = fs.readFileSync(TENANT_HELPER_LOG, 'utf8');
   check('provider image_models registration succeeds', r.status === 200
     && providerReply.image_models[0] === 'vision-model');
+  check('provider model_limits registration succeeds', r.status === 200
+    && providerReply.model_limits[0].id === 'text-model'
+    && providerReply.model_limits[0].context_window === 131072
+    && providerReply.model_limits[0].max_tokens === 16384
+    && providerReply.model_limits[1].id === 'missing-model');
   check('provider helper receives text-only model input', providerLog.indexOf('"id":"text-model","input":["text"]') >= 0);
   check('provider helper receives image model input', providerLog.indexOf('"id":"vision-model","input":["text","image"]') >= 0);
+  check('provider helper receives matched model limits', providerLog.indexOf('"id":"text-model","input":["text"],"contextWindow":131072,"maxTokens":16384') >= 0);
+  check('provider ignores unmatched model_limits entries', providerLog.indexOf('"id":"missing-model"') < 0);
 
   r = await req('POST', '/api/users/tester/provider', {
     headers: providerHeaders,
@@ -395,7 +406,32 @@ function check(name, cond) {
   const defaultImageLog = fs.readFileSync(TENANT_HELPER_LOG, 'utf8').trim().split('\n').pop();
   check('provider defaults image_models to an empty allowlist', r.status === 200
     && Array.isArray(defaultImageReply.image_models) && defaultImageReply.image_models.length === 0
-    && defaultImageLog.indexOf('"id":"vision-model","input":["text"]') >= 0);
+    && defaultImageLog.indexOf('"id":"vision-model","input":["text"],"contextWindow":32768,"maxTokens":8192') >= 0);
+  check('provider defaults model_limits to an empty allowlist', r.status === 200
+    && Array.isArray(defaultImageReply.model_limits) && defaultImageReply.model_limits.length === 0);
+
+  r = await req('POST', '/api/users/tester/provider', {
+    headers: providerHeaders,
+    body: JSON.stringify({
+      provider: { name: 'vision-gateway', baseURL: 'http://127.0.0.1:3999' },
+      apiKey: 'sk-provider-test',
+      model_limits: [
+        { id: 'text-model', max_tokens: 4096 },
+        { id: 'text-model', context_window: 65536 },
+      ],
+    }),
+  });
+  check('provider rejects duplicate model_limits ids', r.status === 400);
+
+  r = await req('POST', '/api/users/tester/provider', {
+    headers: providerHeaders,
+    body: JSON.stringify({
+      provider: { name: 'vision-gateway', baseURL: 'http://127.0.0.1:3999' },
+      apiKey: 'sk-provider-test',
+      model_limits: [{ id: 'text-model', context_window: 4096, max_tokens: 8192 }],
+    }),
+  });
+  check('provider rejects max_tokens above context_window', r.status === 400);
 
   r = await req('POST', '/api/login-ticket', {
     headers: { 'Content-Type': 'application/json' },
